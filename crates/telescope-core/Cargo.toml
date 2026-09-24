@@ -1,0 +1,16 @@
+[package]
+name = "telescope-core"
+description = "Telescope core library: AIDRS-aware prior, BAM evidence, TEL-EM solver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+parquet = { workspace = true }
+noodles-bam = { workspace = true }
+noodles-sam = { workspace = true }
+anyhow = { workspace = true }

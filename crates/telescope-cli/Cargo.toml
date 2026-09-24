@@ -1,0 +1,16 @@
+[package]
+name = "telescope"
+description = "Telescope CLI: terminal-resolved native poly(A) inference for ONT DRS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "telescope"
+path = "src/main.rs"
+
+[dependencies]
+telescope-core = { path = "../telescope-core" }
+anyhow = { workspace = true }
+clap = { workspace = true }
