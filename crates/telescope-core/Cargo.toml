@@ -14,3 +14,4 @@ parquet = { workspace = true }
 noodles-bam = { workspace = true }
 noodles-sam = { workspace = true }
 anyhow = { workspace = true }
+rayon = { workspace = true }
