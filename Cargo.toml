@@ -1,0 +1,16 @@
+[package]
+name = "telescope"
+version = "0.1.0"
+edition = "2021"
+description = "Downstream Rust tool for AIDRS outputs"
+license = "TBD"
+
+[[bin]]
+name = "telescope"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
