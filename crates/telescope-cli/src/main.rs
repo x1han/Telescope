@@ -7,11 +7,14 @@
 //!
 //! Module 4 R to follow per `specs/telescope-v0.1.7.md`.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use telescope_core::{anchor_builder, em, emission_model, evidence, summary};
+use telescope_core::{
+    anchor_builder, em, emission_model, evidence, resolver, summary,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -123,6 +126,43 @@ enum Cmd {
         /// Per-sample read cap per transcript (default 200).
         #[arg(long, default_value_t = 200)]
         max_reads_per_sample: usize,
+    },
+
+    /// Module 0: Resolve cohort-level transcript evidence (Tier A/B/C,
+    /// subsumption, EM/PAL eligibility) → `telescope.transcript_evidence.parquet`.
+    ResolveEvidence {
+        /// One or more AIDRS-aligned transcriptome BAMs (cohort). All BAMs
+        /// must share the same reference catalog (`@SQ` lines).
+        #[arg(long = "bam", required = true)]
+        bams: Vec<PathBuf>,
+
+        /// Sample IDs parallel to `--bam` (one per BAM, used to namespace
+        /// read IDs when pooling).
+        #[arg(long = "sample-id", required = true)]
+        sample_ids: Vec<String>,
+
+        /// Optional TSV with header `transcript_id\tgene_id`. Missing
+        /// mappings emit `gene_id="missing_gene_id"` plus a warning.
+        #[arg(long)]
+        tx_to_gene: Option<PathBuf>,
+
+        /// Cohort size (must equal the number of `--bam` arguments).
+        /// Required and explicit per F6.2 (P0 correction).
+        #[arg(long)]
+        cohort_size: usize,
+
+        /// TES cluster radius in bp (default 50). Excluded from
+        /// subsumption scan iff transcript IDs contain `AlterTes`/`_Alter`.
+        #[arg(long, default_value_t = 50)]
+        tes_cluster_radius: usize,
+
+        /// 3' TES boundary slack in bp passed to Module 2 (default 35).
+        #[arg(long, default_value_t = 35)]
+        tes_slack: usize,
+
+        /// Output `telescope.transcript_evidence.parquet`.
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -272,6 +312,99 @@ fn main() -> Result<()> {
                 max_reads_per_sample,
             ).context("anchor_builder::build_anchor_pool failed")?;
             eprintln!("[telescope]  {}", stats.report());
+            eprintln!("[telescope] done.");
+            Ok(())
+        }
+        Cmd::ResolveEvidence {
+            bams, sample_ids, tx_to_gene, cohort_size,
+            tes_cluster_radius, tes_slack, output,
+        } => {
+            if bams.len() != sample_ids.len() {
+                anyhow::bail!(
+                    "--bam ({} files) and --sample-id ({} ids) must have equal length",
+                    bams.len(), sample_ids.len()
+                );
+            }
+            if cohort_size != bams.len() {
+                anyhow::bail!(
+                    "--cohort-size ({}) must equal the number of --bam arguments ({})",
+                    cohort_size, bams.len()
+                );
+            }
+            eprintln!("[telescope] Module 0: transcript evidence resolver");
+            eprintln!("  cohort_size:         {}", cohort_size);
+            eprintln!("  tes_cluster_radius:  {} bp", tes_cluster_radius);
+            eprintln!("  tes_slack:           {} bp", tes_slack);
+            eprintln!("  output:              {}", output.display());
+
+            // Pool evidence across all cohort BAMs.
+            let pairs: Vec<(PathBuf, String)> = bams
+                .iter()
+                .cloned()
+                .zip(sample_ids.iter().cloned())
+                .collect();
+            let (graph, n_pooled) = resolver::pool_evidence_graphs(&pairs, tes_slack)
+                .context("resolver::pool_evidence_graphs failed")?;
+            eprintln!(
+                "[telescope]  pooled {} BAM(s): molecules={}, transcripts={}, candidate_pool={}",
+                n_pooled,
+                graph.molecules.len(),
+                graph.transcript_names.len(),
+                graph.candidate_pool.len(),
+            );
+
+            // Load transcript→gene mapping (TSV) → HashMap<String, String>.
+            let tx_to_gene_map: std::collections::HashMap<String, String> = match tx_to_gene {
+                Some(p) => {
+                    let content = std::fs::read_to_string(&p).with_context(|| {
+                        format!("Failed to read tx-to-gene TSV: {:?}", p)
+                    })?;
+                    let mut m = std::collections::HashMap::new();
+                    for (i, line) in content.lines().enumerate() {
+                        if i == 0 && line.starts_with("transcript_id") {
+                            continue;
+                        }
+                        let mut parts = line.splitn(2, '\t');
+                        let tx = parts.next().unwrap_or("").to_string();
+                        let g = parts.next().unwrap_or("").to_string();
+                        if !tx.is_empty() && !g.is_empty() {
+                            m.insert(tx, g);
+                        }
+                    }
+                    eprintln!("  tx_to_gene entries:  {}", m.len());
+                    m
+                }
+                None => {
+                    eprintln!("  tx_to_gene entries:  0 (no TSV provided; all transcripts will emit missing_gene_id)");
+                    std::collections::HashMap::new()
+                }
+            };
+
+            let config = resolver::ResolverConfig {
+                cohort_size,
+                tes_cluster_radius,
+            };
+            let mut warn_set: HashSet<String> = HashSet::new();
+            let records = resolver::resolve_transcript_evidence(
+                &graph,
+                &tx_to_gene_map,
+                &config,
+                &mut warn_set,
+            );
+
+            let n_tier_a = records.iter().filter(|r| r.tier == "TierA").count();
+            let n_tier_b = records.iter().filter(|r| r.tier == "TierB").count();
+            let n_tier_c = records.iter().filter(|r| r.tier == "TierC").count();
+            let n_subsumed = records.iter().filter(|r| r.is_subsumed).count();
+            let n_em_eligible = records.iter().filter(|r| r.em_eligible).count();
+            let n_pal_candidate = records.iter().filter(|r| r.pal_candidate).count();
+            eprintln!(
+                "[telescope]  TierA={} TierB={} TierC={} subsumed={} em_eligible={} pal_candidate={}",
+                n_tier_a, n_tier_b, n_tier_c, n_subsumed, n_em_eligible, n_pal_candidate
+            );
+
+            resolver::write_transcript_evidence_parquet(&records, &output)
+                .context("resolver::write_transcript_evidence_parquet failed")?;
             eprintln!("[telescope] done.");
             Ok(())
         }
