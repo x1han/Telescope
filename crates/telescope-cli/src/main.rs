@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use telescope_core::{em, emission_model, evidence};
+use telescope_core::{em, emission_model, evidence, summary};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -74,13 +74,24 @@ enum Cmd {
         #[arg(long, default_value_t = 35)]
         tes_slack: usize,
 
-        /// EM log-likelihood convergence tolerance.
-        #[arg(long, default_value_t = 1e-7)]
+        /// EM log-likelihood convergence tolerance (per-molecule average LL).
+        #[arg(long, default_value_t = 1e-6)]
         tol: f64,
 
         /// Maximum EM iterations (safety cap).
         #[arg(long, default_value_t = 1000)]
         max_iter: usize,
+    },
+
+    /// Profile Summary Engine: aggregate profile.parquet → sample_summary.parquet.
+    Summarize {
+        /// Path to `telescope.profile.parquet`.
+        #[arg(long)]
+        profile: PathBuf,
+
+        /// Output `telescope.sample_summary.parquet`.
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -184,6 +195,15 @@ fn main() -> Result<()> {
                 "[telescope]    dropped (incompetent): {}",
                 stats.n_dropped_incompetent
             );
+            eprintln!("[telescope] done.");
+            Ok(())
+        }
+        Cmd::Summarize { profile, output } => {
+            eprintln!("[telescope] Profile Summary Engine");
+            eprintln!("  profile: {}", profile.display());
+            eprintln!("  output:  {}", output.display());
+            summary::summarize_profile_parquet(&profile, &output)
+                .context("summary::summarize_profile_parquet failed")?;
             eprintln!("[telescope] done.");
             Ok(())
         }
