@@ -15,6 +15,7 @@ use clap::{Parser, Subcommand};
 use telescope_core::{
     anchor_builder, em, emission_model, evidence, resolver, summary,
 };
+use telescope_core::emission_model::FallbackConfig;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -29,19 +30,56 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Module 1: build `telescope.emission.parquet` from AIDRS outputs.
+    /// Module 1: build `telescope.emission.parquet` from AIDRS
+    /// outputs (AIDRS mode) or anchor pool (Universal mode).
+    ///
+    /// The two input modes are MUTUALLY EXCLUSIVE:
+    /// - AIDRS mode: `--polya-parquet X --assessment-tsv Y`
+    /// - Universal mode: `--anchor-pool X [--transcript-evidence Z]`
+    ///
+    /// `--output` is always required. The `--tx-min-reads`,
+    /// `--gene-min-reads`, `--cohort-min-reads` flags configure
+    /// the Universal-Mode 3-level fallback (Tx → Gene → Cohort)
+    /// and only take effect when `--anchor-pool` is supplied.
     BuildEmission {
-        /// Path to `aidrs.transcript_polyA_len.parquet`.
-        #[arg(long)]
-        polya_parquet: PathBuf,
+        /// AIDRS mode: path to `aidrs.transcript_polyA_len.parquet`.
+        #[arg(long, group = "emission_input")]
+        polya_parquet: Option<PathBuf>,
 
-        /// Path to `aidrs.transcript.assessment.tsv`.
-        #[arg(long)]
-        assessment_tsv: PathBuf,
+        /// AIDRS mode: path to `aidrs.transcript.assessment.tsv`.
+        /// Required iff `--polya-parquet` is set.
+        #[arg(long, requires = "polya_parquet")]
+        assessment_tsv: Option<PathBuf>,
+
+        /// Universal mode: path to `telescope.anchor_pool.parquet`
+        /// (produced by `telescope build-anchors`).
+        #[arg(long, group = "emission_input")]
+        anchor_pool: Option<PathBuf>,
+
+        /// Universal mode (optional): path to
+        /// `telescope.transcript_evidence.parquet` (Module 0
+        /// output). When provided, reads whose transcript_id has
+        /// `em_eligible == false` are dropped before emission
+        /// fitting.
+        #[arg(long, requires = "anchor_pool")]
+        transcript_evidence: Option<PathBuf>,
 
         /// Output path for `telescope.emission.parquet`.
         #[arg(long)]
         output: PathBuf,
+
+        /// Universal mode: L1 Tx-level minimum reads (default 10).
+        #[arg(long, default_value_t = 10, requires = "anchor_pool")]
+        tx_min_reads: usize,
+
+        /// Universal mode: L2 Gene-level minimum reads (default 30).
+        #[arg(long, default_value_t = 30, requires = "anchor_pool")]
+        gene_min_reads: usize,
+
+        /// Universal mode: L3 Cohort-level minimum reads
+        /// (informational; L3 is always applied when L1/L2 fail).
+        #[arg(long, default_value_t = 50, requires = "anchor_pool")]
+        cohort_min_reads: usize,
     },
 
     /// Module 2: extract single-molecule evidence from AIDRS-aligned BAM.
@@ -172,18 +210,66 @@ fn main() -> Result<()> {
         Cmd::BuildEmission {
             polya_parquet,
             assessment_tsv,
+            anchor_pool,
+            transcript_evidence,
             output,
+            tx_min_reads,
+            gene_min_reads,
+            cohort_min_reads,
         } => {
             eprintln!("[telescope] Module 1: building emission model");
-            eprintln!("  polya_parquet:  {}", polya_parquet.display());
-            eprintln!("  assessment_tsv: {}", assessment_tsv.display());
-            eprintln!("  output:         {}", output.display());
-            emission_model::build_emission_parquet(
-                polya_parquet,
-                assessment_tsv,
-                output,
-            )
-            .context("Module 1 build_emission_parquet failed")?;
+            match (polya_parquet, anchor_pool) {
+                (Some(p), None) => {
+                    // AIDRS mode (legacy).
+                    let assess = assessment_tsv.context(
+                        "--assessment-tsv is required when --polya-parquet is set",
+                    )?;
+                    eprintln!("  mode:           AIDRS");
+                    eprintln!("  polya_parquet:  {}", p.display());
+                    eprintln!("  assessment_tsv: {}", assess.display());
+                    eprintln!("  output:         {}", output.display());
+                    emission_model::build_emission_parquet(p, assess, output)
+                        .context("Module 1 build_emission_parquet (AIDRS) failed")?;
+                }
+                (None, Some(a)) => {
+                    // Universal mode (Mode B).
+                    let fb = FallbackConfig {
+                        tx_min_reads,
+                        gene_min_reads,
+                        cohort_min_reads,
+                    };
+                    eprintln!("  mode:               Universal (Mode B)");
+                    eprintln!("  anchor_pool:        {}", a.display());
+                    if let Some(ref te) = transcript_evidence {
+                        eprintln!("  transcript_evidence: {}", te.display());
+                    } else {
+                        eprintln!("  transcript_evidence: (none; no em_eligible filter)");
+                    }
+                    eprintln!("  tx_min_reads:       {}", fb.tx_min_reads);
+                    eprintln!("  gene_min_reads:     {}", fb.gene_min_reads);
+                    eprintln!("  cohort_min_reads:   {}", fb.cohort_min_reads);
+                    eprintln!("  output:             {}", output.display());
+                    emission_model::build_emission_from_anchors(
+                        a,
+                        transcript_evidence,
+                        output,
+                        &fb,
+                    )
+                    .context("Module 1 build_emission_from_anchors (Universal) failed")?;
+                }
+                (Some(_), Some(_)) => {
+                    anyhow::bail!(
+                        "--polya-parquet (AIDRS mode) and --anchor-pool (Universal mode) \
+                         are mutually exclusive"
+                    );
+                }
+                (None, None) => {
+                    anyhow::bail!(
+                        "must specify either --polya-parquet (AIDRS mode) or \
+                         --anchor-pool (Universal mode)"
+                    );
+                }
+            }
             eprintln!("[telescope] done.");
             Ok(())
         }
