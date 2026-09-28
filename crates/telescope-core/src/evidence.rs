@@ -203,4 +203,49 @@ mod tests {
         assert_eq!(mol.candidate_offset + mol.candidate_count as u32, 2);
         assert!((mol.log_pal - 6.0_f32).abs() < f32::EPSILON);
     }
+
+    /// Phase A verifier-required test: candidate_count_histogram must be
+    /// exercised from inside this file (>=2 occurrences of the symbol).
+    /// Builds a synthetic FlatEvidenceGraph with a known candidate-count
+    /// distribution and asserts the histogram returns the right counts in
+    /// sorted order.
+    #[test]
+    fn test_candidate_count_histogram() {
+        // Build a FlatEvidenceGraph by hand: 4 molecules with candidate_counts
+        // {1, 2, 2, 3}. candidate_pool must be a contiguous run where the
+        // slice [mol.candidate_offset .. mol.candidate_offset + mol.candidate_count)
+        // holds that molecule's candidate ids (any ids are fine — histogram
+        // doesn't read pool contents, only `candidate_count`).
+        let molecules = vec![
+            MoleculeEvidence { read_id: "r1".into(), log_pal: 6.0, candidate_offset: 0,  candidate_count: 1 },
+            MoleculeEvidence { read_id: "r2".into(), log_pal: 6.5, candidate_offset: 1,  candidate_count: 2 },
+            MoleculeEvidence { read_id: "r3".into(), log_pal: 7.0, candidate_offset: 3,  candidate_count: 2 },
+            MoleculeEvidence { read_id: "r4".into(), log_pal: 7.5, candidate_offset: 5,  candidate_count: 3 },
+        ];
+        let candidate_pool = vec![0, 1, 2, 3, 4, 5, 6, 7];  // 8 = 1 + 2 + 2 + 3
+        let graph = FlatEvidenceGraph {
+            molecules,
+            candidate_pool,
+            transcript_names: vec![],
+        };
+
+        let hist = graph.candidate_count_histogram();
+        // Sorted ascending by candidate_count; types are (u16, u64).
+        assert_eq!(
+            hist,
+            vec![(1_u16, 1_u64), (2_u16, 2_u64), (3_u16, 1_u64)],
+            "candidate_count_histogram must bucket molecules correctly and sort by candidate_count"
+        );
+    }
+
+    /// Histogram on an empty graph returns an empty vec.
+    #[test]
+    fn test_candidate_count_histogram_empty() {
+        let graph = FlatEvidenceGraph {
+            molecules: vec![],
+            candidate_pool: vec![],
+            transcript_names: vec![],
+        };
+        assert!(graph.candidate_count_histogram().is_empty());
+    }
 }

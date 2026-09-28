@@ -242,10 +242,15 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
 
         // Record EM trace (per-iter log-L + mean posterior entropy).
         if let Some(ref mut trace) = output_em_trace {
-            let mean_entropy = if e_results.is_empty() {
-                0.0
+            // P1 fix: exclude ghost drops (h == 0) from the denominator so the
+            // reported mean_entropy reflects reads that actually participated
+            // in E-step weight computation, not reads whose posteriors were
+            // empty due to no competent candidates.
+            let n_with_entropy = e_results.iter().filter(|&&(_, _, h)| h > 0.0).count();
+            let mean_entropy = if n_with_entropy > 0 {
+                e_results.iter().map(|&(_, _, h)| h).sum::<f64>() / n_with_entropy as f64
             } else {
-                e_results.iter().map(|&(_, _, h)| h).sum::<f64>() / e_results.len() as f64
+                0.0
             };
             trace.push((iter + 1, current_ll, mean_entropy));
         }
@@ -335,7 +340,16 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
                 p.sigma2 = p.sigma2.max(MIN_COHORT_VARIANCE);
 
                 // STEP 3: π update.
-                p.alpha = w_sum / n_total_molecules;
+                // P1 fix: defensive check for n_total_molecules == 0 (BAM
+                // with zero mapped reads). Without this, every p.alpha would
+                // become 0/0 = NaN. In practice the E-step would not iterate
+                // for an empty graph (delta_avg_ll = 0 < tol on iter 0),
+                // but a fully-empty BAM hitting quant() would emit NaN rows.
+                p.alpha = if n_total_molecules > 0.0 {
+                    w_sum / n_total_molecules
+                } else {
+                    0.0
+                };
             }
         }
     }
@@ -387,9 +401,13 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
             n_dropped_no_competent_candidates += 1;
         } else {
             let h = posterior_entropy(&weights);
+            // P1 fix: upper bound raised to 0.70 (was 0.60) so that a
+            // 2-way ambiguous read with balanced 50/50 weights (H = ln(2)
+            // ≈ 0.693) is correctly classified as 'partial' rather than
+            // 'degenerate', honoring the docstring semantics.
             if h < 0.20 {
                 n_entropy_clean += 1;
-            } else if h <= 0.60 {
+            } else if h <= 0.70 {
                 n_entropy_partial += 1;
             } else {
                 n_entropy_degenerate += 1;
