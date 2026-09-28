@@ -122,6 +122,15 @@ enum Cmd {
         /// Maximum EM iterations (safety cap).
         #[arg(long, default_value_t = 1000)]
         max_iter: usize,
+
+        /// Optional TSV with header `bam_id\toriginal_id` for ID translation
+        /// (replaces offline Python workaround for AIDRS re-keying).
+        #[arg(long)]
+        tx_id_mapping: Option<PathBuf>,
+
+        /// Print EM per-iter trace (log-L + mean entropy) to stderr.
+        #[arg(long)]
+        debug: bool,
     },
 
     /// Profile Summary Engine: aggregate profile.parquet → sample_summary.parquet.
@@ -313,6 +322,8 @@ fn main() -> Result<()> {
             tes_slack,
             tol,
             max_iter,
+            tx_id_mapping,
+            debug,
         } => {
             eprintln!("[telescope] Quant (M2 → M3)");
             eprintln!("  bam:        {}", bam.display());
@@ -322,10 +333,56 @@ fn main() -> Result<()> {
             eprintln!("  tes_slack:  {} bp", tes_slack);
             eprintln!("  tol:        {:.1e}", tol);
             eprintln!("  max_iter:   {}", max_iter);
+            if let Some(ref p) = tx_id_mapping {
+                eprintln!("  tx_id_mapping: {}", p.display());
+            }
+            eprintln!("  debug:      {}", debug);
+
+            // Parse optional `bam_id\toriginal_id` TSV (header row skipped).
+            // This replaces the previous offline Python re-keying workaround.
+            let id_mapping: Option<std::collections::HashMap<String, String>> =
+                if let Some(ref p) = tx_id_mapping {
+                    let f = std::fs::File::open(p)
+                        .with_context(|| format!("Failed to open --tx-id-mapping {:?}", p))?;
+                    let reader = std::io::BufReader::new(f);
+                    use std::io::BufRead;
+                    let mut map = std::collections::HashMap::new();
+                    for (i, line) in reader.lines().enumerate() {
+                        let l = line.with_context(|| {
+                            format!("Failed to read line {} from {:?}", i + 1, p)
+                        })?;
+                        if i == 0 && l.starts_with("bam_id") {
+                            continue; // skip header
+                        }
+                        let parts: Vec<&str> = l.split('\t').collect();
+                        if parts.len() >= 2 {
+                            let bam_id = parts[0].to_string();
+                            let orig = parts[1].to_string();
+                            if !bam_id.is_empty() && !orig.is_empty() {
+                                map.insert(bam_id, orig);
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "[telescope]    tx_id_mapping entries: {}",
+                        map.len()
+                    );
+                    Some(map)
+                } else {
+                    None
+                };
 
             eprintln!("[telescope]  M2: extract evidence…");
-            let graph = evidence::extract_evidence(&bam, tes_slack)
+            let mut graph = evidence::extract_evidence(&bam, tes_slack)
                 .context("Module 2 extract_evidence failed")?;
+            // Apply optional id mapping to transcript names (BAM @SQ → emission parquet keys).
+            if let Some(ref map) = id_mapping {
+                for name in &mut graph.transcript_names {
+                    if let Some(mapped) = map.get(name) {
+                        *name = mapped.clone();
+                    }
+                }
+            }
             eprintln!(
                 "[telescope]    molecules:      {}",
                 graph.molecules.len()
@@ -335,7 +392,30 @@ fn main() -> Result<()> {
                 graph.transcript_names.len()
             );
 
+            // Phase A: candidate_count histogram (telemetry).
+            let cand_hist = graph.candidate_count_histogram();
+            let n_total_reads = graph.molecules.len() as f64;
+            eprintln!("[telescope]    candidate_count histogram:");
+            if n_total_reads == 0.0 {
+                eprintln!("[telescope]      (no molecules)");
+            } else {
+                for (count, n_reads) in &cand_hist {
+                    eprintln!(
+                        "[telescope]      candidate={:>3}:  {:>10}  ({:5.1}%)",
+                        count,
+                        n_reads,
+                        *n_reads as f64 / n_total_reads * 100.0
+                    );
+                }
+            }
+
             eprintln!("[telescope]  M3: TEL-EM…");
+            let mut em_trace: Vec<(usize, f64, f64)> = Vec::new();
+            let trace_sink: Option<&mut Vec<(usize, f64, f64)>> = if debug {
+                Some(&mut em_trace)
+            } else {
+                None
+            };
             let stats = em::solve_and_write_profile(
                 graph,
                 &emission,
@@ -343,15 +423,46 @@ fn main() -> Result<()> {
                 &output,
                 tol,
                 max_iter,
+                trace_sink,
             )
             .context("Module 3 solve_and_write_profile failed")?;
-            eprintln!("[telescope]    n_unambig / ample:      {}", stats.n_unambiguous);
-            eprintln!("[telescope]    n_ambig / EM:          {}", stats.n_ambiguous);
-            eprintln!("[telescope]    EM iterations:        {}", stats.n_em_iter);
+            eprintln!("[telescope]    n_unambig / sample:      {}", stats.n_unambiguous);
+            eprintln!("[telescope]    n_ambig / EM:           {}", stats.n_ambiguous);
+            eprintln!("[telescope]    EM iterations:          {}", stats.n_em_iter);
             eprintln!(
-                "[telescope]    dropped (incompetent): {}",
+                "[telescope]    dropped (incompetent):  {}",
                 stats.n_dropped_incompetent
             );
+            eprintln!(
+                "[telescope]    dropped (no_competent): {}",
+                stats.n_dropped_no_competent_candidates
+            );
+            let n_ambig = stats.n_ambiguous.max(1) as f64;
+            eprintln!("[telescope]    posterior entropy histogram:");
+            eprintln!(
+                "[telescope]      < 0.20 nats (cleanly resolved): {} ({:.1}%)",
+                stats.n_entropy_clean,
+                stats.n_entropy_clean as f64 / n_ambig * 100.0
+            );
+            eprintln!(
+                "[telescope]      0.20–0.60 nats (partial):     {} ({:.1}%)",
+                stats.n_entropy_partial,
+                stats.n_entropy_partial as f64 / n_ambig * 100.0
+            );
+            eprintln!(
+                "[telescope]      > 0.60 nats (degenerate tie):  {} ({:.1}%)",
+                stats.n_entropy_degenerate,
+                stats.n_entropy_degenerate as f64 / n_ambig * 100.0
+            );
+            if debug && !stats.em_trace.is_empty() {
+                eprintln!("[telescope]    EM trace:");
+                for (iter, ll, ent) in &stats.em_trace {
+                    eprintln!(
+                        "[telescope]      iter={:>4}  logL={:>14.6e}  mean_entropy={:.4e}",
+                        iter, ll, ent
+                    );
+                }
+            }
             eprintln!("[telescope] done.");
             Ok(())
         }

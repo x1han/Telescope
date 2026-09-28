@@ -33,6 +33,9 @@ pub struct TranscriptParam {
     pub transcript_id: String,
     pub gene_id: String,
     pub is_competent: bool,
+    /// Cohort-level μ used as M-step MAP prior (fixed across iterations).
+    pub mu_cohort: f64,
+    /// Current μ estimate (initialized to mu_cohort, updated each M-step).
     pub mu: f64,
     pub sigma2_cohort: f64,
     /// Current EM iteration σ² (initialized to cohort, updated each M-step).
@@ -91,7 +94,8 @@ pub fn load_emission_parameters<P: AsRef<Path>>(
             let tr_id = tr_col.value(i).to_string();
             let gene_id = gene_col.value(i).to_string();
             let is_competent = comp_col.value(i);
-            let mu = mu_col.value(i);
+            let mu_cohort = mu_col.value(i);
+            let mu = mu_cohort;  // Initial value = cohort; M-step will update
             let sigma2_cohort = sigma2_col.value(i);
 
             map.insert(
@@ -100,6 +104,7 @@ pub fn load_emission_parameters<P: AsRef<Path>>(
                     transcript_id: tr_id,
                     gene_id,
                     is_competent,
+                    mu_cohort,
                     mu,
                     sigma2_cohort,
                     sigma2: sigma2_cohort,
@@ -114,7 +119,12 @@ pub fn load_emission_parameters<P: AsRef<Path>>(
 
 /// Run TEL-EM and write `telescope.profile.parquet`.
 ///
-/// Returns: stats `(n_unambiguous, n_ambiguous_em, n_ambiguous_iter, n_dropped_incompetent)`.
+/// Returns: stats `(n_unambiguous, n_ambiguous_em, n_ambiguous_iter, n_dropped_incompetent)`
+/// plus Phase A telemetry (entropy 3-tier, ghost-drop counter, EM log-L trace).
+///
+/// `output_em_trace`: if `Some`, receives one tuple per EM iteration
+/// `(iter_index, log_likelihood, mean_entropy)` (mean entropy = 0 if no
+/// ambiguous reads). Pass `None` to skip trace collection.
 pub fn solve_and_write_profile<P: AsRef<Path>>(
     graph: FlatEvidenceGraph,
     emission_path: P,
@@ -122,6 +132,7 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
     output_profile_path: P,
     tol: f64,
     max_iter: usize,
+    mut output_em_trace: Option<&mut Vec<(usize, f64, f64)>>,
 ) -> Result<TelEmStats> {
     let mut param_map = load_emission_parameters(emission_path)?;
     let num_transcripts = graph.transcript_names.len();
@@ -172,14 +183,15 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
     // 3. TEL-EM loop (only iterates over ambiguous reads).
     let nu_0 = 1.0_f64;
     let beta_0 = 1.0_f64;
+    let tau_0 = 2.0_f64; // MAP pseudo-count damping for μ update (spec v0.2.6 §F2).
     let mut prev_ll = f64::NEG_INFINITY;
     let mut final_weights: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n_ambiguous];
     let mut n_em_iter = 0_usize;
 
     for iter in 0..max_iter {
-        // E-step: parallel over ambiguous reads. Compute log-sum-exp normalized weights
-        // AND per-read log-likelihood.
-        let e_results: Vec<(f64, Vec<(usize, f64)>)> = ambiguous_indices
+        // E-step: parallel over ambiguous reads. Compute log-sum-exp normalized weights,
+        // per-read log-likelihood, and per-read posterior entropy.
+        let e_results: Vec<(f64, Vec<(usize, f64)>, f64)> = ambiguous_indices
             .par_iter()
             .map(|&mol_idx| {
                 let mol = &graph.molecules[mol_idx];
@@ -209,7 +221,8 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
                     .map(|&(_, ll)| ll)
                     .fold(f64::NEG_INFINITY, f64::max);
                 if max_ll == f64::NEG_INFINITY {
-                    return (0.0, Vec::new());
+                    // No competent candidate — read becomes a ghost-drop.
+                    return (0.0, Vec::new(), 0.0);
                 }
                 let sum_exp: f64 = raw.iter().map(|&(_, ll)| (ll - max_ll).exp()).sum();
                 let log_z = max_ll + sum_exp.ln();
@@ -219,12 +232,23 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
                     .filter(|&(_, ll)| ll > f64::NEG_INFINITY)
                     .map(|(tx_id, ll)| (tx_id, (ll - log_z).exp()))
                     .collect();
-                (log_z, weights)
+                let entropy = posterior_entropy(&weights);
+                (log_z, weights, entropy)
             })
             .collect();
 
-        let current_ll: f64 = e_results.iter().map(|&(ll, _)| ll).sum();
+        let current_ll: f64 = e_results.iter().map(|&(ll, _, _)| ll).sum();
         n_em_iter = iter + 1;
+
+        // Record EM trace (per-iter log-L + mean posterior entropy).
+        if let Some(ref mut trace) = output_em_trace {
+            let mean_entropy = if e_results.is_empty() {
+                0.0
+            } else {
+                e_results.iter().map(|&(_, _, h)| h).sum::<f64>() / e_results.len() as f64
+            };
+            trace.push((iter + 1, current_ll, mean_entropy));
+        }
 
         // Convergence check: per-molecule average log-likelihood delta.
         //
@@ -245,7 +269,7 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
             0.0
         };
         if delta_avg_ll < tol {
-            for (i, (_, w)) in e_results.into_iter().enumerate() {
+            for (i, (_, w, _)) in e_results.into_iter().enumerate() {
                 final_weights[i] = w;
             }
             break;
@@ -253,21 +277,29 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         prev_ll = current_ll;
 
         // Collect weights for M-step (always — even on non-final iterations).
-        for (i, (_, w)) in e_results.into_iter().enumerate() {
+        for (i, (_, w, _)) in e_results.into_iter().enumerate() {
             final_weights[i] = w;
         }
 
-        // M-step: update π_k and σ²_k.
+        // M-step: single-pass algebraic closed-form (spec v0.2.6 §F2 F-EM-4 Locked).
+        //
+        // Pre-M-step accumulators collect only (W, S1=Σ w·y, S2=Σ w·y²) per
+        // transcript. The σ² deviation Σ w·(y − μ_new)² is reconstructed
+        // algebraically AFTER μ is updated — avoiding the v0.2.4 bug of
+        // squaring deviations around an old μ that contradicts the new one.
         let mut accum_w = vec![0.0_f64; num_transcripts];
-        let mut accum_sq = vec![0.0_f64; num_transcripts];
+        let mut accum_w_y = vec![0.0_f64; num_transcripts];   // S1
+        let mut accum_w_y2 = vec![0.0_f64; num_transcripts];  // S2
 
         // Unambiguous: w=1.0 always.
         for &idx in &unambiguous_indices {
             let mol = &graph.molecules[idx];
             let tx_id = graph.candidate_pool[mol.candidate_offset as usize] as usize;
-            if let Some(ref p) = params[tx_id] {
+            let y = mol.log_pal as f64;
+            if params[tx_id].is_some() {
                 accum_w[tx_id] += 1.0;
-                accum_sq[tx_id] += (mol.log_pal as f64 - p.mu).powi(2);
+                accum_w_y[tx_id] += y;
+                accum_w_y2[tx_id] += y * y;
             }
         }
 
@@ -277,20 +309,33 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
             let mol = &graph.molecules[mol_idx];
             let y = mol.log_pal as f64;
             for &(tx_id, w) in weights {
-                if let Some(ref p) = params[tx_id] {
+                if params[tx_id].is_some() {
                     accum_w[tx_id] += w;
-                    accum_sq[tx_id] += w * (y - p.mu).powi(2);
+                    accum_w_y[tx_id] += w * y;
+                    accum_w_y2[tx_id] += w * y * y;
                 }
             }
         }
 
+        // 3-step update: μ → σ² (around μ_new) → π. Order is locked (spec §F2).
         for i in 0..num_transcripts {
             if let Some(ref mut p) = params[i] {
                 let w_sum = accum_w[i];
-                p.alpha = w_sum / n_total_molecules;
-                p.sigma2 = (accum_sq[i] + 2.0 * beta_0 * p.sigma2_cohort)
+
+                // STEP 1: μ update — weak empirical Bayes shrinkage (τ₀=2).
+                p.mu = (accum_w_y[i] + tau_0 * p.mu_cohort) / (w_sum + tau_0);
+
+                // STEP 2: σ² update — algebraic closed-form around μ_new.
+                //   Σ w·(y − μ_new)² = S2 − 2·μ_new·S1 + μ_new²·W   (identity).
+                let s1 = accum_w_y[i];
+                let s2 = accum_w_y2[i];
+                let sq_dev_new = (s2 - 2.0 * p.mu * s1 + p.mu * p.mu * w_sum).max(0.0);
+                p.sigma2 = (sq_dev_new + 2.0 * beta_0 * p.sigma2_cohort)
                     / (w_sum + 2.0 * nu_0 + 3.0);
                 p.sigma2 = p.sigma2.max(MIN_COHORT_VARIANCE);
+
+                // STEP 3: π update.
+                p.alpha = w_sum / n_total_molecules;
             }
         }
     }
@@ -303,6 +348,10 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
     let mut pal_b = Int32Builder::new();
     let mut w_b = Float64Builder::new();
     let mut n_dropped_incompetent = 0_u64;
+    let mut n_dropped_no_competent_candidates = 0_u64;
+    let mut n_entropy_clean = 0_u64;
+    let mut n_entropy_partial = 0_u64;
+    let mut n_entropy_degenerate = 0_u64;
 
     // Unambiguous rows: 1 per read.
     for &idx in &unambiguous_indices {
@@ -332,6 +381,21 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         let mol_idx = ambiguous_indices[i];
         let mol = &graph.molecules[mol_idx];
         let pal_i32 = poly_a_length_from_log2(mol.log_pal);
+
+        // Phase A entropy 3-tier + ghost-drop telemetry.
+        if weights.is_empty() {
+            n_dropped_no_competent_candidates += 1;
+        } else {
+            let h = posterior_entropy(&weights);
+            if h < 0.20 {
+                n_entropy_clean += 1;
+            } else if h <= 0.60 {
+                n_entropy_partial += 1;
+            } else {
+                n_entropy_degenerate += 1;
+            }
+        }
+
         for (tx_id, w) in weights {
             if w < min_weight {
                 continue;
@@ -388,6 +452,11 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         n_ambiguous,
         n_em_iter,
         n_dropped_incompetent,
+        n_dropped_no_competent_candidates,
+        n_entropy_clean,
+        n_entropy_partial,
+        n_entropy_degenerate,
+        em_trace: output_em_trace.map(|t| t.clone()).unwrap_or_default(),
     })
 }
 
@@ -396,13 +465,35 @@ fn poly_a_length_from_log2(log_pal: f32) -> i32 {
     log_pal.exp2().round() as i32
 }
 
+/// Posterior entropy (in nats) of a single ambiguous read over its
+/// non-zero weighted candidates: `H = -Σ_k w_k * ln(w_k)`.
+/// Returns 0.0 for an empty / degenerate weight vector.
+fn posterior_entropy(weights: &[(usize, f64)]) -> f64 {
+    weights
+        .iter()
+        .map(|&(_, w)| if w > 0.0 { -w * w.ln() } else { 0.0 })
+        .sum()
+}
+
 /// TEL-EM execution stats for logging / telemetry.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct TelEmStats {
     pub n_unambiguous: usize,
     pub n_ambiguous: usize,
     pub n_em_iter: usize,
     pub n_dropped_incompetent: u64,
+    /// Reads dropped because all candidates were `is_polyA_competent == false`
+    /// (ghost transcripts / n_flnc==0). Phase A telemetry.
+    pub n_dropped_no_competent_candidates: u64,
+    /// Posterior entropy 3-tier counters (per ambiguous read, in nats).
+    /// clean: H < 0.20 nats (near-deterministic assignment).
+    pub n_entropy_clean: u64,
+    /// partial: 0.20 <= H <= 0.60 nats (two-three-way partial ambiguity).
+    pub n_entropy_partial: u64,
+    /// degenerate: H > 0.60 nats (effectively uniform over candidates).
+    pub n_entropy_degenerate: u64,
+    /// EM trace: per-iter `(iter_index, log_likelihood, mean_entropy)`.
+    pub em_trace: Vec<(usize, f64, f64)>,
 }
 
 #[cfg(test)]

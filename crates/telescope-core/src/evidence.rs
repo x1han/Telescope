@@ -171,6 +171,21 @@ pub fn extract_evidence<P: AsRef<Path>>(
     })
 }
 
+impl FlatEvidenceGraph {
+    /// Distribution of `candidate_count` across molecules: returns a sorted
+    /// vec of `(candidate_count, n_molecules_with_that_count)` pairs.
+    /// Useful for diagnosing multi-mapping load (Phase A telemetry).
+    pub fn candidate_count_histogram(&self) -> Vec<(u16, u64)> {
+        let mut hist: HashMap<u16, u64> = HashMap::new();
+        for mol in &self.molecules {
+            *hist.entry(mol.candidate_count).or_insert(0) += 1;
+        }
+        let mut v: Vec<_> = hist.into_iter().collect();
+        v.sort_by_key(|(k, _)| *k);
+        v
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
