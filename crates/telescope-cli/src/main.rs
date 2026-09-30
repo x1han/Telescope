@@ -189,10 +189,15 @@ enum Cmd {
         /// candidate transcript's 5' end, else 0 (default: 1.8). Must be >= 0.
         ///
         /// `g_k` is the start of the read's BEST alignment to candidate k, in
-        /// candidate k's OWN cDNA coordinates — not a genomic span. Because the
-        /// two strands of the molecule measure opposite ends, Module 2 corrects
-        /// for strand at extraction, so this term is well defined on antisense
-        /// alignments rather than silently reading the 3' end.
+        /// candidate k's OWN cDNA coordinates — not a genomic span.
+        ///
+        /// STRAND IS A KNOWN GAP, not a handled case. The frozen spec was
+        /// validated on a forward-only population and the reverse fraction is
+        /// 0.0000 across 200,000 mapped records in each of the AIDRS / Bambu /
+        /// IsoQuant BAMs, so `g_k = s_k − 1` is applied unconditionally here.        /// If the Bambu/IsoQuant general path (Phase F1/F2) ever carries
+        /// antisense alignments this term would silently read the wrong end of
+        /// the molecule; that needs a separately validated definition, not an
+        /// inline guess. See `test_reverse_alignment_uses_the_forward_formula_as_a_documented_gap`.
         ///
         /// **Set to 0 to switch the term off.** That makes `ln_5p ≡ 0` exactly,
         /// so it drops out of the softmax exactly; it is the correct way to run
@@ -224,6 +229,20 @@ enum Cmd {
         /// a very large value to switch the prune off.
         #[arg(long, default_value_t = PRUNE_MAX_DELTA_AS_DEFAULT)]
         prune_max_delta_as: i32,
+
+        /// Output-stage posterior truncation threshold (default: 0.01). A
+        /// (read × candidate) row is emitted only if its posterior is >= this,
+        /// and each read's surviving rows are renormalised to 1.0.
+        ///
+        /// THIS IS NOT COSMETIC FOR A/B WORK. Two arms of an ablation can emit
+        /// different row counts on the same reads — measured on GNG11, 2726 rows
+        /// with the 5' term on vs 1816 with it off — because the arm that shifts
+        /// mass onto a candidate is the arm that clears the cutoff. The arms are
+        /// then not scored on the same support. Any ablation whose arms differ in
+        /// row count must be re-run at `--min-weight 0` (no truncation at all)
+        /// before its delta is quoted. 0.0 is legal; values >= 1.0 are rejected.
+        #[arg(long, default_value_t = 0.01)]
+        min_weight: f64,
 
         /// Optional TSV with header `bam_id\toriginal_id` for ID translation
         /// (replaces offline Python workaround for AIDRS re-keying).
@@ -424,6 +443,7 @@ fn main() -> Result<()> {
             five_prime_weight,
             five_prime_window,
             prune_max_delta_as,
+            min_weight,
             tx_id_mapping,
             debug,
         } => {
@@ -600,6 +620,7 @@ fn main() -> Result<()> {
                 five_prime_weight,
                 five_prime_window,
                 prune_max_delta_as,
+                min_weight,
                 trace_sink,
             )
             .context("Module 3 solve_and_write_profile failed")?;

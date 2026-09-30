@@ -190,6 +190,7 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
     five_prime_weight: f64,
     five_prime_window: u32,
     prune_max_delta_as: i32,
+    min_weight: f64,
     mut output_em_trace: Option<&mut Vec<(usize, f64, f64)>>,
 ) -> Result<TelEmStats> {
     // NaN-safe equivalent of the CLI's `!(aln_weight_lambda > 0.0)`: `<= 0.0`
@@ -201,6 +202,18 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
             "aln_weight_lambda must be > 0 (got {}); it scales ln A_rk = (AS_rk − \
              max_j AS_rj)/λ, so 0 and NaN would emit NaN posterior weights",
             aln_weight_lambda
+        );
+    }
+    // NaN-safe: `(0.0..1.0).contains(&NaN)` is false, so the range test alone
+    // rejects NaN; `is_finite` is kept explicit because +inf would also fail
+    // the range test but for a different reason, and the two failure modes
+    // deserve different error text. 0.0 is legal and means NO truncation.
+    if !min_weight.is_finite() || !(0.0..1.0).contains(&min_weight) {
+        anyhow::bail!(
+            "min_weight must be finite and in [0, 1) (got {}); it is the output-stage \
+             posterior truncation threshold, and 1.0 would retain only a read's \
+             argmax, silently turning the profile into a hard-assignment table",
+            min_weight
         );
     }
     // 5'-anchoring weight. 0.0 is a LEGAL value and is the documented off
@@ -237,11 +250,51 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
 
     let mut param_map = load_emission_parameters(emission_path)?;
     let num_transcripts = graph.transcript_names.len();
+    let n_emission = param_map.len();
 
     // Index transcripts by position in `graph.transcript_names`.
     let mut params: Vec<Option<TranscriptParam>> = Vec::with_capacity(num_transcripts);
     for name in &graph.transcript_names {
         params.push(param_map.remove(name));
+    }
+    let n_matched = params.iter().filter(|p| p.is_some()).count();
+
+    // ID-SPACE GUARD. `graph.transcript_names` comes from the BAM @SQ header;
+    // the emission parquet is keyed by whatever `build-emission` was handed. In
+    // AIDRS Mode those are DIFFERENT SPACES and nothing in the pipeline
+    // reconciles them on its own: the BAM uses `AIDRS_tx_N`, the AIDRS
+    // polyA/assessment tables use `ENST`/`ENSG_NovelTr`. Measured on HC3:
+    // 70,511 BAM references against 70,301 emission rows, intersection ZERO.
+    //
+    // The failure is silent and total. Every `params[i]` above is `None`, so
+    // every read takes the ghost-drop path, and the run still exits 0 behind a
+    // normal-looking telemetry block — measured on the GNG11 subset: 1637
+    // molecules extracted, EM converged in 2 iterations, 1637 dropped
+    // (502 "incompetent" + 1135 "no_competent"), 0 rows emitted, exit 0. The
+    // only tells are the drop counters equalling the input totals and an
+    // all-zero entropy histogram, neither of which a reader checks.
+    //
+    // A zero overlap is never a legitimate configuration, so refuse it instead
+    // of writing an empty profile. Partial overlap is NOT checked here and is
+    // legitimate: transcripts absent from the emission (novel, or polyA-less) are
+    // dropped one by one by design.
+    if num_transcripts > 0 && n_matched == 0 {
+        let bam_sample = graph
+            .transcript_names
+            .first()
+            .map(String::as_str)
+            .unwrap_or("");
+        let em_sample = param_map.keys().next().map(String::as_str).unwrap_or("");
+        anyhow::bail!(
+            "ID-SPACE MISMATCH: none of the {num_transcripts} transcripts in the BAM are \
+             present among the {n_emission} rows of the emission parquet (BAM id e.g. \
+             {bam_sample:?}, emission id e.g. {em_sample:?}). Every read would be \
+             silently dropped and an EMPTY profile written. In AIDRS Mode the BAM is \
+             keyed `AIDRS_tx_N` and the AIDRS polyA/assessment tables are keyed \
+             `ENST`/`ENSG_NovelTr`; pass `--tx-id-mapping <bam_id<TAB>original_id tsv>` \
+             to bridge them, or use Universal Mode (`build-anchors`), whose ids come \
+             from the BAM itself."
+        );
     }
 
     // 1. Split molecules by candidate_count.
@@ -604,8 +657,17 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         }
     }
 
-    // Ambiguous rows: per (read × candidate) with posterior ≥ 0.01.
-    let min_weight = 0.01_f64;
+    // Ambiguous rows: per (read × candidate) with posterior ≥ `min_weight`.
+    // `min_weight` is a CALLER-SUPPLIED parameter, not a constant, because it
+    // silently changes what an A/B comparison is measuring. At the shipped 0.01
+    // a read whose losing candidate sits below 0.01 loses that row and has its
+    // survivors renormalised to 1.0 — so an arm that shifts mass onto a
+    // candidate emits MORE rows than the arm that does not, and the two arms
+    // are no longer scored on the same support. Measured on GNG11: 2726 rows
+    // with the 5' term on vs 1816 with it off, same reads, same weight_sum.
+    // Any ablation whose arms emit different row counts must be re-run at
+    // `min_weight = 0` (where `retained_sum` is the full 1.0 and the term is
+    // exactly off) before its delta is quoted.
     for (i, weights) in final_weights.into_iter().enumerate() {
         let mol_idx = ambiguous_indices[i];
         let mol = &graph.molecules[mol_idx];
@@ -674,8 +736,12 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
             if w < min_weight {
                 continue;
             }
-            // Safe: this body only runs when at least one weight is retained,
-            // hence `retained_sum >= min_weight > 0`.
+            // Safe: this body only runs when at least one weight is retained.
+            // `retained_sum > 0` follows from the softmax summing to 1 over the
+            // candidates that survived `filter(ll > -inf)`, NOT from
+            // `min_weight > 0` — the latter is no longer guaranteed now that 0
+            // is a legal value, and the argument is what makes `min_weight = 0`
+            // (no truncation) well-defined rather than a divide-by-zero.
             let w_norm = w / retained_sum;
             if let Some(ref p) = params[tx_id] {
                 if !p.is_competent {
@@ -1089,6 +1155,7 @@ mod tests {
             FIVE_PRIME_OFF,
             FIVE_PRIME_WINDOW,
             PRUNE_OFF,
+            MIN_WEIGHT,
             None,
         )
         .unwrap();
@@ -1204,6 +1271,7 @@ mod tests {
             FIVE_PRIME_OFF,
             FIVE_PRIME_WINDOW,
             PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
             None,
         )
         .unwrap();
@@ -1226,6 +1294,134 @@ mod tests {
             rows.iter().map(|&(_, w)| w).sum::<f64>(),
             1.0,
             "emitted posterior weights must sum to exactly 1.0"
+        );
+    }
+
+    /// `min_weight = 0` must mean EXACTLY "no truncation", and that has to be a
+    /// real code path, not an accident of `w < 0.0` never being true.
+    ///
+    /// This is load-bearing for ablation work, not a nicety. The GNG11 gate
+    /// measured 2726 emitted rows with the 5' term on against 1816 with it off,
+    /// on the same reads and the same total weight: the arm that shifts mass
+    /// onto a candidate is the arm that clears the 0.01 cutoff, so the two arms
+    /// are not scored on the same support and their difference is not purely the
+    /// ablated term. The remedy is to re-run at `min_weight = 0`, which is only
+    /// legitimate if 0 restores the full untruncated posterior.
+    ///
+    /// Same fixture as the test above, where the `tx1` candidate sits ~5 nats
+    /// down and is therefore truncated at the default but must survive at 0.
+    #[test]
+    fn test_zero_min_weight_disables_truncation_and_still_renormalizes() {
+        let log_pal = (100.0_f32).log2();
+        let sigma2 = 0.04;
+        let emission = scratch("mw0_emission.parquet");
+        let profile_cut = scratch("mw0_profile_cut.parquet");
+        let profile_zero = scratch("mw0_profile_zero.parquet");
+        write_test_emission(
+            &emission,
+            &[
+                ("tx0", "gene0", log_pal as f64, sigma2),
+                (
+                    "tx1",
+                    "gene1",
+                    log_pal as f64 - (2.0 * sigma2 * 5.0).sqrt(),
+                    sigma2,
+                ),
+            ],
+        );
+        let cands = [("tx0", 900), ("tx1", 900)];
+
+        for (path, min_weight) in [(&profile_cut, MIN_WEIGHT), (&profile_zero, 0.0)] {
+            solve_and_write_profile(
+                synth_graph(log_pal, &cands),
+                &emission,
+                "TEST",
+                path,
+                1e-6,
+                1,
+                100.0,
+                FIVE_PRIME_OFF,
+                FIVE_PRIME_WINDOW,
+                PRUNE_MAX_DELTA_AS,
+                min_weight,
+                None,
+            )
+            .unwrap();
+        }
+
+        let cut = read_profile(&profile_cut);
+        let zero = read_profile(&profile_zero);
+        let _ = std::fs::remove_file(&emission);
+        let _ = std::fs::remove_file(&profile_cut);
+        let _ = std::fs::remove_file(&profile_zero);
+
+        assert_eq!(
+            zero.len(),
+            cut.len() + 1,
+            "min_weight = 0 must retain the candidate the default cutoff drops \
+             (cut={cut:?}, zero={zero:?})"
+        );
+        assert!(
+            zero.iter().any(|&(_, w)| w < MIN_WEIGHT),
+            "at min_weight = 0 a sub-cutoff weight must be emitted verbatim, \
+             otherwise 0 is not actually 'no truncation': {zero:?}"
+        );
+        assert_eq!(
+            zero.iter().map(|&(_, w)| w).sum::<f64>(),
+            1.0,
+            "even with no truncation the per-read posterior must sum to 1.0"
+        );
+    }
+
+    /// Disjoint id spaces must be REFUSED, not silently absorbed.
+    ///
+    /// This is the shipped AIDRS Mode default, measured on HC3: the BAM is keyed
+    /// `AIDRS_tx_N`, `build-emission` is keyed `ENST`/`ENSG_NovelTr`, and the
+    /// intersection is 0. Before this guard the run behaved like a success —
+    /// 1637 molecules extracted, EM converged in 2 iterations, 1637 dropped
+    /// (502 "incompetent" + 1135 "no_competent"), zero rows emitted, exit 0.
+    ///
+    /// The `!profile.exists()` assertion is the one that matters: it pins that
+    /// the guard fires BEFORE the writer opens the file. A guard placed after
+    /// the write would still read as correct from the error message alone.
+    #[test]
+    fn test_disjoint_id_spaces_are_refused_before_any_profile_is_written() {
+        let log_pal = (100.0_f32).log2();
+        let emission = scratch("idspace_emission.parquet");
+        let profile = scratch("idspace_profile.parquet");
+        // Emission ids deliberately share no key with the graph's "tx0".
+        write_test_emission(
+            &emission,
+            &[("AIDRS_tx_999", "gene9", log_pal as f64, 0.04)],
+        );
+        let graph = synth_graph(log_pal, &[("tx0", 900)]);
+
+        let err = solve_and_write_profile(
+            graph,
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            1,
+            100.0,
+            FIVE_PRIME_OFF,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
+            None,
+        )
+        .unwrap_err();
+        let _ = std::fs::remove_file(&emission);
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ID-SPACE MISMATCH"),
+            "a zero-overlap emission must be refused by name, got: {msg}"
+        );
+        assert!(
+            !profile.exists(),
+            "the refusal must happen before the profile writer opens the file, \
+             otherwise the empty profile is already on disk by the time we bail"
         );
     }
 
@@ -1286,6 +1482,7 @@ mod tests {
             FIVE_PRIME_OFF,
             FIVE_PRIME_WINDOW,
             PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
             None,
         )
         .unwrap();
@@ -1353,6 +1550,7 @@ mod tests {
                 w5p,
                 window,
                 prune,
+                MIN_WEIGHT,
                 None,
             )
             .map(|_| ())
@@ -1429,6 +1627,7 @@ mod tests {
             five_prime_weight,
             FIVE_PRIME_WINDOW,
             prune_max_delta_as,
+            MIN_WEIGHT,
             None,
         )
         .unwrap();
