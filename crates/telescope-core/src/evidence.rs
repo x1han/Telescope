@@ -216,37 +216,30 @@ pub fn extract_evidence<P: AsRef<Path>>(
         //    so `start_pos` / `ref_end` are already cDNA coordinates. No
         //    genomic conversion is involved, and none is wanted.
         //
-        //    STRAND (this is the one place the frozen spec is silent, so it is
-        //    decided here explicitly rather than inherited):
+        //    STRAND — KNOWN GAP, NOT HANDLED. The frozen spec was validated on
+        //    a FORWARD-ONLY population: the prototype that produced the 58.34%
+        //    directionality figure skips reverse records outright
+        //    (`if a.is_reverse: continue` in `proto_five_prime.py`). Measured
+        //    over 200,000 mapped records in each of the three BAMs this project
+        //    actually runs (AIDRS, Bambu, IsoQuant), the reverse fraction is
+        //    0.0000, so on today's data this is dead code either way.
         //
-        //      forward  — the read's 5' end is the alignment's LEFT end, so the
-        //                 observed gap is `s_k − 1 = start_pos − 1`.
-        //      reverse  — the read is reverse-complemented against the cDNA, so
-        //                 its 5' end is the alignment's RIGHT end and the
-        //                 observed gap is `T_k − ref_end` (the transcript bases
-        //                 lying beyond the alignment's high end).
+        //    An earlier version branched here to `T_k − ref_end` for reverse
+        //    records. That was removed: the TES filter above runs first and is
+        //    strand-blind, so every surviving reverse read satisfies
+        //    `ref_end + tes_slack >= ref_len`, forcing `T_k − ref_end <=
+        //    tes_slack` (= 35). With `five_prime_window = 20` the term would
+        //    degenerate into "did `ref_end` land in the top 20 bp of a band the
+        //    filter already chose", and it would be unvalidated in any case.
+        //    If the Bambu/IsoQuant general path (Phase F1/F2) ever carries
+        //    antisense alignments, this needs a separately validated
+        //    definition — it must not be reintroduced as an inline guess.
         //
-        //    `g_k = start_pos − 1` applied to a reverse record measures the gap
-        //    at the molecule's 3' END and is silently wrong for every antisense
-        //    alignment — roughly a coin flip in an ONT cDNA library, which is
-        //    why `is_reverse_complemented()` was never read anywhere in this
-        //    crate before now. Storing the ALREADY-CORRECTED gap (rather than
-        //    the start plus a strand flag) means every downstream consumer,
-        //    including Module 3's E-step, cannot get this wrong by omission.
-        //
-        //    noodles' `alignment_start()` is 1-BASED, so the forward case is
-        //    already exactly the spec's `s_k − 1`; do NOT subtract a second 1
-        //    (the spec's "1-based reference_start" is bait for rust-htslib,
-        //    whose `reference_start()` is 0-based — this crate does not use it).
-        //    The TES filter above guarantees `ref_end ≤ ref_len` is not
-        //    required for correctness of the forward branch, and the reverse
-        //    branch saturates at 0 rather than wrapping if a malformed BAM
-        //    reports `ref_end > T_k`.
-        let gap5p: u32 = if flags.is_reverse_complemented() {
-            u32::try_from(ref_len.saturating_sub(ref_end)).unwrap_or(u32::MAX)
-        } else {
-            u32::try_from(start_pos.saturating_sub(1)).unwrap_or(u32::MAX)
-        };
+        //    noodles' `alignment_start()` is 1-BASED, so this is already
+        //    exactly the spec's `s_k − 1`; do NOT subtract a second 1 (the
+        //    spec's "1-based reference_start" is bait for rust-htslib, whose
+        //    `reference_start()` is 0-based — this crate does not use it).
+        let gap5p: u32 = u32::try_from(start_pos.saturating_sub(1)).unwrap_or(u32::MAX);
 
         // 4. Read name (QNAME).
         let read_id = match record.name() {
@@ -739,25 +732,17 @@ mod tests {
         assert_eq!(gap, vec![0]);
     }
 
-    /// Regression test for the strand-corrected 5' gap `g_k`.
+    /// Pins the frozen 1-based convention for the forward 5' gap `g_k = s_k − 1`.
     ///
-    /// `g_k` is the number of candidate-cDNA bases lying 5' of the read's 5'
-    /// end, so the two strands measure opposite ENDS of the alignment:
-    /// forward reads → `s_k − 1`, reverse reads → `T_k − ref_end`. Applying the
-    /// forward formula to a reverse record is a ~50% silent error in a library
-    /// with a non-negligible antisense fraction, and it is invisible in a
-    /// fixture where every record is full-length and forward — which, with a
-    /// 100 bp reference, is every record the old helper could build.
+    /// `f5` is the off-by-one tripwire: start 6 must give `g_k = 5`, not 6.
+    /// `f20` sits exactly on the `g_k <= 20` window edge, so an inclusive /
+    /// exclusive slip at the boundary also fails here.
     ///
-    /// `rev` is the sharp case: it starts at position 1, so the forward formula
-    /// would report `g_k = 0` — the strongest possible 5' claim — when the read
-    /// is in fact 30 bp from the 3' end.
-    ///
-    /// Mutation target: dropping the `is_reverse_complemented()` branch (or
-    /// computing `start_pos − 1` unconditionally) reports 0 for `rev`, and the
-    /// `f20` case fails too if the off-by-one slips.
+    /// Strand is deliberately NOT exercised here — see
+    /// `test_reverse_alignment_uses_the_forward_formula_as_a_documented_gap`
+    /// for why that is a known gap rather than a handled case.
     #[test]
-    fn test_5p_gap_is_strand_corrected() {
+    fn test_5p_gap_is_forward_formula_and_one_based() {
         let path = write_synthetic_bam(
             "gap5p",
             vec![
@@ -767,8 +752,6 @@ mod tests {
                 // Forward, g_k = 20 → start 21. Exactly the frozen `g_k <= 20`
                 // window edge.
                 synth_record_with_gap("f20", 1, 20, false, Some(900), 1, 60),
-                // Reverse, g_k = 30 → start 1, ref_end = REF_LEN − 30.
-                synth_record_with_gap("rev", 2, 30, true, Some(800), 1, 60),
             ],
         );
 
@@ -790,10 +773,50 @@ mod tests {
 
         assert_eq!(gap_of("f5"), 5, "forward ⇒ g_k = s_k − 1, so 6 − 1 = 5");
         assert_eq!(gap_of("f20"), 20, "forward start 21 ⇒ g_k = 20 exactly");
+    }
+
+    /// Strand is a KNOWN GAP, not a handled case, and this test exists so the
+    /// gap stays visible instead of being quietly closed by a future edit.
+    ///
+    /// The frozen spec `g_k = s_k − 1` was validated on a FORWARD-ONLY
+    /// population (the prototype skips reverse records), and the reverse
+    /// fraction is 0.0000 across 200,000 mapped records in each of the three
+    /// BAMs this project runs. An earlier version branched to `T_k − ref_end`
+    /// for reverse records; that was removed because the strand-blind TES
+    /// filter forces `T_k − ref_end <= tes_slack` for every surviving reverse
+    /// read, collapsing the term into a 20-of-35 bp band, and the definition
+    /// would have been unvalidated besides.
+    ///
+    /// So a reverse record now gets the forward formula. If the Bambu/IsoQuant
+    /// general path (Phase F1/F2) ever carries antisense alignments, the right
+    /// answer is a separately validated definition -- this assertion is where
+    /// that decision must be made deliberately, not as an inline guess.
+    #[test]
+    fn test_reverse_alignment_uses_the_forward_formula_as_a_documented_gap() {
+        let path = write_synthetic_bam(
+            "strand_gap",
+            vec![
+                // reverse record, start 1 on an 800 nt reference
+                synth_record_with_gap("rev", 0, 30, true, Some(800), 1, 60),
+            ],
+        );
+
+        let graph = extract_evidence(&path, 35).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let mol = graph
+            .molecules
+            .iter()
+            .find(|m| m.read_id == "rev")
+            .expect("rev must be in the graph");
+        let gap = graph.candidate_5p_gap[mol.candidate_offset as usize];
+
+        // start_pos = 1 ⇒ g_k = 0, i.e. the formula does NOT branch on strand.
+        // If this ever becomes strand-aware, this assertion is the tripwire.
         assert_eq!(
-            gap_of("rev"),
-            30,
-            "reverse ⇒ g_k = T_k − ref_end = 30, NOT start − 1 = 0"
+            gap, 0,
+            "g_k is computed as start_pos - 1 regardless of strand; a change here \
+             means a new definition was adopted and must be re-validated"
         );
     }
 

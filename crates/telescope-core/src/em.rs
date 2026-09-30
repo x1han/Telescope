@@ -210,7 +210,10 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
     // reads that start far from the transcript's 5' end, which is not a
     // configuration the frozen spec admits; NaN would propagate into `ll` and
     // out as NaN posterior weights.
-    if five_prime_weight < 0.0 || five_prime_weight.is_nan() {
+    // `is_finite()` rather than `is_nan()`: +inf would pass a NaN check and
+    // then poison the log-sum-exp with `inf - inf`, emitting NaN weights --
+    // the exact outcome this guard exists to prevent.
+    if !five_prime_weight.is_finite() || five_prime_weight < 0.0 {
         anyhow::bail!(
             "five_prime_weight must be >= 0 and non-NaN (got {}); it is the log-space \
              bonus ln_5p awarded to a candidate whose observed 5' gap g_k <= \
@@ -1337,7 +1340,6 @@ mod tests {
         let log_pal = (100.0_f32).log2();
         let missing = scratch("definitely_not_here.parquet");
         let profile = scratch("validation_profile.parquet");
-        let graph = synth_graph(log_pal, &[("tx0", 900), ("tx1", 800)]);
 
         let run = |lambda: f64, w5p: f64, window: u32, prune: i32| {
             solve_and_write_profile(
@@ -1490,8 +1492,14 @@ mod tests {
     /// TEST B of the ablation gate, at unit scale: REDRAWING each read's 5' start
     /// must RESTORE the no-5'-term posterior.
     ///
-    /// This is the test that catches the whole term silently doing nothing. The
-    /// acceptance criterion for the real ablation is a DIFFERENCE (Test A −
+    /// This is a NO-LEAK test, not a liveness test: the redraw makes the two
+    /// candidates identical, so a flat 0.5/0.5 is the correct answer under ANY
+    /// implementation, including one with the term removed entirely — it passes
+    /// with the 5' term disabled. The tests that actually prove the term is live
+    /// are `test_five_prime_term_shifts_posterior_toward_the_anchored_candidate`
+    /// and `test_five_prime_window_is_inclusive_at_20`; both go red if the term
+    /// is neutered. The acceptance criterion for the real ablation is a
+    /// DIFFERENCE (Test A −
     /// Test B ≥ 20 pp), never an absolute percentage, because the absolute value
     /// is measured against a label that is not ground truth. The same property
     /// is what makes the term legitimate here: `ln_5p` is a PRIOR over a
