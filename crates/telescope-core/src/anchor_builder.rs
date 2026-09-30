@@ -41,7 +41,11 @@ pub struct TxToGene {
 }
 
 impl TxToGene {
-    pub fn new() -> Self { Self { map: HashMap::new() } }
+    pub fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+        }
+    }
 
     /// Load from a TSV with header `transcript_id\tgene_id`.
     pub fn from_tsv<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -54,7 +58,7 @@ impl TxToGene {
             }
             let mut parts = line.splitn(2, '\t');
             let tx = parts.next().unwrap_or("").to_string();
-            let g  = parts.next().unwrap_or("").to_string();
+            let g = parts.next().unwrap_or("").to_string();
             if !tx.is_empty() && !g.is_empty() {
                 map.insert(tx, g);
             }
@@ -62,16 +66,20 @@ impl TxToGene {
         Ok(Self { map })
     }
 
-    pub fn get(&self, tx: &str) -> Option<&String> { self.map.get(tx) }
-    pub fn len(&self) -> usize { self.map.len() }
+    pub fn get(&self, tx: &str) -> Option<&String> {
+        self.map.get(tx)
+    }
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
 }
 
 /// One filtered alignment that passes the anchor criteria.
 #[derive(Debug, Clone)]
 pub struct AnchorRecord {
-    pub sample_id:    String,
-    pub read_id:      String,
-    pub gene_id:      String,
+    pub sample_id: String,
+    pub read_id: String,
+    pub gene_id: String,
     pub transcript_id: String,
     pub poly_a_length: i32,
 }
@@ -99,7 +107,12 @@ where
 
     for (bam, sample_id) in bams_and_samples {
         let (anchors, sample_stats) = extract_anchors_from_bam(
-            bam, sample_id, tx_to_gene, tes_slack, min_coverage, max_reads_per_sample,
+            bam,
+            sample_id,
+            tx_to_gene,
+            tes_slack,
+            min_coverage,
+            max_reads_per_sample,
         )?;
         stats.add(&sample_stats);
         all_anchors.extend(anchors);
@@ -122,8 +135,7 @@ fn extract_anchors_from_bam<P: AsRef<Path>>(
     max_reads_per_sample: usize,
 ) -> Result<(Vec<AnchorRecord>, SampleStats)> {
     let path = bam.as_ref();
-    let file = File::open(path)
-        .with_context(|| format!("Failed to open BAM: {:?}", path))?;
+    let file = File::open(path).with_context(|| format!("Failed to open BAM: {:?}", path))?;
     let mut reader = BamReader::new(file);
     let header = reader.read_header().context("Failed to read BAM header")?;
 
@@ -152,7 +164,10 @@ fn extract_anchors_from_bam<P: AsRef<Path>>(
     for result in reader.records() {
         let record = match result {
             Ok(r) => r,
-            Err(_) => { stats.parse_errors += 1; continue; }
+            Err(_) => {
+                stats.parse_errors += 1;
+                continue;
+            }
         };
         stats.total_records += 1;
 
@@ -222,7 +237,9 @@ fn extract_anchors_from_bam<P: AsRef<Path>>(
 
         // Resolve transcript_id and gene_id.
         let transcript_id = ref_seqs.get(ref_id).cloned().unwrap_or_default();
-        let gene_id = tx_to_gene.get(&transcript_id).cloned()
+        let gene_id = tx_to_gene
+            .get(&transcript_id)
+            .cloned()
             .unwrap_or_else(|| transcript_id.clone());
 
         // Per-sample cap.
@@ -238,7 +255,7 @@ fn extract_anchors_from_bam<P: AsRef<Path>>(
             None => continue,
         };
         anchors.push(AnchorRecord {
-            sample_id:    sample_id.to_string(),
+            sample_id: sample_id.to_string(),
             read_id,
             gene_id,
             transcript_id,
@@ -250,16 +267,13 @@ fn extract_anchors_from_bam<P: AsRef<Path>>(
     Ok((anchors, stats))
 }
 
-fn write_anchor_parquet<P: AsRef<Path>>(
-    anchors: &[AnchorRecord],
-    output: P,
-) -> Result<()> {
-    let mut sample_b   = StringBuilder::new();
-    let mut read_b     = StringBuilder::new();
-    let mut gene_b     = StringBuilder::new();
-    let mut tx_b       = StringBuilder::new();
-    let mut pal_b      = Int32Builder::new();
-    let mut w_b        = Float64Builder::new();
+fn write_anchor_parquet<P: AsRef<Path>>(anchors: &[AnchorRecord], output: P) -> Result<()> {
+    let mut sample_b = StringBuilder::new();
+    let mut read_b = StringBuilder::new();
+    let mut gene_b = StringBuilder::new();
+    let mut tx_b = StringBuilder::new();
+    let mut pal_b = Int32Builder::new();
+    let mut w_b = Float64Builder::new();
 
     for a in anchors {
         sample_b.append_value(&a.sample_id);
@@ -267,15 +281,15 @@ fn write_anchor_parquet<P: AsRef<Path>>(
         gene_b.append_value(&a.gene_id);
         tx_b.append_value(&a.transcript_id);
         pal_b.append_value(a.poly_a_length);
-        w_b.append_value(1.0_f64);  // anchors are deterministic → w=1
+        w_b.append_value(1.0_f64); // anchors are deterministic → w=1
     }
 
     let schema = Arc::new(Schema::new(vec![
-        Field::new("sample_id",        DataType::Utf8,    false),
-        Field::new("read_id",          DataType::Utf8,    false),
-        Field::new("gene_id",          DataType::Utf8,    false),
-        Field::new("transcript_id",    DataType::Utf8,    false),
-        Field::new("poly_a_length",     DataType::Int32,   false),
+        Field::new("sample_id", DataType::Utf8, false),
+        Field::new("read_id", DataType::Utf8, false),
+        Field::new("gene_id", DataType::Utf8, false),
+        Field::new("transcript_id", DataType::Utf8, false),
+        Field::new("poly_a_length", DataType::Int32, false),
         Field::new("posterior_weight", DataType::Float64, false),
     ]));
 
@@ -289,11 +303,11 @@ fn write_anchor_parquet<P: AsRef<Path>>(
             Arc::new(pal_b.finish()),
             Arc::new(w_b.finish()),
         ],
-    ).context("Failed to build anchor RecordBatch")?;
+    )
+    .context("Failed to build anchor RecordBatch")?;
 
-    let out_file = File::create(&output).with_context(|| {
-        format!("Failed to create anchor pool file: {:?}", output.as_ref())
-    })?;
+    let out_file = File::create(&output)
+        .with_context(|| format!("Failed to create anchor pool file: {:?}", output.as_ref()))?;
     let props = WriterProperties::builder().build();
     let mut writer = ArrowWriter::try_new(out_file, schema, Some(props))
         .context("Failed to create ArrowWriter")?;
@@ -305,42 +319,42 @@ fn write_anchor_parquet<P: AsRef<Path>>(
 /// Per-sample stats for one BAM input.
 #[derive(Debug, Default, Clone)]
 pub struct SampleStats {
-    pub total_records:        u64,
-    pub parse_errors:          u64,
-    pub filtered_unique:       u64,
-    pub filtered_no_reflen:    u64,
-    pub filtered_3p_anchor:    u64,
-    pub filtered_coverage:     u64,
+    pub total_records: u64,
+    pub parse_errors: u64,
+    pub filtered_unique: u64,
+    pub filtered_no_reflen: u64,
+    pub filtered_3p_anchor: u64,
+    pub filtered_coverage: u64,
     pub filtered_polya_invalid: u64,
-    pub filtered_cap:          u64,
-    pub passed:                u64,
+    pub filtered_cap: u64,
+    pub passed: u64,
 }
 
 /// Aggregated stats across all input BAMs.
 #[derive(Debug, Default, Clone)]
 pub struct AnchorStats {
-    pub samples:               usize,
-    pub total_records:         u64,
-    pub filtered_unique:        u64,
-    pub filtered_no_reflen:     u64,
-    pub filtered_3p_anchor:     u64,
-    pub filtered_coverage:      u64,
+    pub samples: usize,
+    pub total_records: u64,
+    pub filtered_unique: u64,
+    pub filtered_no_reflen: u64,
+    pub filtered_3p_anchor: u64,
+    pub filtered_coverage: u64,
     pub filtered_polya_invalid: u64,
-    pub filtered_cap:           u64,
-    pub passed:                 u64,
+    pub filtered_cap: u64,
+    pub passed: u64,
 }
 
 impl AnchorStats {
     fn add(&mut self, s: &SampleStats) {
-        self.samples               += 1;
-        self.total_records         += s.total_records;
-        self.filtered_unique       += s.filtered_unique;
-        self.filtered_no_reflen    += s.filtered_no_reflen;
-        self.filtered_3p_anchor    += s.filtered_3p_anchor;
-        self.filtered_coverage     += s.filtered_coverage;
+        self.samples += 1;
+        self.total_records += s.total_records;
+        self.filtered_unique += s.filtered_unique;
+        self.filtered_no_reflen += s.filtered_no_reflen;
+        self.filtered_3p_anchor += s.filtered_3p_anchor;
+        self.filtered_coverage += s.filtered_coverage;
         self.filtered_polya_invalid += s.filtered_polya_invalid;
-        self.filtered_cap          += s.filtered_cap;
-        self.passed                += s.passed;
+        self.filtered_cap += s.filtered_cap;
+        self.passed += s.passed;
     }
 
     pub fn report(&self) -> String {
@@ -361,8 +375,16 @@ mod tests {
 
     #[test]
     fn test_anchor_stats_aggregation() {
-        let s1 = SampleStats { total_records: 100, passed: 30, ..Default::default() };
-        let s2 = SampleStats { total_records: 50, passed: 12, ..Default::default() };
+        let s1 = SampleStats {
+            total_records: 100,
+            passed: 30,
+            ..Default::default()
+        };
+        let s2 = SampleStats {
+            total_records: 50,
+            passed: 12,
+            ..Default::default()
+        };
         let mut agg = AnchorStats::default();
         agg.add(&s1);
         agg.add(&s2);

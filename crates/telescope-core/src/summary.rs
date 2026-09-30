@@ -35,10 +35,10 @@ use parquet::file::properties::WriterProperties;
 /// Per-(sample, gene, transcript) accumulator. Streaming: only 7 f64 scalars.
 #[derive(Debug, Default, Clone)]
 struct TranscriptAccumulator {
-    weight_sum:   f64,
-    sum_w2:       f64,
-    sum_w_log:    f64,
-    sum_w_log2:   f64,
+    weight_sum: f64,
+    sum_w2: f64,
+    sum_w_log: f64,
+    sum_w_log2: f64,
 }
 
 impl TranscriptAccumulator {
@@ -49,8 +49,8 @@ impl TranscriptAccumulator {
         }
         let log_pal = (length as f64).log2();
         self.weight_sum += weight;
-        self.sum_w2     += weight * weight;
-        self.sum_w_log  += weight * log_pal;
+        self.sum_w2 += weight * weight;
+        self.sum_w_log += weight * log_pal;
         self.sum_w_log2 += weight * log_pal * log_pal;
     }
 
@@ -167,10 +167,10 @@ where
 
         for i in 0..batch.num_rows() {
             let sample_id = sample_col.value(i).to_string();
-            let gene_id   = gene_col.value(i).to_string();
-            let tx_id     = tx_col.value(i).to_string();
-            let length    = pal_col.value(i);
-            let weight    = weight_col.value(i);
+            let gene_id = gene_col.value(i).to_string();
+            let tx_id = tx_col.value(i).to_string();
+            let length = pal_col.value(i);
+            let weight = weight_col.value(i);
 
             let key = (sample_id, gene_id, tx_id);
             map.entry(key)
@@ -181,14 +181,14 @@ where
 
     // Build output parquet (9 columns, locked schema).
     let mut sample_b = StringBuilder::new();
-    let mut gene_b   = StringBuilder::new();
-    let mut tx_b     = StringBuilder::new();
-    let mut wsum_b   = Float64Builder::new();
-    let mut neff_b   = Float64Builder::new();
-    let mut swlog_b  = Float64Builder::new();
+    let mut gene_b = StringBuilder::new();
+    let mut tx_b = StringBuilder::new();
+    let mut wsum_b = Float64Builder::new();
+    let mut neff_b = Float64Builder::new();
+    let mut swlog_b = Float64Builder::new();
     let mut swlog2_b = Float64Builder::new();
-    let mut mean_b   = Float64Builder::new();
-    let mut var_b    = Float64Builder::new();
+    let mut mean_b = Float64Builder::new();
+    let mut var_b = Float64Builder::new();
 
     for ((sample_id, gene_id, tx_id), acc) in map {
         if acc.weight_sum <= 0.0 {
@@ -206,14 +206,14 @@ where
     }
 
     let schema = Arc::new(Schema::new(vec![
-        Field::new("sample_id",                 DataType::Utf8,    false),
-        Field::new("gene_id",                   DataType::Utf8,    false),
-        Field::new("transcript_id",             DataType::Utf8,    false),
-        Field::new("weight_sum",                DataType::Float64, false),
-        Field::new("effective_n",               DataType::Float64, false),
-        Field::new("sum_w_logPAL",              DataType::Float64, false),
-        Field::new("sum_w_logPAL2",             DataType::Float64, false),
-        Field::new("weighted_mean_logPAL",      DataType::Float64, false),
+        Field::new("sample_id", DataType::Utf8, false),
+        Field::new("gene_id", DataType::Utf8, false),
+        Field::new("transcript_id", DataType::Utf8, false),
+        Field::new("weight_sum", DataType::Float64, false),
+        Field::new("effective_n", DataType::Float64, false),
+        Field::new("sum_w_logPAL", DataType::Float64, false),
+        Field::new("sum_w_logPAL2", DataType::Float64, false),
+        Field::new("weighted_mean_logPAL", DataType::Float64, false),
         Field::new("posterior_weighted_variance", DataType::Float64, false),
     ]));
 

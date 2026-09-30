@@ -48,9 +48,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use arrow::array::{
-    BooleanBuilder, Float32Builder, StringBuilder, UInt32Builder,
-};
+use arrow::array::{BooleanBuilder, Float32Builder, StringBuilder, UInt32Builder};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
@@ -117,8 +115,8 @@ fn build_molecule_inverse_index(graph: &FlatEvidenceGraph) -> Vec<Vec<u32>> {
     let num_tx = graph.transcript_names.len();
     let mut inv: Vec<Vec<u32>> = vec![Vec::new(); num_tx];
     for (mol_idx, mol) in graph.molecules.iter().enumerate() {
-        let cands = &graph.candidate_pool
-            [mol.candidate_offset as usize..(mol.candidate_offset + mol.candidate_count as u32) as usize];
+        let cands = &graph.candidate_pool[mol.candidate_offset as usize
+            ..(mol.candidate_offset + mol.candidate_count as u32) as usize];
         for &tx_id in cands {
             inv[tx_id as usize].push(mol_idx as u32);
         }
@@ -386,7 +384,10 @@ pub fn write_transcript_evidence_parquet<P: AsRef<Path>>(
     .context("Failed to build transcript_evidence RecordBatch")?;
 
     let out_file = File::create(&path).with_context(|| {
-        format!("Failed to create transcript_evidence file: {:?}", path.as_ref())
+        format!(
+            "Failed to create transcript_evidence file: {:?}",
+            path.as_ref()
+        )
     })?;
     let props = WriterProperties::builder().build();
     let mut writer = ArrowWriter::try_new(out_file, schema, Some(props))
@@ -415,6 +416,9 @@ where
     let mut pooled = FlatEvidenceGraph {
         molecules: Vec::new(),
         candidate_pool: Vec::new(),
+        candidate_as: Vec::new(),
+        candidate_nm: Vec::new(),
+        candidate_mapq: Vec::new(),
         transcript_names: Vec::new(),
     };
     let mut count: usize = 0;
@@ -441,6 +445,14 @@ where
             });
         }
         pooled.candidate_pool.extend(g.candidate_pool);
+        pooled.candidate_as.extend(g.candidate_as);
+        pooled.candidate_nm.extend(g.candidate_nm);
+        pooled.candidate_mapq.extend(g.candidate_mapq);
+        // Lockstep invariant across pooled BAMs: the alignment-evidence pools
+        // stay index-aligned with `candidate_pool`.
+        debug_assert_eq!(pooled.candidate_pool.len(), pooled.candidate_as.len());
+        debug_assert_eq!(pooled.candidate_pool.len(), pooled.candidate_nm.len());
+        debug_assert_eq!(pooled.candidate_pool.len(), pooled.candidate_mapq.len());
         count += 1;
     }
     Ok((pooled, count))
@@ -478,12 +490,10 @@ mod tests {
                 mk_mol("r2", 3, 2, 7.0),
             ],
             candidate_pool: vec![0, 0, 1, 1, 2],
-            transcript_names: vec![
-                "tx_a".into(),
-                "tx_b".into(),
-                "tx_c".into(),
-                "tx_d".into(),
-            ],
+            candidate_as: vec![0; 5],
+            candidate_nm: vec![0; 5],
+            candidate_mapq: vec![0; 5],
+            transcript_names: vec!["tx_a".into(), "tx_b".into(), "tx_c".into(), "tx_d".into()],
         };
         let mut tx2g = HashMap::new();
         tx2g.insert("tx_a".into(), "gene_a".into());
@@ -495,7 +505,10 @@ mod tests {
         let records = resolve_transcript_evidence(
             &graph,
             &tx2g,
-            &ResolverConfig { cohort_size: 1, tes_cluster_radius: 50 },
+            &ResolverConfig {
+                cohort_size: 1,
+                tes_cluster_radius: 50,
+            },
             &mut warn,
         );
 
@@ -510,10 +523,7 @@ mod tests {
         assert_eq!(rec_b.unique_reads, 0);
         assert_eq!(rec_b.compatible_reads, 2);
         assert!(!rec_b.is_subsumed, "tx_b must NOT be subsumed");
-        assert!(
-            rec_b.em_eligible,
-            "unsubsumed TierB must be em_eligible"
-        );
+        assert!(rec_b.em_eligible, "unsubsumed TierB must be em_eligible");
 
         let rec_c = records.iter().find(|r| r.transcript_id == "tx_c").unwrap();
         assert_eq!(rec_c.tier, "TierB");
@@ -535,11 +545,11 @@ mod tests {
         // M0 -> [tx_a] only. M1 -> [tx_a, tx_b]. tx_b's molecules = {M1},
         // which is ⊆ tx_a's molecules = {M0, M1} → tx_b fully subsumed.
         let graph = FlatEvidenceGraph {
-            molecules: vec![
-                mk_mol("r0", 0, 1, 6.0),
-                mk_mol("r1", 1, 2, 6.5),
-            ],
+            molecules: vec![mk_mol("r0", 0, 1, 6.0), mk_mol("r1", 1, 2, 6.5)],
             candidate_pool: vec![0, 0, 1],
+            candidate_as: vec![0; 3],
+            candidate_nm: vec![0; 3],
+            candidate_mapq: vec![0; 3],
             transcript_names: vec!["tx_a".into(), "tx_b".into()],
         };
         let mut tx2g = HashMap::new();
@@ -550,7 +560,10 @@ mod tests {
         let records = resolve_transcript_evidence(
             &graph,
             &tx2g,
-            &ResolverConfig { cohort_size: 1, tes_cluster_radius: 50 },
+            &ResolverConfig {
+                cohort_size: 1,
+                tes_cluster_radius: 50,
+            },
             &mut warn,
         );
 
@@ -571,6 +584,9 @@ mod tests {
         let graph = FlatEvidenceGraph {
             molecules: vec![mk_mol("r0", 0, 1, 6.0)],
             candidate_pool: vec![0],
+            candidate_as: vec![0; 1],
+            candidate_nm: vec![0; 1],
+            candidate_mapq: vec![0; 1],
             transcript_names: vec!["tx_a".into(), "tx_b".into()],
         };
         let mut tx2g = HashMap::new();
@@ -581,13 +597,19 @@ mod tests {
         let records = resolve_transcript_evidence(
             &graph,
             &tx2g,
-            &ResolverConfig { cohort_size: 1, tes_cluster_radius: 50 },
+            &ResolverConfig {
+                cohort_size: 1,
+                tes_cluster_radius: 50,
+            },
             &mut warn,
         );
 
         let rec_b = records.iter().find(|r| r.transcript_id == "tx_b").unwrap();
         assert_eq!(rec_b.gene_id, "missing_gene_id");
-        assert!(warn.contains("tx_b"), "tx_b warning must have been emitted exactly once");
+        assert!(
+            warn.contains("tx_b"),
+            "tx_b warning must have been emitted exactly once"
+        );
         assert_eq!(warn.len(), 1, "no other warnings expected");
 
         // Second call should NOT emit a duplicate warning.
@@ -595,7 +617,10 @@ mod tests {
         let _ = resolve_transcript_evidence(
             &graph,
             &tx2g,
-            &ResolverConfig { cohort_size: 1, tes_cluster_radius: 50 },
+            &ResolverConfig {
+                cohort_size: 1,
+                tes_cluster_radius: 50,
+            },
             &mut warn2,
         );
         assert_eq!(warn2.len(), 1, "warning set is deduplicated across calls");

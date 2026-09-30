@@ -52,8 +52,8 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use arrow::array::{
-    Array, BooleanArray, BooleanBuilder, Float64Builder, Int32Array,
-    ListArray, StringArray, StringBuilder, UInt32Builder,
+    Array, BooleanArray, BooleanBuilder, Float64Builder, Int32Array, ListArray, StringArray,
+    StringBuilder, UInt32Builder,
 };
 use arrow::datatypes::{DataType, Field, Int32Type, Schema};
 use arrow::record_batch::RecordBatch;
@@ -147,8 +147,8 @@ pub struct AssessmentQuality {
 pub fn load_assessment_quality<P: AsRef<Path>>(
     tsv_path: P,
 ) -> Result<HashMap<String, AssessmentQuality>> {
-    let file = File::open(&tsv_path)
-        .with_context(|| format!("Failed to open {:?}", tsv_path.as_ref()))?;
+    let file =
+        File::open(&tsv_path).with_context(|| format!("Failed to open {:?}", tsv_path.as_ref()))?;
     let reader = BufReader::new(file);
     let mut lines = reader.lines();
 
@@ -182,10 +182,10 @@ pub fn load_assessment_quality<P: AsRef<Path>>(
         let frac_str = fields[frac_idx];
 
         let (poly_a_frac, is_poly_a_competent) = match frac_str.parse::<f64>() {
-            Ok(val) if val.is_nan() => (0.0, false),    // State 3
-            Ok(val) if val <= 0.0 => (0.0, false),     // State 2
-            Ok(val) => (val, true),                    // State 1
-            Err(_) => (0.0, false),                    // unparseable
+            Ok(val) if val.is_nan() => (0.0, false), // State 3
+            Ok(val) if val <= 0.0 => (0.0, false),   // State 2
+            Ok(val) => (val, true),                  // State 1
+            Err(_) => (0.0, false),                  // unparseable
         };
 
         map.insert(
@@ -230,9 +230,8 @@ pub fn build_emission_parquet<P: AsRef<Path>>(
     let quality_map = load_assessment_quality(assessment_tsv_path)?;
 
     // Open Parquet reader.
-    let file = File::open(&poly_a_parquet_path).with_context(|| {
-        format!("Failed to open {:?}", poly_a_parquet_path.as_ref())
-    })?;
+    let file = File::open(&poly_a_parquet_path)
+        .with_context(|| format!("Failed to open {:?}", poly_a_parquet_path.as_ref()))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .context("Failed to build ParquetRecordBatchReaderBuilder")?;
     let mut reader = builder.with_batch_size(8192).build()?;
@@ -298,12 +297,10 @@ pub fn build_emission_parquet<P: AsRef<Path>>(
             }
 
             let (mu, sigma2) = if is_competent && n_flnc > 0 {
-                let log_lens: Vec<f64> =
-                    lengths.iter().map(|&x| (x as f64).log2()).collect();
+                let log_lens: Vec<f64> = lengths.iter().map(|&x| (x as f64).log2()).collect();
                 let mean = log_lens.iter().sum::<f64>() / (n_flnc as f64);
                 let variance = if n_flnc > 1 {
-                    let sq_diff_sum: f64 =
-                        log_lens.iter().map(|&x| (x - mean).powi(2)).sum();
+                    let sq_diff_sum: f64 = log_lens.iter().map(|&x| (x - mean).powi(2)).sum();
                     sq_diff_sum / ((n_flnc - 1) as f64) // sample variance
                 } else {
                     MIN_COHORT_VARIANCE
@@ -341,8 +338,12 @@ pub fn build_emission_parquet<P: AsRef<Path>>(
     .context("Failed to build output RecordBatch")?;
 
     // Write to disk.
-    let out_file = File::create(&output_emission_path)
-        .with_context(|| format!("Failed to create output {:?}", output_emission_path.as_ref()))?;
+    let out_file = File::create(&output_emission_path).with_context(|| {
+        format!(
+            "Failed to create output {:?}",
+            output_emission_path.as_ref()
+        )
+    })?;
     let props = WriterProperties::builder().build();
     let mut writer = ArrowWriter::try_new(out_file, schema, Some(props))
         .context("Failed to create ArrowWriter")?;
@@ -369,9 +370,14 @@ struct TxAccumulator {
 
 impl TxAccumulator {
     fn new(gene_id: String) -> Self {
-        Self { gene_id, log2_pals: Vec::new() }
+        Self {
+            gene_id,
+            log2_pals: Vec::new(),
+        }
     }
-    fn len(&self) -> usize { self.log2_pals.len() }
+    fn len(&self) -> usize {
+        self.log2_pals.len()
+    }
 }
 
 /// Result of fitting a Gaussian in `log2(PAL)` space.
@@ -401,7 +407,10 @@ fn fit_log_normal(values: &[f64]) -> Option<LogNormalFit> {
     } else {
         MIN_COHORT_VARIANCE
     };
-    Some(LogNormalFit { mu: mean, sigma2: variance.max(MIN_COHORT_VARIANCE) })
+    Some(LogNormalFit {
+        mu: mean,
+        sigma2: variance.max(MIN_COHORT_VARIANCE),
+    })
 }
 
 /// Cohort-level robust fit: `mu` = median(log2(PAL)),
@@ -440,16 +449,14 @@ fn cohort_log_normal_fit(values: &[f64]) -> Option<LogNormalFit> {
 /// This is the entry point for Universal Mode's optional
 /// `em_eligible` filtering (resolver F6.3 + cohort pre-filter).
 pub fn load_em_eligible_set<P: AsRef<Path>>(path: P) -> Result<HashSet<String>> {
-    let file = File::open(&path)
-        .with_context(|| format!("Failed to open {:?}", path.as_ref()))?;
+    let file = File::open(&path).with_context(|| format!("Failed to open {:?}", path.as_ref()))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .context("Failed to build ParquetRecordBatchReaderBuilder for transcript_evidence")?;
     let mut reader = builder.with_batch_size(8192).build()?;
 
     let mut set: HashSet<String> = HashSet::new();
     while let Some(batch_result) = reader.next() {
-        let batch = batch_result
-            .context("Failed to read transcript_evidence batch")?;
+        let batch = batch_result.context("Failed to read transcript_evidence batch")?;
         let tx_col = batch
             .column_by_name("transcript_id")
             .context("Missing 'transcript_id' column in transcript_evidence")?
@@ -484,8 +491,7 @@ fn read_anchor_pool_parquet<P: AsRef<Path>>(
     tx_accums: &mut HashMap<String, TxAccumulator>,
     cohort_log2_pals: &mut Vec<f64>,
 ) -> Result<()> {
-    let file = File::open(&path)
-        .with_context(|| format!("Failed to open {:?}", path.as_ref()))?;
+    let file = File::open(&path).with_context(|| format!("Failed to open {:?}", path.as_ref()))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .context("Failed to build ParquetRecordBatchReaderBuilder for anchor_pool")?;
     let mut reader = builder.with_batch_size(8192).build()?;
@@ -654,8 +660,7 @@ where
             n_l1 += 1;
             // L1: per-tx fit. `n >= tx_min_reads >= 1` implies
             // `log2_pals` is non-empty, so unwrap is safe.
-            fit_log_normal(&acc.log2_pals)
-                .expect("L1 fit must succeed when n >= tx_min_reads >= 1")
+            fit_log_normal(&acc.log2_pals).expect("L1 fit must succeed when n >= tx_min_reads >= 1")
         } else if let Some(gf) = gene_fit.get(&acc.gene_id) {
             n_l2 += 1;
             // L2: per-gene fit. Shared across all underpowered txs in gene.
@@ -703,7 +708,9 @@ where
          L1={} L2={} L3={}",
         tx_accums.len(),
         cohort_log2_pals.len(),
-        n_l1, n_l2, n_l3,
+        n_l1,
+        n_l2,
+        n_l3,
     );
 
     Ok(())
@@ -859,10 +866,7 @@ mod tests {
     /// Write a Module-0 `transcript_evidence.parquet` fixture
     /// containing only the 2 columns consumed by
     /// `load_em_eligible_set` (`transcript_id`, `em_eligible`).
-    fn write_transcript_evidence_minimal(
-        path: &Path,
-        entries: &[(String, bool)],
-    ) {
+    fn write_transcript_evidence_minimal(path: &Path, entries: &[(String, bool)]) {
         let mut tx_b = StringBuilder::new();
         let mut em_b = BooleanBuilder::new();
         for (tx, em) in entries {
@@ -882,19 +886,17 @@ mod tests {
         let props = WriterProperties::builder().build();
         let mut w = ArrowWriter::try_new(out, schema, Some(props))
             .expect("init ArrowWriter for transcript_evidence fixture");
-        w.write(&batch).expect("write transcript_evidence fixture batch");
+        w.write(&batch)
+            .expect("write transcript_evidence fixture batch");
         w.close().expect("close transcript_evidence fixture writer");
     }
 
     /// Read `telescope.emission.parquet` back into a
     /// `Vec<(transcript_id, mu, sigma2, n_cohort_flnc, polyA_frac, is_polyA_competent)>`
     /// for assertions. Sorted by `transcript_id`.
-    fn read_emission_parquet(
-        path: &Path,
-    ) -> Vec<(String, String, f64, bool, u32, f64, f64)> {
+    fn read_emission_parquet(path: &Path) -> Vec<(String, String, f64, bool, u32, f64, f64)> {
         let f = File::open(path).expect("open emission parquet");
-        let b = ParquetRecordBatchReaderBuilder::try_new(f)
-            .expect("init reader");
+        let b = ParquetRecordBatchReaderBuilder::try_new(f).expect("init reader");
         let mut reader = b.with_batch_size(8192).build().expect("build reader");
         let mut out = Vec::new();
         while let Some(batch) = reader.next() {
@@ -982,17 +984,17 @@ mod tests {
             TxFixture {
                 gene_id: "gene_1".into(),
                 tx_id: "tx_1".into(),
-                pals: (50..150).collect::<Vec<i32>>(),    // 50..149
+                pals: (50..150).collect::<Vec<i32>>(), // 50..149
             },
             TxFixture {
                 gene_id: "gene_1".into(),
                 tx_id: "tx_2".into(),
-                pals: (30..130).collect::<Vec<i32>>(),    // 30..129
+                pals: (30..130).collect::<Vec<i32>>(), // 30..129
             },
             TxFixture {
                 gene_id: "gene_2".into(),
                 tx_id: "tx_3".into(),
-                pals: (70..170).collect::<Vec<i32>>(),    // 70..169
+                pals: (70..170).collect::<Vec<i32>>(), // 70..169
             },
         ];
 
@@ -1002,17 +1004,16 @@ mod tests {
 
         let aidrs_poly_a = tmp.join("polyA.parquet");
         let aidrs_assess = tmp.join("assessment.tsv");
-        let anchor_pool  = tmp.join("anchor_pool.parquet");
-        let out_aidrs    = tmp.join("emission_aidrs.parquet");
-        let out_univ     = tmp.join("emission_universal.parquet");
+        let anchor_pool = tmp.join("anchor_pool.parquet");
+        let out_aidrs = tmp.join("emission_aidrs.parquet");
+        let out_univ = tmp.join("emission_universal.parquet");
 
         write_aidrs_parquet(&aidrs_poly_a, &fxs);
         write_assessment_tsv(&aidrs_assess, &fxs);
         write_anchor_pool_parquet(&anchor_pool, &fxs);
 
         // Run both modes.
-        build_emission_parquet(&aidrs_poly_a, &aidrs_assess, &out_aidrs)
-            .expect("AIDRS mode run");
+        build_emission_parquet(&aidrs_poly_a, &aidrs_assess, &out_aidrs).expect("AIDRS mode run");
         build_emission_from_anchors(
             &anchor_pool,
             None::<&str>,
@@ -1022,14 +1023,14 @@ mod tests {
         .expect("Universal mode run");
 
         let rows_aidrs = read_emission_parquet(&out_aidrs);
-        let rows_univ  = read_emission_parquet(&out_univ);
+        let rows_univ = read_emission_parquet(&out_univ);
 
         // Both outputs must have the same set of transcripts in
         // the same order (sort-by-tx_id on the read side).
         assert_eq!(rows_aidrs.len(), 3, "AIDRS: 3 transcript rows expected");
-        assert_eq!(rows_univ.len(),  3, "Universal: 3 transcript rows expected");
+        assert_eq!(rows_univ.len(), 3, "Universal: 3 transcript rows expected");
         let aidrs_tx: Vec<&str> = rows_aidrs.iter().map(|r| r.0.as_str()).collect();
-        let univ_tx:  Vec<&str> = rows_univ.iter().map(|r| r.0.as_str()).collect();
+        let univ_tx: Vec<&str> = rows_univ.iter().map(|r| r.0.as_str()).collect();
         assert_eq!(aidrs_tx, univ_tx, "transcript_id sets must match");
 
         // Per-tx equivalence within machine precision.
@@ -1038,23 +1039,40 @@ mod tests {
             assert_eq!(a.0, u.0, "transcript_id order mismatch");
             assert_eq!(a.1, u.1, "gene_id must match for {}", a.0);
             assert_eq!(a.4, u.4, "n_cohort_flnc must match exactly for {}", a.0);
-            let mu_rel = if a.5.abs() < 1e-300 { 0.0 } else { ((a.5 - u.5) / a.5).abs() };
-            let s2_rel = if a.6.abs() < 1e-300 { 0.0 } else { ((a.6 - u.6) / a.6).abs() };
+            let mu_rel = if a.5.abs() < 1e-300 {
+                0.0
+            } else {
+                ((a.5 - u.5) / a.5).abs()
+            };
+            let s2_rel = if a.6.abs() < 1e-300 {
+                0.0
+            } else {
+                ((a.6 - u.6) / a.6).abs()
+            };
             assert!(
                 mu_rel < tol,
                 "mu_logPAL relative diff for {} = {:.3e} (AIDRS={:.16} Univ={:.16})",
-                a.0, mu_rel, a.5, u.5
+                a.0,
+                mu_rel,
+                a.5,
+                u.5
             );
             assert!(
                 s2_rel < tol,
                 "sigma2_logPAL relative diff for {} = {:.3e} (AIDRS={:.16} Univ={:.16})",
-                a.0, s2_rel, a.6, u.6
+                a.0,
+                s2_rel,
+                a.6,
+                u.6
             );
             // Documented conceptual diff (always State 1 in Universal).
             assert_eq!(u.2, 1.0, "Universal polyA_frac must be 1.0 by construction");
-            assert!(u.3,     "Universal is_polyA_competent must be true for non-empty tx");
+            assert!(
+                u.3,
+                "Universal is_polyA_competent must be true for non-empty tx"
+            );
             assert_eq!(a.2, 1.0, "AIDRS polyA_frac = 1.0 (State 1)");
-            assert!(a.3,     "AIDRS is_polyA_competent = true (State 1)");
+            assert!(a.3, "AIDRS is_polyA_competent = true (State 1)");
         }
     }
 
@@ -1095,17 +1113,16 @@ mod tests {
         std::fs::create_dir_all(&tmp).expect("mkdir tmp");
 
         let anchor_pool = tmp.join("anchor_pool.parquet");
-        let out         = tmp.join("emission.parquet");
+        let out = tmp.join("emission.parquet");
         write_anchor_pool_parquet(&anchor_pool, &fxs);
 
-        let fb = FallbackConfig { tx_min_reads: 10, gene_min_reads: 30, cohort_min_reads: 50 };
-        build_emission_from_anchors(
-            &anchor_pool,
-            None::<&str>,
-            &out,
-            &fb,
-        )
-        .expect("Universal mode run");
+        let fb = FallbackConfig {
+            tx_min_reads: 10,
+            gene_min_reads: 30,
+            cohort_min_reads: 50,
+        };
+        build_emission_from_anchors(&anchor_pool, None::<&str>, &out, &fb)
+            .expect("Universal mode run");
 
         let rows = read_emission_parquet(&out);
         assert_eq!(rows.len(), 4);
@@ -1117,9 +1134,13 @@ mod tests {
         let expected_l1_vals: Vec<f64> = (50..100).map(|p| (p as f64).log2()).collect();
         let exp_mu_1 = expected_l1_vals.iter().sum::<f64>() / expected_l1_vals.len() as f64;
         let exp_var_1 = {
-            let sq: f64 = expected_l1_vals.iter().map(|&x| (x - exp_mu_1).powi(2)).sum();
+            let sq: f64 = expected_l1_vals
+                .iter()
+                .map(|&x| (x - exp_mu_1).powi(2))
+                .sum();
             sq / (expected_l1_vals.len() as f64 - 1.0)
-        }.max(MIN_COHORT_VARIANCE);
+        }
+        .max(MIN_COHORT_VARIANCE);
         assert!((r1.5 - exp_mu_1).abs() < 1e-12, "L1 mu for tx_1");
         assert!((r1.6 - exp_var_1).abs() < 1e-12, "L1 sigma2 for tx_1");
 
@@ -1127,9 +1148,13 @@ mod tests {
         let r2 = by_tx["tx_2"];
         let r3 = by_tx["tx_3"];
         assert!((r2.5 - r3.5).abs() < 1e-12, "L2 mu shared across tx_2/tx_3");
-        assert!((r2.6 - r3.6).abs() < 1e-12, "L2 sigma2 shared across tx_2/tx_3");
+        assert!(
+            (r2.6 - r3.6).abs() < 1e-12,
+            "L2 sigma2 shared across tx_2/tx_3"
+        );
         // Verify the gene-pool fit is what we expect.
-        let gene_a_vals: Vec<f64> = fxs.iter()
+        let gene_a_vals: Vec<f64> = fxs
+            .iter()
             .filter(|f| f.gene_id == "gene_A")
             .flat_map(|f| f.pals.iter().map(|&p| (p as f64).log2()))
             .collect();
@@ -1137,14 +1162,19 @@ mod tests {
         let exp_var_g = {
             let sq: f64 = gene_a_vals.iter().map(|&x| (x - exp_mu_g).powi(2)).sum();
             sq / (gene_a_vals.len() as f64 - 1.0)
-        }.max(MIN_COHORT_VARIANCE);
+        }
+        .max(MIN_COHORT_VARIANCE);
         assert!((r2.5 - exp_mu_g).abs() < 1e-12, "L2 mu == gene_A mean");
-        assert!((r2.6 - exp_var_g).abs() < 1e-12, "L2 sigma2 == gene_A sample variance");
+        assert!(
+            (r2.6 - exp_var_g).abs() < 1e-12,
+            "L2 sigma2 == gene_A sample variance"
+        );
 
         // L3: tx_4 uses cohort-level robust fit.
         let r4 = by_tx["tx_4"];
         // L3 mu = median of ALL cohort log2(PAL).
-        let mut all: Vec<f64> = fxs.iter()
+        let mut all: Vec<f64> = fxs
+            .iter()
             .flat_map(|f| f.pals.iter().map(|&p| (p as f64).log2()))
             .collect();
         all.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -1162,7 +1192,10 @@ mod tests {
         };
         let exp_sigma2_c = (MAD_TO_SIGMA * mad).powi(2).max(MIN_COHORT_VARIANCE);
         assert!((r4.5 - exp_mu_c).abs() < 1e-12, "L3 mu == cohort median");
-        assert!((r4.6 - exp_sigma2_c).abs() < 1e-12, "L3 sigma2 == cohort MAD^2 * 1.4826^2");
+        assert!(
+            (r4.6 - exp_sigma2_c).abs() < 1e-12,
+            "L3 sigma2 == cohort MAD^2 * 1.4826^2"
+        );
     }
 
     /// Verify that `transcript_evidence.parquet` `em_eligible`
@@ -1176,17 +1209,17 @@ mod tests {
             TxFixture {
                 gene_id: "gene_X".into(),
                 tx_id: "tx_keep".into(),
-                pals: (10..20).collect::<Vec<i32>>(),    // 10 reads
+                pals: (10..20).collect::<Vec<i32>>(), // 10 reads
             },
             TxFixture {
                 gene_id: "gene_X".into(),
                 tx_id: "tx_filtered".into(),
-                pals: (30..40).collect::<Vec<i32>>(),    // 10 reads → all dropped
+                pals: (30..40).collect::<Vec<i32>>(), // 10 reads → all dropped
             },
             TxFixture {
                 gene_id: "gene_Y".into(),
                 tx_id: "tx_keep2".into(),
-                pals: (50..60).collect::<Vec<i32>>(),    // 10 reads
+                pals: (50..60).collect::<Vec<i32>>(), // 10 reads
             },
         ];
 
@@ -1194,24 +1227,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).expect("mkdir tmp");
 
-        let anchor_pool  = tmp.join("anchor_pool.parquet");
-        let te_path      = tmp.join("transcript_evidence.parquet");
-        let out          = tmp.join("emission.parquet");
+        let anchor_pool = tmp.join("anchor_pool.parquet");
+        let te_path = tmp.join("transcript_evidence.parquet");
+        let out = tmp.join("emission.parquet");
         write_anchor_pool_parquet(&anchor_pool, &fxs);
-        write_transcript_evidence_minimal(&te_path, &[
-            ("tx_keep".into(),     true),
-            ("tx_filtered".into(), false),
-            ("tx_keep2".into(),    true),
-        ]);
+        write_transcript_evidence_minimal(
+            &te_path,
+            &[
+                ("tx_keep".into(), true),
+                ("tx_filtered".into(), false),
+                ("tx_keep2".into(), true),
+            ],
+        );
 
         let fb = FallbackConfig::default();
-        build_emission_from_anchors(
-            &anchor_pool,
-            Some(&te_path),
-            &out,
-            &fb,
-        )
-        .expect("Universal mode run with em_eligible filter");
+        build_emission_from_anchors(&anchor_pool, Some(&te_path), &out, &fb)
+            .expect("Universal mode run with em_eligible filter");
 
         let rows = read_emission_parquet(&out);
         // tx_filtered must be absent; the other two must be present.
@@ -1221,7 +1252,7 @@ mod tests {
         // n_cohort_flnc for each kept tx is 10 (its own reads),
         // NOT 10 + 10 = 20 (would happen if filter was bypassed).
         let by_tx: HashMap<&str, u32> = rows.iter().map(|r| (r.0.as_str(), r.4)).collect();
-        assert_eq!(by_tx["tx_keep"],  10);
+        assert_eq!(by_tx["tx_keep"], 10);
         assert_eq!(by_tx["tx_keep2"], 10);
     }
 }

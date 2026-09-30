@@ -12,10 +12,14 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use telescope_core::{
-    anchor_builder, em, emission_model, evidence, resolver, summary,
-};
 use telescope_core::emission_model::FallbackConfig;
+use telescope_core::{anchor_builder, em, emission_model, evidence, resolver, summary};
+
+/// Default λ of the F-EM-4 alignment term `ln A_rk = (AS_rk − max_j AS_rj)/λ`.
+/// Referenced by both clap's default and the `quant` telemetry so the shipped
+/// default and the claim printed next to it cannot drift apart. Provenance is
+/// documented on the `--aln-weight-lambda` argument.
+const ALN_WEIGHT_LAMBDA_DEFAULT: f64 = 1000.0;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -122,6 +126,40 @@ enum Cmd {
         /// Maximum EM iterations (safety cap).
         #[arg(long, default_value_t = 1000)]
         max_iter: usize,
+
+        /// Scale λ of the F-EM-4 alignment term `ln A_rk = (AS_rk − max_j AS_rj) / λ`
+        /// (default: 1000.0). Must be > 0. Larger λ = weaker alignment prior.
+        ///
+        /// The default is calibrated on ONE gene (PGAM1), not library-wide and
+        /// not against the Phase C red line. End-to-end grid on the COPD29 BAM
+        /// (oracle = minimap2 primary), full-length read class only — PGAM1's two
+        /// isoforms share a 3' end (ΔTES = 2 bp) and differ at the 5' end
+        /// (ΔTSS = 1555 bp), so a read reaching the 5'-unique region has a
+        /// provably-known isoform: of {no A_rk, 100, 3, 10, 30, 1000, 3000,
+        /// 10000}, 1000 is the smallest λ tested that put 100% of that class in
+        /// agreement. On PGAM1 smaller λ buys no further repair and only
+        /// destroys posterior — at λ=100 every ambiguous read there collapsed to
+        /// a single candidate row with weight 1.0. 5'-truncated reads have no
+        /// ground truth, so their agreement rate is not an accuracy measure.
+        ///
+        /// The companion simulation
+        /// (`workspace/comms/2026-09-29-golden-gene-screen/sim_lambda_sweep.py`)
+        /// recommends λ ∈ [1,3] and scores 0.8948 at λ=1000, ~10 accuracy points
+        /// below λ=100 under θ>0. That is not a conflict — different populations:
+        /// its headline metric ΔAUC(TEL-EM − alignment-only) is λ-invariant by
+        /// construction (Model B is an argmax over a monotone transform of AS;
+        /// the sweep measured a spread of exactly 0.000000 across the whole grid),
+        /// so its recommendation comes from the ΔAUC argmax, not an end-to-end
+        /// oracle; and it averages over an inverted-AS rate θ up to 0.25, whereas
+        /// PGAM1's full-length class measured θ = 0 (0 of 559 inversions), so that
+        /// population does not exist in the measured data. The converse holds:
+        /// θ = 0 is one gene. If another gene's full-length class does contain
+        /// inversions, the large-λ regime is the safer one — that is the open
+        /// question for this parameter and why it stays hedged as one-gene-derived.
+        /// Full curve and provenance: `workspace/notes/EXPERIMENT.md`,
+        /// 2026-09-28 "λ 默认值 100 → 1000 修正" and "A_rk 的 λ 标定".
+        #[arg(long, default_value_t = ALN_WEIGHT_LAMBDA_DEFAULT)]
+        aln_weight_lambda: f64,
 
         /// Optional TSV with header `bam_id\toriginal_id` for ID translation
         /// (replaces offline Python workaround for AIDRS re-keying).
@@ -230,9 +268,8 @@ fn main() -> Result<()> {
             match (polya_parquet, anchor_pool) {
                 (Some(p), None) => {
                     // AIDRS mode (legacy).
-                    let assess = assessment_tsv.context(
-                        "--assessment-tsv is required when --polya-parquet is set",
-                    )?;
+                    let assess = assessment_tsv
+                        .context("--assessment-tsv is required when --polya-parquet is set")?;
                     eprintln!("  mode:           AIDRS");
                     eprintln!("  polya_parquet:  {}", p.display());
                     eprintln!("  assessment_tsv: {}", assess.display());
@@ -288,10 +325,7 @@ fn main() -> Result<()> {
             eprintln!("  tes_slack:  {} bp", tes_slack);
             let graph = evidence::extract_evidence(&bam, tes_slack)
                 .context("Module 2 extract_evidence failed")?;
-            eprintln!(
-                "[telescope]  molecules:        {}",
-                graph.molecules.len()
-            );
+            eprintln!("[telescope]  molecules:        {}", graph.molecules.len());
             eprintln!(
                 "[telescope]  transcripts:     {}",
                 graph.transcript_names.len()
@@ -322,9 +356,18 @@ fn main() -> Result<()> {
             tes_slack,
             tol,
             max_iter,
+            aln_weight_lambda,
             tx_id_mapping,
             debug,
         } => {
+            if !(aln_weight_lambda > 0.0) {
+                anyhow::bail!(
+                    "--aln-weight-lambda must be > 0 (got {}); it scales \
+                     ln A_rk = (AS_rk − max_j AS_rj)/λ, so 0 and NaN would emit \
+                     NaN posterior weights",
+                    aln_weight_lambda
+                );
+            }
             eprintln!("[telescope] Quant (M2 → M3)");
             eprintln!("  bam:        {}", bam.display());
             eprintln!("  emission:   {}", emission.display());
@@ -333,6 +376,19 @@ fn main() -> Result<()> {
             eprintln!("  tes_slack:  {} bp", tes_slack);
             eprintln!("  tol:        {:.1e}", tol);
             eprintln!("  max_iter:   {}", max_iter);
+            eprintln!("  aln_weight_lambda: {}", aln_weight_lambda);
+            if aln_weight_lambda == ALN_WEIGHT_LAMBDA_DEFAULT {
+                eprintln!(
+                    "  WARNING: --aln-weight-lambda is at its PROVISIONAL default \
+                     (1000.0). It was calibrated on a single gene (PGAM1) and is \
+                     not validated genome-wide.\n\
+                     \x20            On genes with d >= 0.5 (~28% of the library), \
+                     the full-length class measures d_AUC = -0.133 versus \
+                     alignment-only, i.e. the alignment term is NET HARMFUL there.\n\
+                     \x20            This value must not be treated as final until the \
+                     stratified scan (S1) completes."
+                );
+            }
             if let Some(ref p) = tx_id_mapping {
                 eprintln!("  tx_id_mapping: {}", p.display());
             }
@@ -340,37 +396,34 @@ fn main() -> Result<()> {
 
             // Parse optional `bam_id\toriginal_id` TSV (header row skipped).
             // This replaces the previous offline Python re-keying workaround.
-            let id_mapping: Option<std::collections::HashMap<String, String>> =
-                if let Some(ref p) = tx_id_mapping {
-                    let f = std::fs::File::open(p)
-                        .with_context(|| format!("Failed to open --tx-id-mapping {:?}", p))?;
-                    let reader = std::io::BufReader::new(f);
-                    use std::io::BufRead;
-                    let mut map = std::collections::HashMap::new();
-                    for (i, line) in reader.lines().enumerate() {
-                        let l = line.with_context(|| {
-                            format!("Failed to read line {} from {:?}", i + 1, p)
-                        })?;
-                        if i == 0 && l.starts_with("bam_id") {
-                            continue; // skip header
-                        }
-                        let parts: Vec<&str> = l.split('\t').collect();
-                        if parts.len() >= 2 {
-                            let bam_id = parts[0].to_string();
-                            let orig = parts[1].to_string();
-                            if !bam_id.is_empty() && !orig.is_empty() {
-                                map.insert(bam_id, orig);
-                            }
+            let id_mapping: Option<std::collections::HashMap<String, String>> = if let Some(ref p) =
+                tx_id_mapping
+            {
+                let f = std::fs::File::open(p)
+                    .with_context(|| format!("Failed to open --tx-id-mapping {:?}", p))?;
+                let reader = std::io::BufReader::new(f);
+                use std::io::BufRead;
+                let mut map = std::collections::HashMap::new();
+                for (i, line) in reader.lines().enumerate() {
+                    let l = line
+                        .with_context(|| format!("Failed to read line {} from {:?}", i + 1, p))?;
+                    if i == 0 && l.starts_with("bam_id") {
+                        continue; // skip header
+                    }
+                    let parts: Vec<&str> = l.split('\t').collect();
+                    if parts.len() >= 2 {
+                        let bam_id = parts[0].to_string();
+                        let orig = parts[1].to_string();
+                        if !bam_id.is_empty() && !orig.is_empty() {
+                            map.insert(bam_id, orig);
                         }
                     }
-                    eprintln!(
-                        "[telescope]    tx_id_mapping entries: {}",
-                        map.len()
-                    );
-                    Some(map)
-                } else {
-                    None
-                };
+                }
+                eprintln!("[telescope]    tx_id_mapping entries: {}", map.len());
+                Some(map)
+            } else {
+                None
+            };
 
             eprintln!("[telescope]  M2: extract evidence…");
             let mut graph = evidence::extract_evidence(&bam, tes_slack)
@@ -383,10 +436,7 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            eprintln!(
-                "[telescope]    molecules:      {}",
-                graph.molecules.len()
-            );
+            eprintln!("[telescope]    molecules:      {}", graph.molecules.len());
             eprintln!(
                 "[telescope]    transcripts:    {}",
                 graph.transcript_names.len()
@@ -410,12 +460,31 @@ fn main() -> Result<()> {
             }
 
             eprintln!("[telescope]  M3: TEL-EM…");
-            let mut em_trace: Vec<(usize, f64, f64)> = Vec::new();
-            let trace_sink: Option<&mut Vec<(usize, f64, f64)>> = if debug {
-                Some(&mut em_trace)
+            eprintln!(
+                "[telescope]    A_rk ACTIVE on ambiguous reads: ln A_rk = (AS_rk − max_j AS_rj) / λ, λ = {}",
+                aln_weight_lambda
+            );
+            // The calibration claim below belongs to the shipped default only;
+            // printing it next to a user-supplied λ would attribute someone
+            // else's value to a calibration that did not produce it.
+            if aln_weight_lambda == ALN_WEIGHT_LAMBDA_DEFAULT {
+                eprintln!(
+                    "[telescope]    λ default {} is calibrated on ONE gene (PGAM1): smallest λ tested \
+                     with 100% full-length-class agreement with minimap2's primary alignment. \
+                     Derived from a single gene — NOT validated library-wide, nor against the \
+                     Phase C red line.",
+                    ALN_WEIGHT_LAMBDA_DEFAULT
+                );
             } else {
-                None
-            };
+                eprintln!(
+                    "[telescope]    λ = {} is user-supplied; the PGAM1-derived default calibration \
+                     (λ = {}) does not apply. No value of λ is validated library-wide.",
+                    aln_weight_lambda, ALN_WEIGHT_LAMBDA_DEFAULT
+                );
+            }
+            let mut em_trace: Vec<(usize, f64, f64)> = Vec::new();
+            let trace_sink: Option<&mut Vec<(usize, f64, f64)>> =
+                if debug { Some(&mut em_trace) } else { None };
             let stats = em::solve_and_write_profile(
                 graph,
                 &emission,
@@ -423,11 +492,18 @@ fn main() -> Result<()> {
                 &output,
                 tol,
                 max_iter,
+                aln_weight_lambda,
                 trace_sink,
             )
             .context("Module 3 solve_and_write_profile failed")?;
-            eprintln!("[telescope]    n_unambig / sample:      {}", stats.n_unambiguous);
-            eprintln!("[telescope]    n_ambig / EM:           {}", stats.n_ambiguous);
+            eprintln!(
+                "[telescope]    n_unambig / sample:      {}",
+                stats.n_unambiguous
+            );
+            eprintln!(
+                "[telescope]    n_ambig / EM:           {}",
+                stats.n_ambiguous
+            );
             eprintln!("[telescope]    EM iterations:          {}", stats.n_em_iter);
             eprintln!(
                 "[telescope]    dropped (incompetent):  {}",
@@ -476,13 +552,19 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::BuildAnchors {
-            bams, sample_ids, output, tx_to_gene,
-            tes_slack, min_coverage, max_reads_per_sample,
+            bams,
+            sample_ids,
+            output,
+            tx_to_gene,
+            tes_slack,
+            min_coverage,
+            max_reads_per_sample,
         } => {
             if bams.len() != sample_ids.len() {
                 anyhow::bail!(
                     "--bam ({} files) and --sample-id ({} ids) must have equal length",
-                    bams.len(), sample_ids.len()
+                    bams.len(),
+                    sample_ids.len()
                 );
             }
             eprintln!("[telescope] D1 Universal Mode: anchor pool builder");
@@ -499,7 +581,11 @@ fn main() -> Result<()> {
             };
             eprintln!("  tx_to_gene entries: {}", tx_to_g.len());
 
-            let pairs: Vec<(PathBuf, &str)> = bams.iter().cloned().zip(sample_ids.iter().map(|s| s.as_str())).collect();
+            let pairs: Vec<(PathBuf, &str)> = bams
+                .iter()
+                .cloned()
+                .zip(sample_ids.iter().map(|s| s.as_str()))
+                .collect();
             let stats = anchor_builder::build_anchor_pool(
                 &pairs,
                 &tx_to_g,
@@ -507,25 +593,33 @@ fn main() -> Result<()> {
                 tes_slack,
                 min_coverage,
                 max_reads_per_sample,
-            ).context("anchor_builder::build_anchor_pool failed")?;
+            )
+            .context("anchor_builder::build_anchor_pool failed")?;
             eprintln!("[telescope]  {}", stats.report());
             eprintln!("[telescope] done.");
             Ok(())
         }
         Cmd::ResolveEvidence {
-            bams, sample_ids, tx_to_gene, cohort_size,
-            tes_cluster_radius, tes_slack, output,
+            bams,
+            sample_ids,
+            tx_to_gene,
+            cohort_size,
+            tes_cluster_radius,
+            tes_slack,
+            output,
         } => {
             if bams.len() != sample_ids.len() {
                 anyhow::bail!(
                     "--bam ({} files) and --sample-id ({} ids) must have equal length",
-                    bams.len(), sample_ids.len()
+                    bams.len(),
+                    sample_ids.len()
                 );
             }
             if cohort_size != bams.len() {
                 anyhow::bail!(
                     "--cohort-size ({}) must equal the number of --bam arguments ({})",
-                    cohort_size, bams.len()
+                    cohort_size,
+                    bams.len()
                 );
             }
             eprintln!("[telescope] Module 0: transcript evidence resolver");
@@ -553,9 +647,8 @@ fn main() -> Result<()> {
             // Load transcript→gene mapping (TSV) → HashMap<String, String>.
             let tx_to_gene_map: std::collections::HashMap<String, String> = match tx_to_gene {
                 Some(p) => {
-                    let content = std::fs::read_to_string(&p).with_context(|| {
-                        format!("Failed to read tx-to-gene TSV: {:?}", p)
-                    })?;
+                    let content = std::fs::read_to_string(&p)
+                        .with_context(|| format!("Failed to read tx-to-gene TSV: {:?}", p))?;
                     let mut m = std::collections::HashMap::new();
                     for (i, line) in content.lines().enumerate() {
                         if i == 0 && line.starts_with("transcript_id") {

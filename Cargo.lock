@@ -1102,6 +1102,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "noodles-bam",
+ "noodles-core",
  "noodles-sam",
  "parquet",
  "rayon",

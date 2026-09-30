@@ -15,3 +15,8 @@ noodles-bam = { workspace = true }
 noodles-sam = { workspace = true }
 anyhow = { workspace = true }
 rayon = { workspace = true }
+
+[dev-dependencies]
+# Only needed to name `noodles_core::Position` when building synthetic BAM
+# records in tests; noodles-sam does not re-export it.
+noodles-core = "0.19"
