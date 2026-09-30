@@ -6,8 +6,12 @@
 //! Bifurcated inference (spec v0.1.7 F2.1):
 //! - Unambiguous reads (candidate_count == 1) get w_rk ≡ 1.0 (deterministic).
 //! - Ambiguous reads (candidate_count > 1) enter the EM loop, which carries the
-//!   joint `w_rk ∝ π_k · A_rk · N(y_r; μ_k, σ_k²)` term of spec v0.2.7 F-EM-4;
-//!   `ln A_rk = (AS_rk − max_j AS_rj) / λ` comes from Module 2's `AS:i` pool.
+//!   joint `w_rk ∝ π_k · A_rk · F_rk · N(y_r; μ_k, σ_k²)` responsibility of
+//!   spec v0.2.7 F-EM-4 plus the 5'-anchoring term; `ln A_rk = (AS_rk − max_j
+//!   AS_rj) / λ` and `ln_5p_k = β if g_k ≤ window` come from Module 2's `AS:i`
+//!   and 5'-gap pools respectively, and the `ΔAS > 50` prune drops the
+//!   hopeless candidates. See `solve_and_write_profile` for the parameter
+//!   provenance, including the rejected alternatives.
 //!
 //! Real-data profile (Tongji 2026-09-25): 99.7% unambiguous, ~0.3% ambiguous
 //! (~7,000 reads). EM therefore runs on a tiny subset.
@@ -139,8 +143,41 @@ pub fn load_emission_parameters<P: AsRef<Path>>(
 /// `output_em_trace`: if `Some`, receives one tuple per EM iteration
 /// `(iter_index, log_likelihood, mean_entropy)` (mean entropy = 0 if no
 /// ambiguous reads). Pass `None` to skip trace collection.
+///
+/// The 5'-anchoring term and the `ΔAS` prune are `FROZEN SPEC`, validated
+/// empirically in the Python prototype against HC3. Provenance, in the form
+/// that must not be re-derived:
+///
+///   `g_k`  = `s_k − 1`, `s_k` the 1-BASED start of the read's BEST alignment
+///            to candidate k, in candidate k's OWN cDNA coordinates. Never a
+///            genomic span; the BAM reference IS the cDNA.
+///   `ln_5p_k` = `five_prime_weight` if `g_k <= five_prime_window` else 0.0.
+///   prune: drop candidates with `ΔAS_k > prune_max_delta_as`, where `ΔAS` is
+///            measured against the read's best AS.
+///   `w_k ∝ π_k · exp(ln_a_k + ln_5p_k)`.
+///
+/// REJECTED — `o_k = T_k − L_k` (transcript minus read length). Its
+///   directionality toward the lower-frequency isoform measured 46.52%, i.e.
+///   chance, against 58.34% for `g_k = s_k − 1`. Reason: `o_k` is a length
+///   comparison, symmetric across candidates, so it CANCELS in the likelihood
+///   ratio. Any future "simplification" to a length difference is a known-wrong
+///   quantity, not a different bug.
+/// REJECTED — `five_prime_weight = 7.9`. With `prune_max_delta_as = 50` and
+///   `aln_weight_lambda = 20` the alignment term spans only `[−2.5, 0]` nats, so
+///   7.9 is an unconditional hard override that no read can argue with. 1.8
+///   sits inside that range, so the 5' term COMPETES with the alignment term
+///   rather than replacing it.
+/// REJECTED — `aln_weight_lambda = 1000`. It made every evidence term ≤ 0.1
+///   nat, i.e. it silently disabled the evidence the EM is supposed to weigh.
+///   The default is now 20.0. This function has NO default of its own: λ, the
+///   5' weight, the window and the prune threshold are all arguments, so no
+///   test here reads a CLI default and no library embedder can pick one up by
+///   accident.
 // `aln_weight_lambda` pushed the signature to 8 arguments; collapsing the EM
 // hyperparameters into a config struct is a separate refactor, out of scope.
+// The 5' term and the prune bring it to 11 adjacent positional scalars, so the
+// argument-shuffling hazard that note warned about is now realised and the
+// config-struct refactor is overdue rather than merely optional.
 #[allow(clippy::too_many_arguments)]
 pub fn solve_and_write_profile<P: AsRef<Path>>(
     graph: FlatEvidenceGraph,
@@ -150,6 +187,9 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
     tol: f64,
     max_iter: usize,
     aln_weight_lambda: f64,
+    five_prime_weight: f64,
+    five_prime_window: u32,
+    prune_max_delta_as: i32,
     mut output_em_trace: Option<&mut Vec<(usize, f64, f64)>>,
 ) -> Result<TelEmStats> {
     // NaN-safe equivalent of the CLI's `!(aln_weight_lambda > 0.0)`: `<= 0.0`
@@ -161,6 +201,34 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
             "aln_weight_lambda must be > 0 (got {}); it scales ln A_rk = (AS_rk − \
              max_j AS_rj)/λ, so 0 and NaN would emit NaN posterior weights",
             aln_weight_lambda
+        );
+    }
+    // 5'-anchoring weight. 0.0 is a LEGAL value and is the documented off
+    // switch (`--five-prime-weight 0`): it makes `ln_5p ≡ 0`, i.e. `exp(0) = 1`,
+    // so the term leaves the softmax EXACTLY rather than approximately. Only a
+    // negative weight or NaN are rejected. A negative weight would reward
+    // reads that start far from the transcript's 5' end, which is not a
+    // configuration the frozen spec admits; NaN would propagate into `ll` and
+    // out as NaN posterior weights.
+    if five_prime_weight < 0.0 || five_prime_weight.is_nan() {
+        anyhow::bail!(
+            "five_prime_weight must be >= 0 and non-NaN (got {}); it is the log-space \
+             bonus ln_5p awarded to a candidate whose observed 5' gap g_k <= \
+             five_prime_window, so 0.0 (the off switch) is valid but a negative \
+             weight would invert the term",
+            five_prime_weight
+        );
+    }
+    // A negative prune threshold would drop every candidate INCLUDING the
+    // read's own argmax (whose ΔAS against itself is 0), emptying `raw` and
+    // turning every ambiguous read into a ghost drop. `i32::MAX` is a legal
+    // "prune off" value.
+    if prune_max_delta_as < 0 {
+        anyhow::bail!(
+            "prune_max_delta_as must be >= 0 (got {}); it drops candidates whose \
+             alignment score is more than this far below the read's best, and a \
+             negative threshold would drop the argmax too, emptying every read",
+            prune_max_delta_as
         );
     }
 
@@ -243,15 +311,95 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
                     .map(|c| graph.candidate_as[(mol.candidate_offset + c as u32) as usize])
                     .fold(i32::MIN, i32::max);
 
-                // Compute raw log responsibilities (with alpha + Gaussian + A_rk).
+                // Compute raw log responsibilities (with alpha + Gaussian +
+                // A_rk + the 5' term).
                 let mut raw: Vec<(usize, f64)> = Vec::with_capacity(mol.candidate_count as usize);
                 for c in 0..mol.candidate_count {
                     let idx = (mol.candidate_offset + c as u32) as usize;
                     let tx_id = graph.candidate_pool[idx] as usize;
-                    // ln A_rk = (AS_rk − max_j AS_rj) / λ (spec v0.2.7 F-EM-4).
-                    // Added to `ll` *before* the `max_ll` log-sum-exp shift, so
-                    // any λ is numerically safe — no clamping needed.
-                    let ln_a = (graph.candidate_as[idx] - max_as) as f64 / aln_weight_lambda;
+
+                    // ΔAS is a MAGNITUDE: the read's best score minus this
+                    // candidate's, so ΔAS >= 0. SIGN MATTERS, and the two uses
+                    // below disagree on purpose: the prune thresholds the
+                    // magnitude, the log term negates it. A prune written on
+                    // the `ln_a` numerator compares a non-positive number
+                    // against 50 and NEVER fires — which is exactly the bug
+                    // `test_prune_boundary_is_strictly_greater_than` exists to
+                    // catch, since a large-ΔAS fixture is then silently passing
+                    // on the `min_weight` cutoff instead.
+                    let delta_as = max_as - graph.candidate_as[idx];
+
+                    // ΔAS prune (frozen spec): drop candidates whose alignment
+                    // score is more than `prune_max_delta_as` below the read's
+                    // best.
+                    //
+                    // `-inf` rather than a bare `continue`, matching the
+                    // competence mask below. Note that in THIS E-step the two
+                    // are observationally IDENTICAL, and it is worth being
+                    // precise about why rather than asserting a safety
+                    // property that does not hold: `weights` is built with
+                    // `filter(ll > -inf)`, so a `-inf` entry leaves the
+                    // population exactly as an absent one would, and
+                    // `sum_exp` contributes `exp(-inf) = 0` either way. The
+                    // log-sum-exp, `log_z`, the emitted weights and the output
+                    // stage's `retained_sum` denominator are all bit-identical
+                    // under both spellings. (They would DIVERGE if that filter
+                    // were ever removed — a `-inf` entry would then be summed
+                    // as 0 by `sum_exp` but never reach `weights`, while an
+                    // absent one would not be counted at all; the direction of
+                    // the difference is the reason the filter is load-bearing,
+                    // not the choice of `-inf` over `continue`.)
+                    //
+                    // The `-inf` form is kept for the weaker but real reasons:
+                    // it keeps one `raw` entry per candidate, so `raw` stays a
+                    // faithful per-candidate record and its `with_capacity`
+                    // holds, and it routes the prune through the same code path
+                    // as every other "this candidate is dead" decision.
+                    //
+                    // This is placed OUTSIDE the `if let Some(params)` so the
+                    // prune is a property of the alignment evidence alone, and
+                    // holds for a candidate that has no emission row at all.
+                    // It cannot empty a read: the argmax candidate has
+                    // `delta_as == 0` against itself and `prune_max_delta_as`
+                    // is validated `>= 0` above, so at least one entry always
+                    // escapes `-inf`.
+                    if delta_as > prune_max_delta_as {
+                        raw.push((tx_id, f64::NEG_INFINITY));
+                        continue;
+                    }
+
+                    // ln A_rk = (AS_rk − max_j AS_rj) / λ (spec v0.2.7 F-EM-4)
+                    // = −ΔAS / λ. Added to `ll` *before* the `max_ll`
+                    // log-sum-exp shift, so any λ is numerically safe — no
+                    // clamping needed.
+                    let ln_a = -(delta_as as f64) / aln_weight_lambda;
+
+                    // ln_5p_k = β if g_k ≤ window else 0 (frozen spec). `g_k` is
+                    // the observed 5' gap of the read's best alignment to THIS
+                    // candidate, in this candidate's own cDNA coordinates, and
+                    // is already strand-corrected by Module 2 — there is no
+                    // strand flag to consult here and none may be inferred.
+                    //
+                    // It is a PRIOR, not an EM parameter: `g_k` is fixed per
+                    // (read, candidate) exactly like `AS`, so it belongs in no
+                    // accumulator and no M-step. Adding it here, before the
+                    // `max_ll` shift, is what keeps the log-sum-exp safe; a
+                    // bounded [0, 1.8] bump on an un-shifted `exp` would not
+                    // overflow, but applying it to the weight AFTER `log_z` is
+                    // formed would break the invariant the λ-range safety
+                    // argument rests on.
+                    //
+                    // NOTE the deliberate asymmetry with `ln_a`: `ln_a` is
+                    // continuous in the evidence and is the term that ORDERS
+                    // candidates, while `ln_5p` is a step function of a single
+                    // coordinate. It can only ever reorder, never delete —
+                    // deletion is the prune's job.
+                    let ln_5p = if graph.candidate_5p_gap[idx] <= five_prime_window {
+                        five_prime_weight
+                    } else {
+                        0.0
+                    };
+
                     if let Some(ref p) = params[tx_id] {
                         if !p.is_competent || p.alpha <= 0.0 {
                             // Push -inf so normalization kills this candidate.
@@ -260,7 +408,8 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
                             let ll = p.alpha.ln()
                                 - (p.sigma2.sqrt()).ln()
                                 - ((y - p.mu).powi(2) / (2.0 * p.sigma2))
-                                + ln_a;
+                                + ln_a
+                                + ln_5p;
                             raw.push((tx_id, ll));
                         }
                     }
@@ -429,7 +578,8 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         // derived once here and repeated verbatim on every row of this read
         // (below) — they do NOT vary with the candidate a row describes.
         // `candidate_count` is read off the graph as-is, i.e. BEFORE the
-        // `min_weight` truncation in the ambiguous branch below can drop rows.
+        // E-step's `ΔAS` prune and BEFORE the `min_weight` truncation in the
+        // ambiguous branch below can drop rows.
         let ncand = mol.candidate_count;
         let as_ratio = read_max_as_ratio(&graph, mol);
         if let Some(ref p) = params[tx_id] {
@@ -457,11 +607,12 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         let mol_idx = ambiguous_indices[i];
         let mol = &graph.molecules[mol_idx];
         let pal_i32 = poly_a_length_from_log2(mol.log_pal);
-        // Observational columns, per READ — computed once, before the
-        // `min_weight` truncation below can drop rows, and repeated verbatim
-        // on every emitted row of this read. `candidate_count` is the ORIGINAL
-        // count off the graph (what the E-step saw), NOT the number of rows
-        // this loop emits.
+        // Observational columns, per READ — computed once, before the E-step's
+        // `ΔAS` prune and before the `min_weight` truncation below can drop
+        // rows, and repeated verbatim on every emitted row of this read.
+        // `candidate_count` is the ORIGINAL count off the graph (what Module 2
+        // produced), NOT the number of rows this loop emits — and not the
+        // number the E-step normalised over, which excludes the pruned.
         let ncand = mol.candidate_count;
         let as_ratio = read_max_as_ratio(&graph, mol);
 
@@ -500,6 +651,16 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         // to `max_ll` in the E-step — harmless there (constant shift inside a
         // softmax), but it means "the weights" and "the raw log
         // responsibilities" are not the same candidate set.
+        //
+        // The `ΔAS` prune does NOT break this coupling, and it is worth being
+        // explicit about why: a pruned candidate is pushed as `-inf`, and
+        // `weights` is built with `filter(ll > -inf)`, so it is already gone
+        // from the population this denominator sums over — its mass was
+        // renormalised away by the log-sum-exp, not left stranded here.
+        // (Verified: replacing the `-inf` push with a bare `continue` leaves
+        // every emitted weight bit-identical, because the same filter removes
+        // it. What the filter protects is the case of a candidate pushed as
+        // `-inf` that is then NOT filtered — not the choice of `-inf`.)
         let retained_sum: f64 = weights
             .iter()
             .filter(|&(_, w)| *w >= min_weight)
@@ -553,20 +714,31 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         // rather than on one gene. These columns are that record.
         //
         // CAVEAT — THE EMITTED DISTRIBUTION IS SURVIVAL-BIASED. Both columns
-        // ride on rows that survive the `min_weight` cutoff, so a read whose
-        // top candidate clears the cutoff while every competitor falls below it
-        // emits exactly one row, and a read all of whose candidates fall below
-        // emits none at all. Reads with decisive evidence are therefore
-        // over-represented relative to genuinely contested reads — which is
-        // the opposite of the population a score-ratio gate would be judged on.
-        // Any analysis of these columns MUST group by `read_id` and report the
-        // read-level coverage rate alongside the distribution; do not read the
-        // row-level histogram as an unbiased per-read statistic.
+        // ride on rows that survive TWO filters, and the two are independent:
+        //   (1) the E-step's `ΔAS > prune_max_delta_as` prune, which removes
+        //       the whole candidate from the softmax, and
+        //   (2) the `min_weight` cutoff below, which truncates a row that
+        //       survived (1).
+        // So a read whose top candidate clears (1) and (2) while every
+        // competitor fails (1) emits exactly one row, and a read all of whose
+        // candidates fall below (2) emits none at all. Reads with decisive
+        // evidence are therefore over-represented relative to genuinely
+        // contested reads — which is the opposite of the population a
+        // score-ratio gate would be judged on. Any analysis of these columns
+        // MUST group by `read_id` and report the read-level coverage rate
+        // alongside the distribution; do not read the row-level histogram as an
+        // unbiased per-read statistic.
         //
         // The molecule's ORIGINAL candidate count (`MoleculeEvidence::candidate_count`
-        // as it stands on the graph), captured before the `min_weight`
-        // truncation drops rows. Differs from the number of emitted rows exactly
-        // when the truncation fired.
+        // as it stands on the graph), captured before BOTH the `ΔAS` prune and
+        // the `min_weight` truncation drop rows. It differs from the number of
+        // emitted rows whenever EITHER fired. The ΔAS prune is why this column
+        // is NOT the count the E-step actually normalised over — the E-step
+        // saw `candidate_count − n_pruned` candidates. Downstream readers
+        // condition on `n_candidates_before_cutoff >= 2`; that condition now
+        // admits reads that were ambiguous on the graph but effectively
+        // unambiguous after pruning (one survivor), and the historical series
+        // is therefore not comparable across this change without a re-baseline.
         Field::new("n_candidates_before_cutoff", DataType::UInt16, false),
         // Second-largest / largest `AS:i` over the read's full candidate range.
         // 0.0 when the read has no second candidate or when no candidate carries
@@ -719,6 +891,23 @@ mod tests {
     /// Output-stage truncation threshold mirrored from `solve_and_write_profile`.
     const MIN_WEIGHT: f64 = 0.01;
 
+    /// Frozen 5'-anchoring weight, mirrored from the CLI default.
+    const FIVE_PRIME_WEIGHT: f64 = 1.8;
+    /// Frozen 5' window `g_k <= 20`, mirrored from the CLI default.
+    const FIVE_PRIME_WINDOW: u32 = 20;
+    /// Frozen `ΔAS` prune threshold, mirrored from the CLI default.
+    const PRUNE_MAX_DELTA_AS: i32 = 50;
+    /// The 5' term switched off. `ln_5p ≡ 0` exactly, so any test passing this
+    /// is provably independent of `candidate_5p_gap` — which is what keeps the
+    /// pre-existing A_rk and renormalisation tests unperturbed by this change
+    /// instead of accidentally also covering the new term.
+    const FIVE_PRIME_OFF: f64 = 0.0;
+    /// The `ΔAS` prune switched off. Legal (`i32::MAX` is a valid threshold);
+    /// used only by the A_rk test, whose `ΔAS = 200` fixture is exactly the
+    /// quantity the prune thresholds on, so testing both at once would conflate
+    /// them into one number.
+    const PRUNE_OFF: i32 = i32::MAX;
+
     #[test]
     fn test_poly_a_length_round_trip() {
         // log2(120) ≈ 6.9069, exp2 = 120
@@ -770,15 +959,31 @@ mod tests {
     }
 
     /// Build a one-molecule `FlatEvidenceGraph`: read `r1` with poly(A) length
-    /// `log_pal` and one candidate per `(transcript_id, AS:i)` entry.
+    /// `log_pal` and one candidate per `(transcript_id, AS:i)` entry. Every
+    /// candidate gets `gap5p = 0`; use `synth_graph_with_gaps` when the 5' term
+    /// is under test.
     fn synth_graph(log_pal: f32, candidates: &[(&str, i32)]) -> FlatEvidenceGraph {
+        let with_gaps: Vec<(&str, i32, u32)> =
+            candidates.iter().map(|&(tx, as_)| (tx, as_, 0)).collect();
+        synth_graph_with_gaps(log_pal, &with_gaps)
+    }
+
+    /// As `synth_graph`, but each candidate also carries its observed 5' gap
+    /// `g_k` (bp from the transcript's 5' end, strand-corrected by Module 2).
+    ///
+    /// `AS` is held under the caller's control and `g_k` is independent of it,
+    /// which is what lets a 5'-term test separate `ln_5p` from `ln_a`: hold AS
+    /// EQUAL and any posterior shift is attributable to the gap alone.
+    fn synth_graph_with_gaps(log_pal: f32, candidates: &[(&str, i32, u32)]) -> FlatEvidenceGraph {
         let mut transcript_names = Vec::new();
         let mut candidate_pool = Vec::new();
         let mut candidate_as = Vec::new();
-        for (tx, as_score) in candidates {
+        let mut candidate_5p_gap = Vec::new();
+        for (tx, as_score, gap) in candidates {
             candidate_pool.push(transcript_names.len() as u32);
             transcript_names.push(tx.to_string());
             candidate_as.push(*as_score);
+            candidate_5p_gap.push(*gap);
         }
         let n = candidates.len();
         FlatEvidenceGraph {
@@ -792,6 +997,7 @@ mod tests {
             candidate_mapq: vec![60; n],
             candidate_pool,
             candidate_as,
+            candidate_5p_gap,
             transcript_names,
         }
     }
@@ -847,6 +1053,13 @@ mod tests {
     /// initialization, so the M-step feedback (which on its own would push π
     /// further towards whichever transcript won the first E-step) cannot be
     /// mistaken for the A_rk effect.
+    ///
+    /// Both new terms are explicitly disabled: `PRUNE_OFF` because this
+    /// fixture's `ΔAS = 200` IS the quantity the `ΔAS > 50` prune thresholds
+    /// on, so leaving it on would delete the very candidate the test measures
+    /// and conflate two mechanisms into one number; `FIVE_PRIME_OFF` so the
+    /// 0.880797 pin below remains a pure A_rk measurement. The prune has its
+    /// own test.
     #[test]
     fn test_a_rk_breaks_weight_tie_by_alignment_score() {
         let log_pal = (100.0_f32).log2();
@@ -862,7 +1075,20 @@ mod tests {
         // One read aligning to tx0 with AS 1000 and to tx1 with AS 800.
         let graph = synth_graph(log_pal, &[("tx0", 1000), ("tx1", 800)]);
 
-        solve_and_write_profile(graph, &emission, "TEST", &profile, 1e-6, 1, 100.0, None).unwrap();
+        solve_and_write_profile(
+            graph,
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            1,
+            100.0,
+            FIVE_PRIME_OFF,
+            FIVE_PRIME_WINDOW,
+            PRUNE_OFF,
+            None,
+        )
+        .unwrap();
 
         let rows = read_profile(&profile);
         let _ = std::fs::remove_file(&emission);
@@ -964,7 +1190,20 @@ mod tests {
         );
         let graph = synth_graph(log_pal, &[("tx0", 900), ("tx1", 900)]);
 
-        solve_and_write_profile(graph, &emission, "TEST", &profile, 1e-6, 1, 100.0, None).unwrap();
+        solve_and_write_profile(
+            graph,
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            1,
+            100.0,
+            FIVE_PRIME_OFF,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            None,
+        )
+        .unwrap();
 
         let rows = read_profile(&profile);
         let _ = std::fs::remove_file(&emission);
@@ -1033,7 +1272,20 @@ mod tests {
         );
         let graph = synth_graph(log_pal, &[("tx0", 900), ("tx1", 900), ("tx2", 900)]);
 
-        solve_and_write_profile(graph, &emission, "TEST", &profile, 1e-6, 1, 100.0, None).unwrap();
+        solve_and_write_profile(
+            graph,
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            1,
+            100.0,
+            FIVE_PRIME_OFF,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            None,
+        )
+        .unwrap();
 
         let rows = read_profile(&profile);
         let _ = std::fs::remove_file(&emission);
@@ -1063,5 +1315,472 @@ mod tests {
             (sum - 1.0).abs() < 1e-9,
             "emitted posterior weights must sum to 1.0, got {sum}"
         );
+    }
+
+    /// Guards the three parameter validations, which run before any I/O and
+    /// are therefore callable with a deliberately nonexistent emission path —
+    /// a bail with a parameter message proves the guard fired, and any other
+    /// error would prove it did not.
+    ///
+    /// The CLI's own `anyhow::bail!` calls cannot be reached this way (they sit
+    /// inside `main()`'s match arm), which is why the core check is the one
+    /// that matters: it is the last gate before a bad parameter becomes NaN
+    /// posterior weights, and it is NaN-safe, which `!(x > 0.0)` is not.
+    ///
+    /// Mutation targets: `five_prime_weight < 0.0` → `<= 0.0` rejects the
+    /// documented off switch and makes the Test A / Test B ablation unrunnable;
+    /// dropping `.is_nan()` lets a NaN weight through every comparison and
+    /// emits NaN posteriors; dropping the `prune_max_delta_as < 0` check lets
+    /// a negative threshold drop each read's own argmax.
+    #[test]
+    fn test_parameter_validation_rejects_bad_values_and_accepts_the_off_switch() {
+        let log_pal = (100.0_f32).log2();
+        let missing = scratch("definitely_not_here.parquet");
+        let profile = scratch("validation_profile.parquet");
+        let graph = synth_graph(log_pal, &[("tx0", 900), ("tx1", 800)]);
+
+        let run = |lambda: f64, w5p: f64, window: u32, prune: i32| {
+            solve_and_write_profile(
+                synth_graph(log_pal, &[("tx0", 900), ("tx1", 800)]),
+                &missing,
+                "TEST",
+                &profile,
+                1e-6,
+                1,
+                lambda,
+                w5p,
+                window,
+                prune,
+                None,
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        };
+
+        // Off switch and legal extremes must NOT be rejected by validation.
+        // (They will still fail on the missing emission file, which is why the
+        // assertion is "not a parameter error" rather than success.)
+        for (lambda, w5p, window, prune, label) in [
+            (20.0, 0.0, 20, 50, "5' off switch"),
+            (20.0, 1.8, 20, i32::MAX, "prune off"),
+            (
+                f64::INFINITY,
+                0.0,
+                20,
+                50,
+                "infinite lambda (as on the CLI)",
+            ),
+        ] {
+            let err = run(lambda, w5p, window, prune).unwrap_err();
+            assert!(
+                !err.contains("must be"),
+                "{label} must pass validation, got: {err}"
+            );
+        }
+
+        // Rejected values.
+        for (lambda, w5p, window, prune, needle, label) in [
+            (0.0, 1.8, 20, 50, "> 0", "λ = 0"),
+            (f64::NAN, 1.8, 20, 50, "> 0", "λ = NaN"),
+            (20.0, -1.0, 20, 50, ">= 0", "negative 5' weight"),
+            (20.0, f64::NAN, 20, 50, ">= 0", "NaN 5' weight"),
+            (20.0, 1.8, 20, -1, ">= 0", "negative prune threshold"),
+        ] {
+            let err = run(lambda, w5p, window, prune).unwrap_err();
+            assert!(
+                err.contains(needle),
+                "{label} must be rejected with a message containing {needle:?}, got: {err}"
+            );
+        }
+    }
+
+    /// Run one E-step (`max_iter = 1`) over a two-candidate read and return the
+    /// emitted `(tx0, tx1)` posterior weights. Both candidates share identical
+    /// emission parameters, so `π_k · N(y; μ_k, σ_k²)` is equal across the pair
+    /// and the split is produced by the evidence terms alone.
+    fn two_candidate_posteriors(
+        name: &str,
+        candidates: &[(&str, i32, u32)],
+        aln_weight_lambda: f64,
+        five_prime_weight: f64,
+        prune_max_delta_as: i32,
+    ) -> Vec<(String, f64)> {
+        let log_pal = (100.0_f32).log2();
+        let emission = scratch(&format!("{name}_emission.parquet"));
+        let profile = scratch(&format!("{name}_profile.parquet"));
+        write_test_emission(
+            &emission,
+            &[
+                ("tx0", "gene0", log_pal as f64, 0.04),
+                ("tx1", "gene1", log_pal as f64, 0.04),
+            ],
+        );
+        let graph = synth_graph_with_gaps(log_pal, candidates);
+        solve_and_write_profile(
+            graph,
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            1,
+            aln_weight_lambda,
+            five_prime_weight,
+            FIVE_PRIME_WINDOW,
+            prune_max_delta_as,
+            None,
+        )
+        .unwrap();
+        let rows = read_profile(&profile);
+        let _ = std::fs::remove_file(&emission);
+        let _ = std::fs::remove_file(&profile);
+        // Returned raw: several of these tests assert that a candidate was
+        // PRUNED or truncated away, so looking a weight up eagerly would panic
+        // inside the helper instead of failing the caller's own assertion.
+        rows
+    }
+
+    /// TEST A of the ablation gate: the 5' term must reach the posterior.
+    ///
+    /// Two candidates with IDENTICAL `AS` (so `ln_a ≡ 0` and `A_rk` cannot
+    /// separate them) and identical emission parameters, differing only in the
+    /// observed 5' gap: tx0 starts 5 bp from the transcript 5' end
+    /// (`g_k = 5 <= 20`) and tx1 starts 500 bp in (`g_k = 500 > 20`). The
+    /// 1.8-nat bonus must give tx0 `e^1.8 / (1 + e^1.8) = 0.858149`.
+    ///
+    /// This is the unit-test analogue of the Python harness's Test A. It
+    /// isolates the term: holding AS and the emission fixed is the only way
+    /// `ln_5p` can be the explanation for the shift.
+    ///
+    /// Mutation targets: dropping `+ ln_5p` from the E-step, computing the
+    /// window as `g_k < 20` (this fixture would still pass — see
+    /// `test_five_prime_window_is_inclusive_at_20`), reading the gap from the
+    /// wrong pool index, or leaving `FIVE_PRIME_WEIGHT` at 0 all flatten the
+    /// pair to 0.5 / 0.5 and turn this red.
+    #[test]
+    fn test_five_prime_term_shifts_posterior_toward_the_anchored_candidate() {
+        let rows = two_candidate_posteriors(
+            "five_prime_on",
+            &[("tx0", 900, 5), ("tx1", 900, 500)],
+            20.0,
+            FIVE_PRIME_WEIGHT,
+            PRUNE_MAX_DELTA_AS,
+        );
+        assert_eq!(
+            rows.len(),
+            2,
+            "equal AS means neither candidate is pruned or truncated: {rows:?}"
+        );
+        let w_anchored = weight_of(&rows, "tx0");
+        let w_anchored_as_lo = weight_of(&rows, "tx1");
+        // e^1.8 = 6.049647… → 6.049647 / 7.049647.
+        assert!(
+            (w_anchored - 0.858_149).abs() < 1e-5,
+            "a 1.8-nat 5' bonus must give 0.8581, got {w_anchored}"
+        );
+        assert!(
+            (w_anchored_as_lo - 0.141_851).abs() < 1e-5,
+            "the 3'-anchored candidate must take the complement, got {w_anchored_as_lo}"
+        );
+        assert!(
+            (w_anchored + w_anchored_as_lo - 1.0).abs() < 1e-12,
+            "emitted posterior weights must sum to 1.0"
+        );
+    }
+
+    /// TEST B of the ablation gate, at unit scale: REDRAWING each read's 5' start
+    /// must RESTORE the no-5'-term posterior.
+    ///
+    /// This is the test that catches the whole term silently doing nothing. The
+    /// acceptance criterion for the real ablation is a DIFFERENCE (Test A −
+    /// Test B ≥ 20 pp), never an absolute percentage, because the absolute value
+    /// is measured against a label that is not ground truth. The same property
+    /// is what makes the term legitimate here: `ln_5p` is a PRIOR over a
+    /// coordinate, and a prior that stops mattering when the coordinate is
+    /// decorrelated from the truth is doing real work rather than adding a
+    /// constant. Both redraw flavours must return the read to a flat 0.5 / 0.5:
+    ///
+    ///   (a) redraw to a gap OUTSIDE the window (500 for both) — the term
+    ///       fires for neither candidate, so it is identically 0;
+    ///   (b) redraw to a gap INSIDE the window (7 for both) — the term fires
+    ///       for both, so it is a shared additive constant and CANCELS in the
+    ///       log-sum-exp. This is the sharper of the two: a term that leaked
+    ///       outside the softmax, or was applied after `log_z`, would NOT
+    ///       cancel here and this case would go red.
+    ///
+    /// The flat reference is the posterior the same fixture produces with the
+    /// term switched off, asserted explicitly so the two cannot drift.
+    #[test]
+    fn test_redrawing_the_5p_start_restores_the_flat_posterior() {
+        let reference_rows = two_candidate_posteriors(
+            "five_prime_off_ref",
+            // A gap inside the window that CANNOT be the discriminator: both
+            // candidates identical in every respect that matters.
+            &[("tx0", 900, 500), ("tx1", 900, 500)],
+            20.0,
+            FIVE_PRIME_OFF,
+            PRUNE_MAX_DELTA_AS,
+        );
+        let (r0, r1) = (
+            weight_of(&reference_rows, "tx0"),
+            weight_of(&reference_rows, "tx1"),
+        );
+        assert!(
+            (r0 - 0.5).abs() < 1e-12 && (r1 - 0.5).abs() < 1e-12,
+            "with the 5' term off and equal AS the posterior must be flat, got {r0} / {r1}"
+        );
+
+        // (a) redraw outside the window → term is identically zero.
+        let outside = two_candidate_posteriors(
+            "five_prime_redraw_outside",
+            &[("tx0", 900, 500), ("tx1", 900, 500)],
+            20.0,
+            FIVE_PRIME_WEIGHT,
+            PRUNE_MAX_DELTA_AS,
+        );
+        let (o0, o1) = (weight_of(&outside, "tx0"), weight_of(&outside, "tx1"));
+        assert!(
+            (o0 - 0.5).abs() < 1e-12 && (o1 - 0.5).abs() < 1e-12,
+            "a redraw outside the window must restore the flat posterior, got {o0} / {o1}"
+        );
+
+        // (b) redraw inside the window → term is a shared constant and cancels.
+        let inside = two_candidate_posteriors(
+            "five_prime_redraw_inside",
+            &[("tx0", 900, 7), ("tx1", 900, 7)],
+            20.0,
+            FIVE_PRIME_WEIGHT,
+            PRUNE_MAX_DELTA_AS,
+        );
+        let (i0, i1) = (weight_of(&inside, "tx0"), weight_of(&inside, "tx1"));
+        assert!(
+            (i0 - 0.5).abs() < 1e-12 && (i1 - 0.5).abs() < 1e-12,
+            "a constant ln_5p must cancel inside the log-sum-exp, got {i0} / {i1}"
+        );
+    }
+
+    /// The window is `g_k <= 20`, INCLUSIVE. 20 bp inside must earn the full
+    /// bonus; 21 bp must earn none. A `< 20` comparison would move the frozen
+    /// threshold by one base against the harness the parameter was validated
+    /// on, and — because the coordinate comes from a 1-based `s_k` with the
+    /// off-by-one applied in Module 2 — an off-by-one here is indistinguishable
+    /// from a coordinate error unless it is pinned at the edge.
+    #[test]
+    fn test_five_prime_window_is_inclusive_at_20() {
+        let at_edge = two_candidate_posteriors(
+            "gap_window_edge",
+            &[("tx0", 900, 20), ("tx1", 900, 900)],
+            20.0,
+            FIVE_PRIME_WEIGHT,
+            PRUNE_MAX_DELTA_AS,
+        );
+        let w_edge = weight_of(&at_edge, "tx0");
+        assert!(
+            (w_edge - 0.858_149).abs() < 1e-5,
+            "g_k = 20 is inside the `<= 20` window and must earn the bonus, got {w_edge}"
+        );
+
+        let just_outside = two_candidate_posteriors(
+            "gap_window_21",
+            &[("tx0", 900, 21), ("tx1", 900, 900)],
+            20.0,
+            FIVE_PRIME_WEIGHT,
+            PRUNE_MAX_DELTA_AS,
+        );
+        let w_21 = weight_of(&just_outside, "tx0");
+        assert!(
+            (w_21 - 0.5).abs() < 1e-12,
+            "g_k = 21 is outside the `<= 20` window and must earn nothing, got {w_21}"
+        );
+    }
+
+    /// Pins the posterior at the NEW λ default of 20.0, which until now no test
+    /// exercised at all: every pre-existing test passed λ = 100 explicitly, so
+    /// the shipped default — at 1000, and now at 20 — has never been pinned.
+    ///
+    /// `ΔAS = 40` at λ = 20 is a 2.0-nat gap → 0.880797, the same value the
+    /// A_rk test reaches at `ΔAS = 200` / λ = 100. That is the point: the same
+    /// posterior from a 5× smaller score gap is exactly what dropping λ from
+    /// 1000 to 20 means, and at the old default this pair would sit at
+    /// 1/(1 + e^-0.04) = 0.99005 instead. `ΔAS = 40` is under the prune
+    /// threshold, so this pin is unaffected by pruning.
+    ///
+    /// Mutation target: shipping λ = 1000 (or any λ ≠ 20) moves this to 0.99005
+    /// and turns it red.
+    #[test]
+    fn test_lambda_20_pins_the_alignment_posterior() {
+        let rows = two_candidate_posteriors(
+            "lambda20",
+            // Equal gaps (both outside the window) so ln_5p ≡ 0 and the pin
+            // measures λ alone.
+            &[("tx0", 1000, 900), ("tx1", 960, 900)],
+            20.0,
+            FIVE_PRIME_WEIGHT,
+            PRUNE_MAX_DELTA_AS,
+        );
+        assert_eq!(rows.len(), 2, "ΔAS = 40 must not be pruned: {rows:?}");
+        let w_high = weight_of(&rows, "tx0");
+        let w_low = weight_of(&rows, "tx1");
+        assert!(
+            (w_high - 0.880_797).abs() < 1e-5,
+            "ΔAS = 40 at λ = 20 is a 2.0-nat gap → 0.8808, got {w_high}"
+        );
+        assert!(
+            (w_high + w_low - 1.0).abs() < 1e-12,
+            "weights must sum to 1.0"
+        );
+    }
+
+    /// The `ΔAS > 50` prune is a hard drop of real posterior mass, so the two
+    /// things that can go wrong silently are (1) it fails to fire, and (2) it
+    /// fires in a way that leaves the emitted weights summing to less than 1.
+    ///
+    /// `ΔAS = 200` against a `PRUNE_OFF` run is the same fixture with the
+    /// mechanism toggled, so the only difference between the two is the prune
+    /// itself.
+    ///
+    /// Mutation targets: inverting the comparison drops the argmax and empties
+    /// the read; writing the prune on the `ln_a` numerator (which is
+    /// non-positive) makes it never fire at all, and every assertion below
+    /// then passes on the `min_weight` cutoff instead — see
+    /// `test_prune_boundary_is_strictly_greater_than`.
+    ///
+    /// Note one mutation that deliberately does NOT turn this red: replacing
+    /// the `-inf` push with a bare `continue`. The two are equivalent here
+    /// because `weights` is built with `filter(ll > -inf)`; see the comment at
+    /// the prune for why, and do not read this test as covering it.
+    #[test]
+    fn test_delta_as_prune_drops_the_candidate_and_keeps_weights_normalised() {
+        let candidates: &[(&str, i32, u32)] = &[("tx0", 1000, 900), ("tx1", 800, 900)];
+
+        // Prune ON: ΔAS = 200 is deleted inside the E-step's softmax.
+        let pruned_rows = two_candidate_posteriors(
+            "prune_on",
+            candidates,
+            20.0,
+            FIVE_PRIME_OFF,
+            PRUNE_MAX_DELTA_AS,
+        );
+        assert_eq!(
+            pruned_rows.len(),
+            1,
+            "ΔAS = 200 > 50 must delete the weaker candidate outright: {pruned_rows:?}"
+        );
+        let w_kept = weight_of(&pruned_rows, "tx0");
+        assert!(
+            (w_kept - 1.0).abs() < 1e-12,
+            "the surviving candidate must absorb all mass, got {w_kept}"
+        );
+        assert!(
+            (pruned_rows.iter().map(|&(_, w)| w).sum::<f64>() - 1.0).abs() < 1e-12,
+            "a pruned candidate must not leak mass into the retained denominator"
+        );
+
+        // Prune OFF, SAME fixture: ΔAS = 200 at λ = 20 is −10 nats, so the
+        // `min_weight` cutoff deletes the row instead. The emitted ROW COUNT is
+        // identical either way, which is precisely why this pair of runs
+        // cannot distinguish the two mechanisms and why the interesting case is
+        // the next one.
+        let unpruned_rows =
+            two_candidate_posteriors("prune_off", candidates, 20.0, FIVE_PRIME_OFF, PRUNE_OFF);
+        assert_eq!(
+            unpruned_rows.len(),
+            1,
+            "ΔAS = 200 is 10 nats, below MIN_WEIGHT whether or not it is pruned: \
+             {unpruned_rows:?}"
+        );
+        assert!(
+            (weight_of(&unpruned_rows, "tx0") - 1.0).abs() < 1e-12,
+            "truncation also renormalises to 1.0: {unpruned_rows:?}"
+        );
+
+        // THE PRUNE'S ACTUAL JOB — a candidate the alignment term and the
+        // output cutoff would both KEEP. ΔAS = 60 is −3.0 nats at λ = 20, i.e.
+        // w = 0.0474, comfortably above MIN_WEIGHT = 0.01, so with the prune off
+        // it survives as a live second hypothesis. The prune deletes it.
+        //
+        // The region where this matters is `50 < ΔAS < 4.595 × 20 = 91.9`:
+        // inside it the prune is strictly stronger than the output cutoff, and
+        // it is the whole reason the prune exists now that λ = 20. Under the
+        // old λ = 1000 the cutoff alone did this job, at 4.595 × 1000 = 4595.
+        let keepable: &[(&str, i32, u32)] = &[("tx0", 1000, 900), ("tx1", 940, 900)];
+        let pruned_60 = two_candidate_posteriors(
+            "prune_60_on",
+            keepable,
+            20.0,
+            FIVE_PRIME_OFF,
+            PRUNE_MAX_DELTA_AS,
+        );
+        assert_eq!(
+            pruned_60.len(),
+            1,
+            "ΔAS = 60 > 50 must be pruned even though A_rk alone would keep it: \
+             {pruned_60:?}"
+        );
+        assert!(
+            (weight_of(&pruned_60, "tx0") - 1.0).abs() < 1e-12,
+            "the survivor absorbs everything: {pruned_60:?}"
+        );
+
+        let unpruned_60 =
+            two_candidate_posteriors("prune_60_off", keepable, 20.0, FIVE_PRIME_OFF, PRUNE_OFF);
+        assert_eq!(
+            unpruned_60.len(),
+            2,
+            "without the prune the same candidate is emitted as a live hypothesis: \
+             {unpruned_60:?}"
+        );
+        let w0 = weight_of(&unpruned_60, "tx0");
+        let w1 = weight_of(&unpruned_60, "tx1");
+        // 1/(1 + e^-3) = 0.952574, renormalised over the retained pair.
+        assert!(
+            (w0 - 0.952_574).abs() < 1e-5,
+            "−3.0 nats of A_rk must give 0.9526 on its own, got {w0}"
+        );
+        assert!(
+            (w0 + w1 - 1.0).abs() < 1e-12,
+            "emitted weights must sum to 1.0, got {w0} + {w1}"
+        );
+    }
+
+    /// The prune comparison is strictly greater-than: `ΔAS = 50` survives and
+    /// `ΔAS = 51` does not. An off-by-one here silently moves the frozen
+    /// threshold against the harness the parameter was validated on, and it
+    /// would not be visible in any test that only used a large ΔAS.
+    #[test]
+    fn test_prune_boundary_is_strictly_greater_than() {
+        // ΔAS = 50 exactly: `delta_as > 50` is false, so it survives.
+        let rows_at = two_candidate_posteriors(
+            "prune_at_50",
+            &[("tx0", 1000, 900), ("tx1", 950, 900)],
+            20.0,
+            FIVE_PRIME_OFF,
+            PRUNE_MAX_DELTA_AS,
+        );
+        assert_eq!(
+            rows_at.len(),
+            2,
+            "ΔAS = 50 is NOT pruned (`> 50`, not `>= 50`): {rows_at:?}"
+        );
+        // −2.5 nats at λ = 20 → 1/(1 + e^-2.5) = 0.924142, and both candidates
+        // clear MIN_WEIGHT so the pair is renormalised over itself.
+        let w_at = weight_of(&rows_at, "tx0");
+        assert!(
+            (w_at - 0.924_142).abs() < 1e-5,
+            "a surviving ΔAS = 50 candidate must still cost 2.5 nats, got {w_at}"
+        );
+        assert!(
+            (w_at + weight_of(&rows_at, "tx1") - 1.0).abs() < 1e-12,
+            "the retained pair must sum to 1.0: {rows_at:?}"
+        );
+
+        // ΔAS = 51: pruned.
+        let rows_51 = two_candidate_posteriors(
+            "prune_at_51",
+            &[("tx0", 1000, 900), ("tx1", 949, 900)],
+            20.0,
+            FIVE_PRIME_OFF,
+            PRUNE_MAX_DELTA_AS,
+        );
+        assert_eq!(rows_51.len(), 1, "ΔAS = 51 must be pruned: {rows_51:?}");
     }
 }

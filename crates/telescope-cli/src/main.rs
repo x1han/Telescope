@@ -19,7 +19,45 @@ use telescope_core::{anchor_builder, em, emission_model, evidence, resolver, sum
 /// Referenced by both clap's default and the `quant` telemetry so the shipped
 /// default and the claim printed next to it cannot drift apart. Provenance is
 /// documented on the `--aln-weight-lambda` argument.
-const ALN_WEIGHT_LAMBDA_DEFAULT: f64 = 1000.0;
+///
+/// PROVENANCE — the previous default of 1000.0 was WRONG and is superseded.
+/// It was calibrated on ONE gene (PGAM1) and, more importantly, at that
+/// temperature every evidence term is compressed to ≤ 0.1 nat, so the EM was
+/// effectively ignoring the alignment evidence it exists to weigh. At λ = 20
+/// with the `ΔAS > 50` prune the term spans `[−2.5, 0]` nats, which is the
+/// range the 5'-anchoring weight of 1.8 was chosen to COMPETE inside — a 7.9
+/// weight (also tried, also rejected) would override the alignment evidence
+/// outright rather than compete with it. Provenance: the frozen-parameter table
+/// in `workspace/notes/EXPERIMENT.md`. Note the λ = 1000 figures cited in the
+/// superseded single-gene calibration come from the COPD29 pilot BAM; the
+/// active dataset is the 10-sample COPD/HC cohort, so they were never
+/// library-wide evidence in the first place.
+const ALN_WEIGHT_LAMBDA_DEFAULT: f64 = 20.0;
+
+/// Default weight β of the 5'-anchoring term `ln_5p_k = β if g_k ≤ window`.
+///
+/// PROVENANCE — 7.9 was TRIED AND REJECTED: with `prune = 50` and `λ = 20` the
+/// alignment term spans only `[−2.5, 0]` nats, so a 7.9-nat bonus is an
+/// unconditional hard override that no read's own evidence can argue with. 1.8
+/// sits inside that range, so the 5' term competes with the alignment term
+/// instead of replacing it.
+///
+/// This is the 5' term's off switch as well as its weight: `--five-prime-weight
+/// 0` makes `ln_5p ≡ 0` exactly (`exp(0) = 1`), so the term leaves the softmax
+/// exactly rather than approximately. That is the mechanism behind the Test A /
+/// Test B ablation, and it is the only correct way to run arm B.
+const FIVE_PRIME_WEIGHT_DEFAULT: f64 = 1.8;
+
+/// Default 5' window in bp: the bonus fires iff the read's observed 5' gap
+/// `g_k` in candidate k's cDNA coordinates is at most this. INCLUSIVE (`<=`).
+const FIVE_PRIME_WINDOW_DEFAULT: u32 = 20;
+
+/// Default `ΔAS` prune threshold. Candidates whose alignment score is more
+/// than this far below the read's best are dropped before the softmax, which is
+/// where the deletion responsibility moved to once λ dropped to 20 (at λ = 1000
+/// the `min_weight` cutoff used to do this implicitly, via a much weaker
+/// penalty that happened to cross 4.595 nats only for high-AS reads).
+const PRUNE_MAX_DELTA_AS_DEFAULT: i32 = 50;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -128,38 +166,64 @@ enum Cmd {
         max_iter: usize,
 
         /// Scale λ of the F-EM-4 alignment term `ln A_rk = (AS_rk − max_j AS_rj) / λ`
-        /// (default: 1000.0). Must be > 0. Larger λ = weaker alignment prior.
+        /// (default: 20.0). Must be > 0. Larger λ = weaker alignment prior.
         ///
-        /// The default is calibrated on ONE gene (PGAM1), not library-wide and
-        /// not against the Phase C red line. End-to-end grid on the COPD29 BAM
-        /// (oracle = minimap2 primary), full-length read class only — PGAM1's two
-        /// isoforms share a 3' end (ΔTES = 2 bp) and differ at the 5' end
-        /// (ΔTSS = 1555 bp), so a read reaching the 5'-unique region has a
-        /// provably-known isoform: of {no A_rk, 100, 3, 10, 30, 1000, 3000,
-        /// 10000}, 1000 is the smallest λ tested that put 100% of that class in
-        /// agreement. On PGAM1 smaller λ buys no further repair and only
-        /// destroys posterior — at λ=100 every ambiguous read there collapsed to
-        /// a single candidate row with weight 1.0. 5'-truncated reads have no
-        /// ground truth, so their agreement rate is not an accuracy measure.
+        /// PROVENANCE — this default was 1000.0 until the 5'-anchoring work, and
+        /// that value is superseded. 1000 came from a ONE-gene (PGAM1) grid on
+        /// the COPD29 pilot BAM whose oracle was minimap2's own primary
+        /// alignment, i.e. the term was being judged against the aligner that
+        /// produced it. More decisively, at λ = 1000 every evidence term
+        /// compresses to ≤ 0.1 nat, so the EM was barely using the alignment
+        /// evidence it exists to weigh. At λ = 20 with the `ΔAS > 50` prune the
+        /// term spans `[−2.5, 0]` nats, which is the range the 5' weight of 1.8
+        /// was chosen to compete inside.
         ///
-        /// The companion simulation
-        /// (`workspace/comms/2026-09-29-golden-gene-screen/sim_lambda_sweep.py`)
-        /// recommends λ ∈ [1,3] and scores 0.8948 at λ=1000, ~10 accuracy points
-        /// below λ=100 under θ>0. That is not a conflict — different populations:
-        /// its headline metric ΔAUC(TEL-EM − alignment-only) is λ-invariant by
-        /// construction (Model B is an argmax over a monotone transform of AS;
-        /// the sweep measured a spread of exactly 0.000000 across the whole grid),
-        /// so its recommendation comes from the ΔAUC argmax, not an end-to-end
-        /// oracle; and it averages over an inverted-AS rate θ up to 0.25, whereas
-        /// PGAM1's full-length class measured θ = 0 (0 of 559 inversions), so that
-        /// population does not exist in the measured data. The converse holds:
-        /// θ = 0 is one gene. If another gene's full-length class does contain
-        /// inversions, the large-λ regime is the safer one — that is the open
-        /// question for this parameter and why it stays hedged as one-gene-derived.
-        /// Full curve and provenance: `workspace/notes/EXPERIMENT.md`,
-        /// 2026-09-28 "λ 默认值 100 → 1000 修正" and "A_rk 的 λ 标定".
+        /// No value of λ is validated library-wide. Full curve, the superseded
+        /// single-gene calibration, and the frozen-parameter table:
+        /// `workspace/notes/EXPERIMENT.md`.
         #[arg(long, default_value_t = ALN_WEIGHT_LAMBDA_DEFAULT)]
         aln_weight_lambda: f64,
+
+        /// Weight β of the 5'-anchoring term `ln_5p_k = β` when the read's
+        /// observed 5' gap `g_k` is within `--five-prime-window` of the
+        /// candidate transcript's 5' end, else 0 (default: 1.8). Must be >= 0.
+        ///
+        /// `g_k` is the start of the read's BEST alignment to candidate k, in
+        /// candidate k's OWN cDNA coordinates — not a genomic span. Because the
+        /// two strands of the molecule measure opposite ends, Module 2 corrects
+        /// for strand at extraction, so this term is well defined on antisense
+        /// alignments rather than silently reading the 3' end.
+        ///
+        /// **Set to 0 to switch the term off.** That makes `ln_5p ≡ 0` exactly,
+        /// so it drops out of the softmax exactly; it is the correct way to run
+        /// the Test A / Test B ablation. Note that redrawing each read's 5' start
+        /// (Test B) is a different intervention and is not the same as turning
+        /// the weight to 0 — a redraw leaves the term active but decorrelated.
+        ///
+        /// PROVENANCE — 7.9 was tried and rejected: with the `ΔAS > 50` prune
+        /// and λ = 20 the alignment term spans only `[−2.5, 0]` nats, so a
+        /// 7.9-nat bonus is an unconditional override. 1.8 competes instead.
+        #[arg(long, default_value_t = FIVE_PRIME_WEIGHT_DEFAULT)]
+        five_prime_weight: f64,
+
+        /// 5' window in bp for `--five-prime-weight`: the bonus fires iff
+        /// `g_k <=` this value (default: 20). INCLUSIVE. The comparison is on
+        /// the 1-based start `s_k` minus one, which is why 20 and 21 are
+        /// different answers and the boundary is tested.
+        #[arg(long, default_value_t = FIVE_PRIME_WINDOW_DEFAULT)]
+        five_prime_window: u32,
+
+        /// Drop candidates whose `AS:i` is more than this far below the read's
+        /// best (default: 50). Must be >= 0; the comparison is strictly
+        /// greater-than, so `ΔAS = 50` survives. The read's own best candidate
+        /// has `ΔAS = 0` against itself and can never be pruned.
+        ///
+        /// At λ = 20 the alignment term is too weak to delete candidates on its
+        /// own — reaching the `min_weight` cutoff costs `ΔAS > 4.595 × 20 = 91.9`,
+        /// past this threshold — so the deletion responsibility sits here. Use
+        /// a very large value to switch the prune off.
+        #[arg(long, default_value_t = PRUNE_MAX_DELTA_AS_DEFAULT)]
+        prune_max_delta_as: i32,
 
         /// Optional TSV with header `bam_id\toriginal_id` for ID translation
         /// (replaces offline Python workaround for AIDRS re-keying).
@@ -357,6 +421,9 @@ fn main() -> Result<()> {
             tol,
             max_iter,
             aln_weight_lambda,
+            five_prime_weight,
+            five_prime_window,
+            prune_max_delta_as,
             tx_id_mapping,
             debug,
         } => {
@@ -368,6 +435,26 @@ fn main() -> Result<()> {
                     aln_weight_lambda
                 );
             }
+            // NaN-safe: `!(w >= 0.0)` would let NaN through, and a NaN weight
+            // propagates into every posterior weight. 0.0 is legal and is the
+            // documented off switch for the 5' term.
+            if !(five_prime_weight >= 0.0) {
+                anyhow::bail!(
+                    "--five-prime-weight must be >= 0 and non-NaN (got {}); it is the \
+                     log-space bonus ln_5p awarded inside the 5' window, so 0.0 is the \
+                     valid off switch but a negative weight inverts the term and NaN \
+                     would emit NaN posterior weights",
+                    five_prime_weight
+                );
+            }
+            if prune_max_delta_as < 0 {
+                anyhow::bail!(
+                    "--prune-max-delta-as must be >= 0 (got {}); a negative threshold \
+                     would also drop the read's own best candidate, emptying every \
+                     ambiguous read",
+                    prune_max_delta_as
+                );
+            }
             eprintln!("[telescope] Quant (M2 → M3)");
             eprintln!("  bam:        {}", bam.display());
             eprintln!("  emission:   {}", emission.display());
@@ -377,16 +464,17 @@ fn main() -> Result<()> {
             eprintln!("  tol:        {:.1e}", tol);
             eprintln!("  max_iter:   {}", max_iter);
             eprintln!("  aln_weight_lambda: {}", aln_weight_lambda);
+            eprintln!("  five_prime_weight: {}", five_prime_weight);
+            eprintln!("  five_prime_window: {} bp", five_prime_window);
+            eprintln!("  prune_max_delta_as: {}", prune_max_delta_as);
             if aln_weight_lambda == ALN_WEIGHT_LAMBDA_DEFAULT {
                 eprintln!(
-                    "  WARNING: --aln-weight-lambda is at its PROVISIONAL default \
-                     (1000.0). It was calibrated on a single gene (PGAM1) and is \
-                     not validated genome-wide.\n\
-                     \x20            On genes with d >= 0.5 (~28% of the library), \
-                     the full-length class measures d_AUC = -0.133 versus \
-                     alignment-only, i.e. the alignment term is NET HARMFUL there.\n\
-                     \x20            This value must not be treated as final until the \
-                     stratified scan (S1) completes."
+                    "  WARNING: --aln-weight-lambda is at its FROZEN default (20.0).\n\
+                     \x20            It was set by the 5'-anchoring ablation, not by the \
+                     earlier one-gene (PGAM1) calibration that produced λ=1000 — that \
+                     value is superseded and compressed every evidence term to \
+                     <= 0.1 nat.\n\
+                     \x20            No value of λ is validated library-wide."
                 );
             }
             if let Some(ref p) = tx_id_mapping {
@@ -464,21 +552,37 @@ fn main() -> Result<()> {
                 "[telescope]    A_rk ACTIVE on ambiguous reads: ln A_rk = (AS_rk − max_j AS_rj) / λ, λ = {}",
                 aln_weight_lambda
             );
+            if five_prime_weight > 0.0 {
+                eprintln!(
+                    "[telescope]    5' term ACTIVE on ambiguous reads: ln_5p = {} if g_k <= {} bp, else 0",
+                    five_prime_weight, five_prime_window
+                );
+            } else {
+                eprintln!("[telescope]    5' term OFF (--five-prime-weight 0).");
+            }
+            if prune_max_delta_as < i32::MAX {
+                eprintln!(
+                    "[telescope]    ΔAS prune ACTIVE: drop candidates with ΔAS > {} vs the read's best AS",
+                    prune_max_delta_as
+                );
+            } else {
+                eprintln!("[telescope]    ΔAS prune OFF (--prune-max-delta-as at i32::MAX).");
+            }
             // The calibration claim below belongs to the shipped default only;
             // printing it next to a user-supplied λ would attribute someone
             // else's value to a calibration that did not produce it.
             if aln_weight_lambda == ALN_WEIGHT_LAMBDA_DEFAULT {
                 eprintln!(
-                    "[telescope]    λ default {} is calibrated on ONE gene (PGAM1): smallest λ tested \
-                     with 100% full-length-class agreement with minimap2's primary alignment. \
-                     Derived from a single gene — NOT validated library-wide, nor against the \
-                     Phase C red line.",
+                    "[telescope]    λ default {} comes from the 5'-anchoring ablation, which put the \
+                     alignment term in the same [−2.5, 0] nat range the 5' bonus competes in. \
+                     The earlier one-gene (PGAM1) λ=1000 calibration is SUPERSEDED. No value of \
+                     λ is validated library-wide.",
                     ALN_WEIGHT_LAMBDA_DEFAULT
                 );
             } else {
                 eprintln!(
-                    "[telescope]    λ = {} is user-supplied; the PGAM1-derived default calibration \
-                     (λ = {}) does not apply. No value of λ is validated library-wide.",
+                    "[telescope]    λ = {} is user-supplied; the frozen default (λ = {}) does not \
+                     apply. No value of λ is validated library-wide.",
                     aln_weight_lambda, ALN_WEIGHT_LAMBDA_DEFAULT
                 );
             }
@@ -493,6 +597,9 @@ fn main() -> Result<()> {
                 tol,
                 max_iter,
                 aln_weight_lambda,
+                five_prime_weight,
+                five_prime_window,
+                prune_max_delta_as,
                 trace_sink,
             )
             .context("Module 3 solve_and_write_profile failed")?;
@@ -698,5 +805,119 @@ fn main() -> Result<()> {
             eprintln!("[telescope] done.");
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Pins the shipped defaults.
+    ///
+    /// This file previously had NO test module, so nothing in the repository
+    /// asserted the value of any default: every `em.rs` test passes λ (and now
+    /// the 5' weight, window and prune threshold) EXPLICITLY, by the existing
+    /// convention of not letting a unit test read a CLI default. The
+    /// consequence was that bumping `ALN_WEIGHT_LAMBDA_DEFAULT` back to the
+    /// superseded 1000.0 left the entire suite green — verified by mutation.
+    ///
+    /// The defaults are the frozen parameters, and the whole change is
+    /// "ship these numbers", so the numbers themselves need a guard. The
+    /// backend tests pin what each value DOES; this pins what is SHIPPED.
+    ///
+    /// Mutation target: changing any of the four constants, or changing a
+    /// `default_value_t` to diverge from its constant, turns this red — which
+    /// is the drift the doc comment on `ALN_WEIGHT_LAMBDA_DEFAULT` promises
+    /// cannot happen.
+    #[test]
+    fn test_shipped_defaults_are_the_frozen_parameters() {
+        assert_eq!(
+            ALN_WEIGHT_LAMBDA_DEFAULT, 20.0,
+            "λ = 1000 compressed every evidence term to <= 0.1 nat and is superseded"
+        );
+        assert_eq!(FIVE_PRIME_WEIGHT_DEFAULT, 1.8, "frozen 5' weight");
+        assert_eq!(FIVE_PRIME_WINDOW_DEFAULT, 20, "frozen 5' window, inclusive");
+        assert_eq!(PRUNE_MAX_DELTA_AS_DEFAULT, 50, "frozen ΔAS prune threshold");
+    }
+
+    /// The `default_value_t` attributes must resolve to the SAME constants.
+    ///
+    /// clap derives the shipped default from `default_value_t`, and renders it
+    /// into `[default: N]` in `--help`. A literal typed into the attribute
+    /// instead of the constant would therefore print a help block
+    /// contradicting the telemetry and the doc comment — exactly the drift
+    /// that happened before this change, when the prose said
+    /// `(default: 1000.0)` while the const said something else.
+    ///
+    /// Asserted by PARSING rather than by matching the rendered string, because
+    /// clap formats `f64` its own way (20.0 renders as `20`, not `20.0`) and
+    /// that is an implementation detail, not the property under test.
+    #[test]
+    fn test_quant_flag_defaults_come_from_the_constants() {
+        let m = Cli::command()
+            .try_get_matches_from([
+                "telescope",
+                "quant",
+                "--bam",
+                "in.bam",
+                "--emission",
+                "e.parquet",
+                "--sample-id",
+                "S1",
+                "--output",
+                "o.parquet",
+            ])
+            .expect("required-only invocation parses");
+        let sub = m.subcommand_matches("quant").expect("quant subcommand");
+        assert_eq!(
+            *sub.get_one::<f64>("aln_weight_lambda").unwrap(),
+            ALN_WEIGHT_LAMBDA_DEFAULT,
+            "--aln-weight-lambda must default to the constant, not a literal"
+        );
+        assert_eq!(
+            *sub.get_one::<f64>("five_prime_weight").unwrap(),
+            FIVE_PRIME_WEIGHT_DEFAULT,
+            "--five-prime-weight must default to the constant, not a literal"
+        );
+        assert_eq!(
+            *sub.get_one::<u32>("five_prime_window").unwrap(),
+            FIVE_PRIME_WINDOW_DEFAULT,
+            "--five-prime-window must default to the constant, not a literal"
+        );
+        assert_eq!(
+            *sub.get_one::<i32>("prune_max_delta_as").unwrap(),
+            PRUNE_MAX_DELTA_AS_DEFAULT,
+            "--prune-max-delta-as must default to the constant, not a literal"
+        );
+    }
+
+    /// `--five-prime-weight 0` is the documented off switch and must be
+    /// ACCEPTED, not rejected by the `>= 0` validation. A `> 0` guard would
+    /// silently make the Test A / Test B ablation unrunnable.
+    #[test]
+    fn test_five_prime_weight_zero_parses_as_the_off_switch() {
+        let cmd = Cli::command()
+            .try_get_matches_from([
+                "telescope",
+                "quant",
+                "--bam",
+                "in.bam",
+                "--emission",
+                "e.parquet",
+                "--sample-id",
+                "S1",
+                "--output",
+                "o.parquet",
+                "--five-prime-weight",
+                "0",
+            ])
+            .expect("weight 0 must be accepted");
+        let sub = cmd.subcommand_matches("quant").expect("quant subcommand");
+        assert_eq!(
+            *sub.get_one::<f64>("five_prime_weight").unwrap(),
+            0.0,
+            "the off switch must survive parsing exactly"
+        );
     }
 }

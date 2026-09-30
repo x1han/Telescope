@@ -419,6 +419,7 @@ where
         candidate_as: Vec::new(),
         candidate_nm: Vec::new(),
         candidate_mapq: Vec::new(),
+        candidate_5p_gap: Vec::new(),
         transcript_names: Vec::new(),
     };
     let mut count: usize = 0;
@@ -448,11 +449,22 @@ where
         pooled.candidate_as.extend(g.candidate_as);
         pooled.candidate_nm.extend(g.candidate_nm);
         pooled.candidate_mapq.extend(g.candidate_mapq);
+        pooled.candidate_5p_gap.extend(g.candidate_5p_gap);
         // Lockstep invariant across pooled BAMs: the alignment-evidence pools
         // stay index-aligned with `candidate_pool`.
+        //
+        // THIS IS THE HIGHEST-SEVERITY SILENT-FAILURE SITE IN THE 5' CHANGE.
+        // Every `extend` above MUST be present: omitting one leaves that pool
+        // short while `candidate_pool` grows, and `candidate_5p_gap[o + c]` is
+        // then read from the WRONG BAM's coordinate frame — a wrong 5' gap, not
+        // a crash. `cargo test` stays green because the only guard is a
+        // `debug_assert_eq!` on LENGTHS, and the forgotten pool is length 0 on
+        // the first BAM; the assert trips only from the second BAM onward, and
+        // not at all in a release build.
         debug_assert_eq!(pooled.candidate_pool.len(), pooled.candidate_as.len());
         debug_assert_eq!(pooled.candidate_pool.len(), pooled.candidate_nm.len());
         debug_assert_eq!(pooled.candidate_pool.len(), pooled.candidate_mapq.len());
+        debug_assert_eq!(pooled.candidate_pool.len(), pooled.candidate_5p_gap.len());
         count += 1;
     }
     Ok((pooled, count))
@@ -470,6 +482,93 @@ mod tests {
             candidate_offset: offset,
             candidate_count: count,
         }
+    }
+
+    /// Guards the cohort pooling path against a MISSING `extend`.
+    ///
+    /// `pool_evidence_graphs` concatenates five lockstep pools across BAMs. A
+    /// forgotten `extend` for any one of them leaves that pool short while
+    /// `candidate_pool` grows, and every index `o + c` then reads the WRONG
+    /// BAM's coordinate frame — a silently wrong 5' gap, not a crash. The
+    /// in-function `debug_assert_eq!` is the only other guard and it is
+    /// compiled out in release; before this test existed, deleting
+    /// `pooled.candidate_5p_gap.extend(..)` left the ENTIRE suite green,
+    /// because nothing called `pool_evidence_graphs` at all.
+    ///
+    /// Two BAMs with DISTINCT gaps are used so the assertion is about the
+    /// pooled FRAME, not just the length: if the second BAM's gap overwrote or
+    /// dropped the first's, the values below would not match.
+    ///
+    /// Mutation target: removing any one of the five `extend` calls in
+    /// `pool_evidence_graphs` turns this red.
+    #[test]
+    fn test_pool_evidence_graphs_keeps_all_pools_aligned() {
+        use crate::evidence::test_support::{synth_record_with_gap, write_synthetic_bam};
+
+        // BAM 1: one read, g_k = 5.   BAM 2: one read, g_k = 40.
+        let bam1 = write_synthetic_bam(
+            "pool1",
+            vec![synth_record_with_gap("p1", 0, 5, false, Some(1000), 1, 60)],
+        );
+        let bam2 = write_synthetic_bam(
+            "pool2",
+            vec![synth_record_with_gap("p2", 0, 40, false, Some(900), 2, 30)],
+        );
+
+        let pairs = [(bam1.as_path(), "S1"), (bam2.as_path(), "S2")];
+        let (pooled, n) = pool_evidence_graphs(&pairs, 35).unwrap();
+        let _ = std::fs::remove_file(&bam1);
+        let _ = std::fs::remove_file(&bam2);
+
+        assert_eq!(n, 2);
+        assert_eq!(
+            pooled.molecules.len(),
+            2,
+            "read ids are namespaced per sample"
+        );
+        let total: usize = pooled
+            .molecules
+            .iter()
+            .map(|m| m.candidate_count as usize)
+            .sum();
+        assert_eq!(total, pooled.candidate_pool.len());
+
+        // Every pool must be exactly as long as `candidate_pool` — asserted
+        // unconditionally, unlike the in-function `debug_assert_eq!`, so this
+        // still bites in a release build.
+        assert_eq!(pooled.candidate_as.len(), pooled.candidate_pool.len());
+        assert_eq!(pooled.candidate_nm.len(), pooled.candidate_pool.len());
+        assert_eq!(pooled.candidate_mapq.len(), pooled.candidate_pool.len());
+        assert_eq!(
+            pooled.candidate_5p_gap.len(),
+            pooled.candidate_pool.len(),
+            "candidate_5p_gap desynchronised: a missing `extend` reads the 5' gap \
+             from the wrong BAM's frame"
+        );
+
+        // The pooled 5' gaps are the two BAMs' gaps, in BAM order, and each
+        // molecule's `candidate_offset` indexes its own slot.
+        let mut gaps_by_sample: Vec<(String, u32)> = pooled
+            .molecules
+            .iter()
+            .map(|m| {
+                let o = m.candidate_offset as usize;
+                assert_eq!(m.candidate_count, 1, "{} is single-candidate", m.read_id);
+                (m.read_id.clone(), pooled.candidate_5p_gap[o])
+            })
+            .collect();
+        gaps_by_sample.sort();
+        assert_eq!(
+            gaps_by_sample,
+            vec![("S1::p1".to_string(), 5), ("S2::p2".to_string(), 40)],
+            "pooled gaps must be the two BAMs' own gaps, each in its own frame"
+        );
+
+        // ... and the AS/NM/MAPQ pools must likewise carry each BAM's own
+        // values, not a repeat of the first BAM's.
+        assert_eq!(pooled.candidate_as, vec![1000, 900]);
+        assert_eq!(pooled.candidate_nm, vec![1, 2]);
+        assert_eq!(pooled.candidate_mapq, vec![60, 30]);
     }
 
     #[test]
@@ -493,6 +592,7 @@ mod tests {
             candidate_as: vec![0; 5],
             candidate_nm: vec![0; 5],
             candidate_mapq: vec![0; 5],
+            candidate_5p_gap: vec![0; 5],
             transcript_names: vec!["tx_a".into(), "tx_b".into(), "tx_c".into(), "tx_d".into()],
         };
         let mut tx2g = HashMap::new();
@@ -550,6 +650,7 @@ mod tests {
             candidate_as: vec![0; 3],
             candidate_nm: vec![0; 3],
             candidate_mapq: vec![0; 3],
+            candidate_5p_gap: vec![0; 3],
             transcript_names: vec!["tx_a".into(), "tx_b".into()],
         };
         let mut tx2g = HashMap::new();
@@ -587,6 +688,7 @@ mod tests {
             candidate_as: vec![0; 1],
             candidate_nm: vec![0; 1],
             candidate_mapq: vec![0; 1],
+            candidate_5p_gap: vec![0; 1],
             transcript_names: vec!["tx_a".into(), "tx_b".into()],
         };
         let mut tx2g = HashMap::new();
