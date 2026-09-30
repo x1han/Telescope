@@ -1106,6 +1106,7 @@ dependencies = [
  "noodles-sam",
  "parquet",
  "rayon",
+ "telescope-core",
 ]
 
 [[package]]

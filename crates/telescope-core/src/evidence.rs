@@ -444,15 +444,16 @@ impl FlatEvidenceGraph {
     }
 }
 
-#[cfg(test)]
-/// Synthetic-BAM helpers shared with `resolver`'s tests.
-///
-/// These are `#[cfg(test)]`-only and exist because the cohort pooling path
-/// (`resolver::pool_evidence_graphs`) needs a real BAM on disk, and duplicating
-/// a second writer there would let the two copies drift — which is precisely
-/// the class of bug the pooling path is prone to.
-#[cfg(test)]
-pub(crate) mod test_support {
+#[cfg(any(test, feature = "test-support"))]
+/// Synthetic-BAM helpers shared with `resolver`'s tests, and with the
+/// end-to-end integration tests in `tests/`, which are a SEPARATE crate and so
+/// cannot see `#[cfg(test)]` items. That is what the `test-support` feature is
+/// for; `#[doc(hidden)]` keeps it out of the published docs. The alternative —
+/// a second BAM writer inside `tests/` — would let the copies drift, which is
+/// precisely the class of bug the pooling path is prone to and the reason this
+/// module exists at all.
+#[doc(hidden)]
+pub mod test_support {
     use super::*;
 
     use std::num::NonZero;
@@ -478,12 +479,12 @@ pub(crate) mod test_support {
     /// unable to distinguish a real gap from a constant. Lengthening it is what
     /// allows a partial-length read, and the read length is then DERIVED from
     /// the gap so the fixture stays inside the 3' TES filter.
-    pub(crate) const REF_LEN: usize = 2000;
+    pub const REF_LEN: usize = 2000;
 
     /// Build a synthetic BAM record: a full-length forward match against
     /// `ref_id` starting at 1, carrying `pt:i`, `NM:i`, MAPQ and (optionally)
     /// `AS:i`. `g_k = 0` for every record this builds.
-    pub(crate) fn synth_record(
+    pub fn synth_record(
         name: &str,
         ref_id: usize,
         as_score: Option<i32>,
@@ -517,7 +518,7 @@ pub(crate) mod test_support {
     ///
     /// `reverse` sets SAM `REVERSE_COMPLEMENTED` (0x10) — in noodles the
     /// accessor is `is_reverse_complemented()`, not `is_reverse()`.
-    pub(crate) fn synth_record_with_gap(
+    pub fn synth_record_with_gap(
         name: &str,
         ref_id: usize,
         gap: usize,
@@ -558,7 +559,7 @@ pub(crate) mod test_support {
     ///
     /// Molecule ordering out of `extract_evidence` follows HashMap iteration
     /// order, so callers must look molecules up by `read_id`.
-    pub(crate) fn write_synthetic_bam(tag: &str, records: Vec<RecordBuf>) -> std::path::PathBuf {
+    pub fn write_synthetic_bam(tag: &str, records: Vec<RecordBuf>) -> std::path::PathBuf {
         let mut header = sam::Header::builder();
         for name in ["tx0", "tx1", "tx2"] {
             header = header.add_reference_sequence(

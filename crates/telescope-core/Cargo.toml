@@ -15,8 +15,26 @@ noodles-bam = { workspace = true }
 noodles-sam = { workspace = true }
 anyhow = { workspace = true }
 rayon = { workspace = true }
+# Optional, and ONLY reachable through the `test-support` feature. The synthetic
+# BAM builder needs `noodles_core::Position`, which noodles-sam does not
+# re-export. It cannot live in `[dev-dependencies]` alone: the self dev-dependency
+# that makes `tests/` see `evidence::test_support` builds the library as an
+# ordinary dependency, and dev-dependencies are not linked into that build.
+noodles-core = { version = "0.19", optional = true }
+
+[features]
+# Exposes `evidence::test_support` (synthetic-BAM builders) to the integration
+# tests in `tests/`, which are a separate crate and cannot see `#[cfg(test)]`
+# items. Off by default; nothing in the shipped library depends on it.
+test-support = ["dep:noodles-core"]
 
 [dev-dependencies]
 # Only needed to name `noodles_core::Position` when building synthetic BAM
 # records in tests; noodles-sam does not re-export it.
 noodles-core = "0.19"
+# Self dev-dependency: the ONLY way an integration test in `tests/` — a separate
+# crate — can see `evidence::test_support`, which is `#[cfg(any(test,
+# feature = "test-support"))]`. A plain `cargo test` therefore builds the lib
+# with the feature on, while a plain `cargo build` leaves it out and the shipped
+# library carries no test scaffolding.
+telescope-core = { path = ".", features = ["test-support"] }
