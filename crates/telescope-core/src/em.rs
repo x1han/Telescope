@@ -383,7 +383,18 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
                     // `test_prune_boundary_is_strictly_greater_than` exists to
                     // catch, since a large-ΔAS fixture is then silently passing
                     // on the `min_weight` cutoff instead.
-                    let delta_as = max_as - graph.candidate_as[idx];
+                    //
+                    // `saturating_sub`, not `-`: both operands are `i32` and
+                    // this sits OUTSIDE the `if let Some(params)`, so it runs
+                    // for candidates that have no emission row at all. A plain
+                    // subtraction panics under `cargo test` (debug overflow
+                    // checks) and WRAPS under `--release`, and the wrap is the
+                    // dangerous one: a wrapped negative ΔAS satisfies
+                    // `delta_as > prune_max_delta_as` as FALSE, so the one
+                    // candidate that should be pruned hardest is the one that
+                    // survives. Saturation gives `i32::MAX`, which prunes —
+                    // the direction that is safe under both profiles.
+                    let delta_as = max_as.saturating_sub(graph.candidate_as[idx]);
 
                     // ΔAS prune (frozen spec): drop candidates whose alignment
                     // score is more than `prune_max_delta_as` below the read's
@@ -992,6 +1003,21 @@ mod tests {
     /// Write a minimal `telescope.emission.parquet`: one poly(A)-competent row
     /// per `(transcript_id, gene_id, mu_logPAL, sigma2_logPAL)`.
     fn write_test_emission(path: &Path, rows: &[(&str, &str, f64, f64)]) {
+        let all_competent: Vec<(&str, &str, f64, f64, bool)> = rows
+            .iter()
+            .map(|&(a, b, c, d)| (a, b, c, d, true))
+            .collect();
+        write_test_emission_with_competence(path, &all_competent);
+    }
+
+    /// As `write_test_emission`, but each row also carries its
+    /// `is_polyA_competent` flag. Needed because the E-step pushes an
+    /// INCOMPETENT candidate as `-inf` (see the competence mask) and the
+    /// output stage's `retained_sum` denominator is documented as correct only
+    /// while that keeps incompetent rows out of `weights`. Nothing tested that
+    /// coupling, so a future change to the mask would silently break
+    /// normalisation with every test still green.
+    fn write_test_emission_with_competence(path: &Path, rows: &[(&str, &str, f64, f64, bool)]) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("transcript_id", DataType::Utf8, false),
             Field::new("gene_id", DataType::Utf8, false),
@@ -1004,10 +1030,10 @@ mod tests {
         let mut comp_b = BooleanBuilder::new();
         let mut mu_b = Float64Builder::new();
         let mut s2_b = Float64Builder::new();
-        for &(tx, gene, mu, sigma2) in rows {
+        for &(tx, gene, mu, sigma2, is_competent) in rows {
             tx_b.append_value(tx);
             gene_b.append_value(gene);
-            comp_b.append_value(true);
+            comp_b.append_value(is_competent);
             mu_b.append_value(mu);
             s2_b.append_value(sigma2);
         }
@@ -1371,6 +1397,104 @@ mod tests {
             1.0,
             "even with no truncation the per-read posterior must sum to 1.0"
         );
+    }
+
+    /// An INCOMPETENT candidate must not break per-read renormalisation.
+    ///
+    /// The output stage's `retained_sum` denominator sums `{w >= min_weight}`
+    /// over `weights`, but the emit loop then drops rows that are
+    /// `!p.is_competent` or missing from `params`. That is only sound because
+    /// the E-step pushes incompetent candidates as `-inf` and
+    /// `filter(ll > -inf)` removes them from `weights` before the denominator is
+    /// ever taken. The code says so in a comment; nothing TESTED it, so a future
+    /// change to the competence mask would make every read's emitted weights sum
+    /// to less than 1.0 with the suite still green.
+    ///
+    /// The fixture puts the 5-nat handicap on the **COMPETENT** transcript, so
+    /// the INCOMPETENT one is the candidate the likelihood likes most. That
+    /// direction matters and the first draft of this test got it backwards: with
+    /// the handicap on the incompetent transcript instead, its weight lands
+    /// below `min_weight` and is dropped by TRUNCATION, so the test passed even
+    /// with the competence mask fully disabled. Only when the doomed candidate
+    /// is the favoured one does it carry a large weight into `retained_sum` —
+    /// which is exactly the state in which a bypassed mask strands mass and
+    /// leaves the survivor at 0.9933.
+    #[test]
+    fn test_incompetent_candidate_is_excluded_from_the_renormalisation_base() {
+        let log_pal = (100.0_f32).log2();
+        let sigma2 = 0.04;
+        let emission = scratch("incomp_emission.parquet");
+        let profile = scratch("incomp_profile.parquet");
+        write_test_emission_with_competence(
+            &emission,
+            &[
+                // μ offset sized so `(y − μ)² / (2σ²)` = 5.0 nats. On the
+                // COMPETENT transcript, so the incompetent one is favoured.
+                (
+                    "tx0",
+                    "gene0",
+                    log_pal as f64 - (2.0_f64 * sigma2 * 5.0_f64).sqrt(),
+                    sigma2,
+                    true,
+                ),
+                ("tx1", "gene1", log_pal as f64, sigma2, false),
+            ],
+        );
+        let graph = synth_graph(log_pal, &[("tx0", 900), ("tx1", 900)]);
+
+        let stats = solve_and_write_profile(
+            graph,
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            1,
+            100.0,
+            FIVE_PRIME_OFF,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
+            None,
+        )
+        .unwrap();
+
+        let rows = read_profile(&profile);
+        let _ = std::fs::remove_file(&emission);
+        let _ = std::fs::remove_file(&profile);
+
+        assert_eq!(
+            rows.len(),
+            1,
+            "the incompetent candidate must not be emitted: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|(t, _)| t == "tx1"),
+            "tx1 is is_polyA_competent=false and must never reach the profile"
+        );
+        assert_eq!(
+            rows.iter().map(|&(_, w)| w).sum::<f64>(),
+            1.0,
+            "a dropped-incompetent candidate must not leave stranded mass in the \
+             denominator -- emitted weights would sum to {} instead of 1.0",
+            rows.iter().map(|&(_, w)| w).sum::<f64>()
+        );
+        assert_eq!(
+            rows[0].1, 1.0,
+            "the lone survivor must absorb the whole posterior, not 0.9933"
+        );
+        // NOTE on `stats.n_dropped_incompetent` being 0 here, which surprised
+        // the first draft of this test. That counter is incremented by the
+        // OUTPUT stage's `!p.is_competent` check, which is unreachable for an
+        // AMBIGUOUS read: the E-step already pushed this candidate as `-inf`
+        // and `filter(ll > -inf)` removed it from `weights`, so no incompetent
+        // row ever reaches the emit loop. That unreachability is not a bug --
+        // it IS the invariant this test exists to pin -- but it does mean the
+        // E-step's competence mask drops candidates with NO telemetry at all:
+        // `n_dropped_no_competent_candidates` fires only when `weights` is
+        // entirely empty, so a read with 1 competent + 1 incompetent candidate
+        // loses the incompetent one silently. Worth a counter; out of scope
+        // for a test-only change, flagged to the reviewer instead.
+        let _ = stats;
     }
 
     /// Disjoint id spaces must be REFUSED, not silently absorbed.
