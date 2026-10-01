@@ -220,12 +220,19 @@ enum Cmd {
         five_prime_window: u32,
 
         /// Scale on the poly(A) mixture term. 1.0 is the shipped model.
-        /// **0.0 removes the poly(A) evidence entirely**, leaving the alignment
-        /// (and 5') terms as the whole log-likelihood -- the alignment-only
-        /// ablation baseline. It cannot be neutralised from the outside by
-        /// pinning `mu`/`sigma2` in the emission parquet, because `alpha` is
-        /// re-estimated by the M-step and would still leak the abundance prior
-        /// into every candidate's score.
+        /// **0.0 removes the poly(A) evidence entirely.**
+        ///
+        /// It does NOT leave an alignment-only model. `ln w_rk = ln alpha_k +
+        /// poly_a_weight * ln P(polyA|k) + ln a_rk + ln 5p_k`, so the mixture
+        /// prior `ln alpha_k` survives at any weight, including 0. With both
+        /// this and `--five-prime-weight` at 0 the likelihood is
+        /// `ln alpha_k + ln a_rk` — abundance prior PLUS alignment. Calling that
+        /// arm "alignment-only" is wrong, and the prior cannot be dropped from
+        /// the outside either: pinning `mu`/`sigma2` in the emission parquet
+        /// does nothing, because `alpha` is re-estimated by the M-step and
+        /// would still leak into every candidate's score. A genuinely
+        /// prior-free baseline is a different estimator (e.g. argmax-`AS`
+        /// assignment), not an ablation of this one.
         #[arg(long, default_value_t = POLY_A_WEIGHT_DEFAULT)]
         poly_a_weight: f64,
 

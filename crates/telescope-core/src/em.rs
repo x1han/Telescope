@@ -190,9 +190,11 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
     five_prime_weight: f64,
     // Scale on the poly(A) mixture term
     // `ln alpha_k - ln sigma2_k - (y - mu_k)^2 / (2 sigma2_k)`.
-    // 1.0 is the shipped model; 0.0 removes the poly(A) evidence entirely,
-    // leaving `ln A_rk + ln_5p_k` as the whole log-likelihood -- the
-    // alignment-only ablation baseline. It CANNOT be neutralised from the
+    // 1.0 is the shipped model; 0.0 removes the poly(A) evidence entirely.
+    // It does NOT leave an alignment-only likelihood: `ln alpha_k` is the
+    // mixture prior and survives at any weight, so at 0.0 the score is
+    // `ln alpha_k + ln A_rk + ln_5p_k` -- abundance prior PLUS alignment.
+    // Calling that arm "alignment-only" is wrong. It CANNOT be neutralised from the
     // outside: `alpha` is re-estimated by the M-step, so pinning mu and sigma2
     // in the emission parquet still leaks the abundance prior into every
     // candidate's log-likelihood. Hence a parameter, not a data trick.
@@ -219,12 +221,13 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
     // deserve different error text. 0.0 is legal and means NO truncation.
     // NaN-safe on purpose: `!(w >= 0.0)` is false for NaN, and a NaN weight
     // would poison every posterior weight in the graph. 0.0 is the documented
-    // off switch (alignment-only baseline), not an error.
+    // off switch (leaving the abundance prior plus alignment), not an error.
     #[allow(clippy::neg_cmp_op_on_partial_ord)]
     if !poly_a_weight.is_finite() || poly_a_weight < 0.0 {
         anyhow::bail!(
             "poly_a_weight must be finite and >= 0 (got {}); 0.0 is the valid \
-             alignment-only off switch, but a negative weight inverts the poly(A) \
+             poly(A)-off switch (the abundance prior and alignment terms remain), \
+             but a negative weight inverts the poly(A) \
              term and NaN would emit NaN posterior weights",
             poly_a_weight
         );
@@ -980,9 +983,13 @@ pub struct TelEmStats {
     /// Posterior entropy 3-tier counters (per ambiguous read, in nats).
     /// clean: H < 0.20 nats (near-deterministic assignment).
     pub n_entropy_clean: u64,
-    /// partial: 0.20 <= H <= 0.60 nats (two-three-way partial ambiguity).
+    /// partial: 0.20 <= H <= 0.70 nats (two-three-way partial ambiguity).
     pub n_entropy_partial: u64,
-    /// degenerate: H > 0.60 nats (effectively uniform over candidates).
+    /// degenerate: H > 0.70 nats (effectively uniform over candidates).
+    /// The upper bounds are 0.20 / 0.70, NOT 0.20 / 0.60: the degenerate bound
+    /// was raised to 0.70 and this comment was left behind. Anything that
+    /// re-derives these tiers from the doc comment rather than from the
+    /// comparison in the E-step will bin the wrong reads.
     pub n_entropy_degenerate: u64,
     /// EM trace: per-iter `(iter_index, log_likelihood, mean_entropy)`.
     pub em_trace: Vec<(usize, f64, f64)>,
@@ -1499,8 +1506,8 @@ mod tests {
 
         // (poly_a_weight, five_prime_weight, aln_weight_lambda, label)
         let arms: [(f64, f64, f64, &str); 6] = [
-            (0.0, FIVE_PRIME_OFF, 100.0, "AlignOnly"),
-            (0.0, FIVE_PRIME_OFF, 10.0, "AlignOnly, λ=10"),
+            (0.0, FIVE_PRIME_OFF, 100.0, "prior+aln only"),
+            (0.0, FIVE_PRIME_OFF, 10.0, "prior+aln only, λ=10"),
             (0.0, FIVE_PRIME_WEIGHT, 100.0, "no-polyA, 5' on"),
             (POLY_A_ON, FIVE_PRIME_OFF, 100.0, "polyA on, 5' off"),
             (POLY_A_ON, FIVE_PRIME_WEIGHT, 10.0, "Full, λ=10"),
@@ -1550,7 +1557,7 @@ mod tests {
                 None => reference_odds = Some(odds),
                 Some(ref0) => assert!(
                     (odds / ref0 - 1.0).abs() < 1e-6,
-                    "[{label}] posterior odds {odds:.6} differ from the AlignOnly arm's \
+                    "[{label}] posterior odds {odds:.6} differ from the reference arm's \
                      {ref0:.6}. With every evidence term tied, each weight is a constant \
                      that must cancel, so no arm may change the odds. A weight is \
                      reaching a term it must not."
@@ -1625,8 +1632,9 @@ mod tests {
         );
     }
 
-    /// `poly_a_weight = 0` must remove the poly(A) term COMPLETELY, so the
-    /// alignment-only ablation baseline really is alignment-only.
+    /// `poly_a_weight = 0` must remove the poly(A) term COMPLETELY. Note what
+    /// remains is `ln alpha_k + ln_a`, i.e. the abundance prior PLUS alignment --
+    /// this arm is not, and cannot be made, an alignment-only baseline.
     ///
     /// This cannot be faked from the outside. The obvious data trick -- pin `mu`
     /// and `sigma2` to the same value for every transcript so the Gaussian term
