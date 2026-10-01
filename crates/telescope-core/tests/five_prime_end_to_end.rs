@@ -44,6 +44,7 @@ use telescope_core::evidence::{extract_evidence, test_support};
 
 /// λ, β, window and prune are the shipped frozen values. See
 /// `workspace/notes/EXPERIMENT.md` for provenance.
+const POLY_A_ON: f64 = 1.0;
 const LAMBDA: f64 = 20.0;
 const BETA_ON: f64 = 1.8;
 const BETA_OFF: f64 = 0.0;
@@ -176,7 +177,8 @@ fn run_pipeline(beta: f64, tag: &str) -> (f64, usize) {
 
     // Module 3.
     solve_and_write_profile(
-        graph, &emission, "TEST", &profile, 1e-6, 1, LAMBDA, beta, WINDOW, PRUNE, MIN_WEIGHT, None,
+        graph, &emission, "TEST", &profile, 1e-6, 1, LAMBDA, beta, POLY_A_ON, WINDOW, PRUNE,
+        MIN_WEIGHT, None,
     )
     .expect("solve_and_write_profile");
 

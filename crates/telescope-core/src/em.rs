@@ -188,6 +188,15 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
     max_iter: usize,
     aln_weight_lambda: f64,
     five_prime_weight: f64,
+    // Scale on the poly(A) mixture term
+    // `ln alpha_k - ln sigma2_k - (y - mu_k)^2 / (2 sigma2_k)`.
+    // 1.0 is the shipped model; 0.0 removes the poly(A) evidence entirely,
+    // leaving `ln A_rk + ln_5p_k` as the whole log-likelihood -- the
+    // alignment-only ablation baseline. It CANNOT be neutralised from the
+    // outside: `alpha` is re-estimated by the M-step, so pinning mu and sigma2
+    // in the emission parquet still leaks the abundance prior into every
+    // candidate's log-likelihood. Hence a parameter, not a data trick.
+    poly_a_weight: f64,
     five_prime_window: u32,
     prune_max_delta_as: i32,
     min_weight: f64,
@@ -208,6 +217,18 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
     // rejects NaN; `is_finite` is kept explicit because +inf would also fail
     // the range test but for a different reason, and the two failure modes
     // deserve different error text. 0.0 is legal and means NO truncation.
+    // NaN-safe on purpose: `!(w >= 0.0)` is false for NaN, and a NaN weight
+    // would poison every posterior weight in the graph. 0.0 is the documented
+    // off switch (alignment-only baseline), not an error.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+    if !poly_a_weight.is_finite() || poly_a_weight < 0.0 {
+        anyhow::bail!(
+            "poly_a_weight must be finite and >= 0 (got {}); 0.0 is the valid \
+             alignment-only off switch, but a negative weight inverts the poly(A) \
+             term and NaN would emit NaN posterior weights",
+            poly_a_weight
+        );
+    }
     if !min_weight.is_finite() || !(0.0..1.0).contains(&min_weight) {
         anyhow::bail!(
             "min_weight must be finite and in [0, 1) (got {}); it is the output-stage \
@@ -472,9 +493,10 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
                             // Push -inf so normalization kills this candidate.
                             raw.push((tx_id, f64::NEG_INFINITY));
                         } else {
-                            let ll = p.alpha.ln()
-                                - (p.sigma2.sqrt()).ln()
-                                - ((y - p.mu).powi(2) / (2.0 * p.sigma2))
+                            let ll = poly_a_weight
+                                * (p.alpha.ln()
+                                    - (p.sigma2.sqrt()).ln()
+                                    - ((y - p.mu).powi(2) / (2.0 * p.sigma2)))
                                 + ln_a
                                 + ln_5p;
                             raw.push((tx_id, ll));
@@ -981,6 +1003,7 @@ mod tests {
     /// is provably independent of `candidate_5p_gap` — which is what keeps the
     /// pre-existing A_rk and renormalisation tests unperturbed by this change
     /// instead of accidentally also covering the new term.
+    const POLY_A_ON: f64 = 1.0;
     const FIVE_PRIME_OFF: f64 = 0.0;
     /// The `ΔAS` prune switched off. Legal (`i32::MAX` is a valid threshold);
     /// used only by the A_rk test, whose `ΔAS = 200` fixture is exactly the
@@ -1179,6 +1202,7 @@ mod tests {
             1,
             100.0,
             FIVE_PRIME_OFF,
+            POLY_A_ON,
             FIVE_PRIME_WINDOW,
             PRUNE_OFF,
             MIN_WEIGHT,
@@ -1295,6 +1319,7 @@ mod tests {
             1,
             100.0,
             FIVE_PRIME_OFF,
+            POLY_A_ON,
             FIVE_PRIME_WINDOW,
             PRUNE_MAX_DELTA_AS,
             MIN_WEIGHT,
@@ -1320,6 +1345,85 @@ mod tests {
             rows.iter().map(|&(_, w)| w).sum::<f64>(),
             1.0,
             "emitted posterior weights must sum to exactly 1.0"
+        );
+    }
+
+    /// `poly_a_weight = 0` must remove the poly(A) term COMPLETELY, so the
+    /// alignment-only ablation baseline really is alignment-only.
+    ///
+    /// This cannot be faked from the outside. The obvious data trick -- pin `mu`
+    /// and `sigma2` to the same value for every transcript so the Gaussian term
+    /// is a constant that cancels in the softmax -- does NOT work, because the
+    /// `ln alpha_k` term is re-estimated by the M-step and would still carry
+    /// the abundance prior into every candidate's log-likelihood. Hence a
+    /// parameter.
+    ///
+    /// Fixture: two transcripts at EQUAL `AS`, so `ln_a = 0` for both and any
+    /// posterior movement is attributable to poly(A) alone; and well-separated
+    /// `mu`, so poly(A) is decisive rather than marginal. The 5' term is off.
+    ///
+    /// The second arm is the neuter: if `poly_a_weight` were being ignored, or
+    /// applied to the wrong term, the off-arm would still favour tx0 and the
+    /// `0.5` assertion would fail.
+    #[test]
+    fn test_poly_a_weight_zero_removes_the_poly_a_term_entirely() {
+        let log_pal = (100.0_f32).log2();
+        let sigma2 = 0.04;
+        let emission = scratch("paw_emission.parquet");
+        write_test_emission(
+            &emission,
+            &[
+                ("tx0", "gene0", log_pal as f64, sigma2),
+                // Same AS, far-away mu: only poly(A) can separate them.
+                ("tx1", "gene1", log_pal as f64 + 4.0, sigma2),
+            ],
+        );
+        let cands = [("tx0", 900), ("tx1", 900)];
+
+        let pi_tx0 = |poly_a_weight: f64, tag: &str| -> f64 {
+            let profile = scratch(&format!("paw_profile_{tag}.parquet"));
+            solve_and_write_profile(
+                synth_graph(log_pal, &cands),
+                &emission,
+                "TEST",
+                &profile,
+                1e-6,
+                1,
+                100.0,
+                FIVE_PRIME_OFF,
+                poly_a_weight,
+                FIVE_PRIME_WINDOW,
+                PRUNE_MAX_DELTA_AS,
+                // 0.0 so no candidate is truncated away before the comparison;
+                // otherwise a losing candidate vanishing would look like
+                // "removed by the parameter".
+                0.0,
+                None,
+            )
+            .unwrap();
+            let rows = read_profile(&profile);
+            let tot: f64 = rows.iter().map(|&(_, w)| w).sum();
+            assert!(tot > 0.0, "{tag}: profile is empty, every read was dropped");
+            rows.iter()
+                .filter(|(t, _)| t == "tx0")
+                .map(|&(_, w)| w)
+                .sum::<f64>()
+                / tot
+        };
+
+        let on = pi_tx0(POLY_A_ON, "on");
+        let off = pi_tx0(0.0, "off");
+
+        assert!(
+            on > 0.9,
+            "with poly(A) ON, tx0 (whose mu matches the read) must win decisively, got {on}"
+        );
+        assert!(
+            (off - 0.5).abs() < 0.02,
+            "with poly_a_weight=0 the poly(A) term must vanish and the posterior \
+             must be a dead heat, got {off}. If this fails the parameter is being \
+             ignored or applied to the wrong term, and the alignment-only \
+             baseline would silently still contain the poly(A) evidence."
         );
     }
 
@@ -1367,6 +1471,7 @@ mod tests {
                 1,
                 100.0,
                 FIVE_PRIME_OFF,
+                POLY_A_ON,
                 FIVE_PRIME_WINDOW,
                 PRUNE_MAX_DELTA_AS,
                 min_weight,
@@ -1451,6 +1556,7 @@ mod tests {
             1,
             100.0,
             FIVE_PRIME_OFF,
+            POLY_A_ON,
             FIVE_PRIME_WINDOW,
             PRUNE_MAX_DELTA_AS,
             MIN_WEIGHT,
@@ -1529,6 +1635,7 @@ mod tests {
             1,
             100.0,
             FIVE_PRIME_OFF,
+            POLY_A_ON,
             FIVE_PRIME_WINDOW,
             PRUNE_MAX_DELTA_AS,
             MIN_WEIGHT,
@@ -1604,6 +1711,7 @@ mod tests {
             1,
             100.0,
             FIVE_PRIME_OFF,
+            POLY_A_ON,
             FIVE_PRIME_WINDOW,
             PRUNE_MAX_DELTA_AS,
             MIN_WEIGHT,
@@ -1672,6 +1780,7 @@ mod tests {
                 1,
                 lambda,
                 w5p,
+                POLY_A_ON,
                 window,
                 prune,
                 MIN_WEIGHT,
@@ -1749,6 +1858,7 @@ mod tests {
             1,
             aln_weight_lambda,
             five_prime_weight,
+            POLY_A_ON,
             FIVE_PRIME_WINDOW,
             prune_max_delta_as,
             MIN_WEIGHT,

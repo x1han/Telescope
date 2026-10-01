@@ -51,6 +51,7 @@ const FIVE_PRIME_WEIGHT_DEFAULT: f64 = 1.8;
 /// Default 5' window in bp: the bonus fires iff the read's observed 5' gap
 /// `g_k` in candidate k's cDNA coordinates is at most this. INCLUSIVE (`<=`).
 const FIVE_PRIME_WINDOW_DEFAULT: u32 = 20;
+const POLY_A_WEIGHT_DEFAULT: f64 = 1.0;
 
 /// Default `ΔAS` prune threshold. Candidates whose alignment score is more
 /// than this far below the read's best are dropped before the softmax, which is
@@ -217,6 +218,16 @@ enum Cmd {
         /// different answers and the boundary is tested.
         #[arg(long, default_value_t = FIVE_PRIME_WINDOW_DEFAULT)]
         five_prime_window: u32,
+
+        /// Scale on the poly(A) mixture term. 1.0 is the shipped model.
+        /// **0.0 removes the poly(A) evidence entirely**, leaving the alignment
+        /// (and 5') terms as the whole log-likelihood -- the alignment-only
+        /// ablation baseline. It cannot be neutralised from the outside by
+        /// pinning `mu`/`sigma2` in the emission parquet, because `alpha` is
+        /// re-estimated by the M-step and would still leak the abundance prior
+        /// into every candidate's score.
+        #[arg(long, default_value_t = POLY_A_WEIGHT_DEFAULT)]
+        poly_a_weight: f64,
 
         /// Drop candidates whose `AS:i` is more than this far below the read's
         /// best (default: 50). Must be >= 0; the comparison is strictly
@@ -441,6 +452,7 @@ fn main() -> Result<()> {
             max_iter,
             aln_weight_lambda,
             five_prime_weight,
+            poly_a_weight,
             five_prime_window,
             prune_max_delta_as,
             min_weight,
@@ -623,6 +635,7 @@ fn main() -> Result<()> {
                 max_iter,
                 aln_weight_lambda,
                 five_prime_weight,
+                poly_a_weight,
                 five_prime_window,
                 prune_max_delta_as,
                 min_weight,
