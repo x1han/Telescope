@@ -493,10 +493,18 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
                             // Push -inf so normalization kills this candidate.
                             raw.push((tx_id, f64::NEG_INFINITY));
                         } else {
-                            let ll = poly_a_weight
-                                * (p.alpha.ln()
-                                    - (p.sigma2.sqrt()).ln()
-                                    - ((y - p.mu).powi(2) / (2.0 * p.sigma2)))
+                            // `ln alpha` is the MIXTURE PRIOR, not part of the
+                            // poly(A) emission, so it is OUTSIDE the
+                            // poly_a_weight scale. Putting it inside is not a
+                            // stylistic choice: at `poly_a_weight = 0` the
+                            // E-step would never read alpha, the M-step's
+                            // update would have no effect on any posterior, and
+                            // the "EM" would degenerate into a one-shot static
+                            // alignment scorer with an inert M-step.
+                            let ll = p.alpha.ln()
+                                + poly_a_weight
+                                    * (-(p.sigma2.sqrt()).ln()
+                                        - ((y - p.mu).powi(2) / (2.0 * p.sigma2)))
                                 + ln_a
                                 + ln_5p;
                             raw.push((tx_id, ll));
@@ -1345,6 +1353,162 @@ mod tests {
             rows.iter().map(|&(_, w)| w).sum::<f64>(),
             1.0,
             "emitted posterior weights must sum to exactly 1.0"
+        );
+    }
+
+    /// Read the profile as `(read_id, transcript_id, weight)` so a test can
+    /// isolate ONE read's posterior instead of the transcript-level aggregate.
+    /// The aggregate is useless for this: a graph with many unambiguous reads
+    /// is dominated by them, and the ambiguous read's own signal is swamped.
+    fn read_profile_by_read(path: &Path) -> Vec<(String, String, f64)> {
+        let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(path).unwrap())
+            .unwrap()
+            .with_batch_size(8192)
+            .build()
+            .unwrap();
+        let mut out = Vec::new();
+        for batch in reader {
+            let batch = batch.unwrap();
+            let tx = batch
+                .column_by_name("transcript_id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let rd = batch
+                .column_by_name("read_id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let w = batch
+                .column_by_name("posterior_weight")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                out.push((rd.value(i).to_string(), tx.value(i).to_string(), w.value(i)));
+            }
+        }
+        out
+    }
+
+    /// The abundance prior `ln alpha` is the MIXTURE prior, not part of the
+    /// poly(A) emission, so it must survive `poly_a_weight = 0`.
+    ///
+    /// This is the regression test for a real P0. The parameter was originally
+    /// written as `poly_a_weight * (alpha.ln() - ...)`, which looks like a
+    /// harmless grouping. It is not: at weight 0 the E-step never reads alpha,
+    /// so the M-step's abundance update cannot influence any posterior, and the
+    /// "EM" silently degenerates into a one-shot static alignment scorer. The
+    /// number it prints is still a plausible profile, which is exactly why it
+    /// would have survived review.
+    ///
+    /// Fixture: unambiguous reads set the prior (tx0 gets 30, tx1 gets 3), then
+    /// ONE ambiguous read with EQUAL `AS` to both, 5' off, poly(A) off. With no
+    /// evidence of its own, that read must follow the prior. If alpha is scaled
+    /// away the two candidates are exactly tied and it splits 50/50.
+    ///
+    /// The assertion is on the AMBIGUOUS READ'S OWN weight, not the aggregate:
+    /// the 33 unambiguous reads would otherwise swamp the signal and the two
+    /// outcomes would differ by well under a percentage point.
+    #[test]
+    fn test_poly_a_weight_zero_keeps_the_abundance_prior_in_the_e_step() {
+        let log_pal = (100.0_f32).log2();
+        let emission = scratch("prior_emission.parquet");
+        write_test_emission(
+            &emission,
+            &[
+                ("tx0", "gene0", log_pal as f64, 0.04),
+                ("tx1", "gene1", log_pal as f64, 0.04),
+            ],
+        );
+
+        // Build the graph by hand: pools are molecule-major / candidate-minor
+        // and all five must be the same length. 33 single-candidate molecules
+        // (30 -> tx0, 3 -> tx1) then one two-candidate probe.
+        let mut molecules = Vec::new();
+        let mut candidate_pool: Vec<u32> = Vec::new();
+        let mut candidate_as: Vec<i32> = Vec::new();
+        let mut n = 0usize;
+        for i in 0..30 {
+            molecules.push(MoleculeEvidence {
+                read_id: format!("u{i}"),
+                log_pal,
+                candidate_offset: n as u32,
+                candidate_count: 1,
+            });
+            candidate_pool.push(0);
+            candidate_as.push(900);
+            n += 1;
+        }
+        for i in 0..3 {
+            molecules.push(MoleculeEvidence {
+                read_id: format!("u{i}"),
+                log_pal,
+                candidate_offset: n as u32,
+                candidate_count: 1,
+            });
+            candidate_pool.push(1);
+            candidate_as.push(900);
+            n += 1;
+        }
+        molecules.push(MoleculeEvidence {
+            read_id: "PROBE".to_string(),
+            log_pal,
+            candidate_offset: n as u32,
+            candidate_count: 2,
+        });
+        candidate_pool.extend_from_slice(&[0, 1]); // tx0, tx1
+        candidate_as.extend_from_slice(&[900, 900]); // EQUAL alignment score
+        n += 2;
+
+        let graph = FlatEvidenceGraph {
+            molecules,
+            candidate_nm: vec![0; n],
+            candidate_mapq: vec![60; n],
+            candidate_5p_gap: vec![0; n],
+            candidate_pool: candidate_pool.clone(),
+            candidate_as,
+            transcript_names: vec!["tx0".to_string(), "tx1".to_string()],
+        };
+        assert_eq!(graph.candidate_pool.len(), n);
+        assert_eq!(graph.candidate_as.len(), n);
+        assert_eq!(graph.candidate_5p_gap.len(), n);
+
+        let profile = scratch("prior_profile.parquet");
+        solve_and_write_profile(
+            graph,
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            1,
+            100.0,
+            FIVE_PRIME_OFF,
+            0.0,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            0.0,
+            None,
+        )
+        .unwrap();
+
+        let rows = read_profile_by_read(&profile);
+        let probe: f64 = rows
+            .iter()
+            .filter(|(r, t, _)| r == "PROBE" && t == "tx0")
+            .map(|&(_, _, w)| w)
+            .sum();
+        // init alpha is proportional to the unambiguous counts: 30 vs 3, so
+        // ~0.90 once the probe's own half-share is added to both.
+        assert!(
+            probe > 0.7,
+            "with poly(A) OFF the ambiguous PROBE read has no evidence of its own, \
+             so it must follow the abundance prior (~0.9 onto tx0). It got {probe}. \
+             If this is ~0.5, `ln alpha` is being scaled by poly_a_weight and the \
+             M-step cannot influence any posterior -- the EM is inert."
         );
     }
 
