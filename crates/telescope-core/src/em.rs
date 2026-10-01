@@ -1394,6 +1394,171 @@ mod tests {
         out
     }
 
+    /// A graph whose abundance prior is set entirely by UNAMBIGUOUS reads, so
+    /// the prior is knowable without running the EM.
+    ///
+    /// 30 single-candidate molecules on `tx0`, 3 on `tx1`, then one two-candidate
+    /// `PROBE` molecule with EQUAL `AS` to both and `g_k = 0` on both. The probe
+    /// therefore has no evidence of its own, and the init prior is
+    /// `(0.01 + 30 + 0.5) : (0.01 + 3 + 0.5)` — the Laplace epsilon and the
+    /// probe's half-share are `solve_and_write_profile`'s convention, read here
+    /// so the fixture does not hide where the number comes from.
+    ///
+    /// Shared by the two tests below; they differ in what they sweep, not in
+    /// what they measure.
+    fn prior_biased_graph() -> FlatEvidenceGraph {
+        let log_pal = (100.0_f32).log2();
+        // Pools are molecule-major / candidate-minor and all must be the same
+        // length, so the count is tracked as we go.
+        let mut molecules = Vec::new();
+        let mut candidate_pool: Vec<u32> = Vec::new();
+        let mut candidate_as: Vec<i32> = Vec::new();
+        let mut n = 0usize;
+        for (tx, count) in [(0u32, 30usize), (1, 3usize)] {
+            for i in 0..count {
+                molecules.push(MoleculeEvidence {
+                    read_id: format!("u{tx}_{i}"),
+                    log_pal,
+                    candidate_offset: n as u32,
+                    candidate_count: 1,
+                });
+                candidate_pool.push(tx);
+                candidate_as.push(900);
+                n += 1;
+            }
+        }
+        molecules.push(MoleculeEvidence {
+            read_id: "PROBE".to_string(),
+            log_pal,
+            candidate_offset: n as u32,
+            candidate_count: 2,
+        });
+        candidate_pool.extend_from_slice(&[0, 1]); // tx0, tx1
+        candidate_as.extend_from_slice(&[900, 900]); // EQUAL alignment score
+        n += 2;
+
+        let graph = FlatEvidenceGraph {
+            molecules,
+            candidate_nm: vec![0; n],
+            candidate_mapq: vec![60; n],
+            candidate_5p_gap: vec![0; n],
+            candidate_pool,
+            candidate_as,
+            transcript_names: vec!["tx0".to_string(), "tx1".to_string()],
+        };
+        assert_eq!(graph.candidate_pool.len(), n);
+        assert_eq!(graph.candidate_as.len(), n);
+        assert_eq!(graph.candidate_5p_gap.len(), n);
+        graph
+    }
+
+    /// MODEL IDENTITY AXIOM, permanent P0 guard: **when every likelihood
+    /// evidence term is equal across candidates, the posterior must reduce to
+    /// the abundance prior.** This is a property of the E-step, not of any
+    /// flag, so it must hold in EVERY arm.
+    ///
+    /// Why it is a separate test from the `poly_a_weight` regression below:
+    /// that one pins one flag at one setting and would still pass if a future
+    /// edit swallowed `ln alpha` inside some *other* weight's bracket — say
+    /// `five_prime_weight * (ln_5p + alpha.ln())`, which is inert at
+    /// `five_prime_weight = 0` and would survive a poly(A)-only test. The
+    /// shared failure mode is not "a parameter is set wrong", it is "the
+    /// mixture prior stopped being a mixture prior", and that can happen
+    /// through any of the three weights. So this one sweeps all three.
+    ///
+    /// The sweep is exact rather than approximate because the fixture makes
+    /// each evidence term a CONSTANT across the two candidates, and a constant
+    /// cancels in the softmax for any scale factor:
+    ///   - `AS` equal      -> `ln_a = -ΔAS/λ = 0` for every `λ`
+    ///   - `g_k = 0` equal -> `ln_5p = five_prime_weight` for both, so it is
+    ///     the same constant added to both `ll`s
+    ///   - `mu`, `sigma2` equal -> the Gaussian is one constant times
+    ///     `poly_a_weight`
+    /// So the odds `w_0 / w_1` must equal the prior odds in all six arms, and
+    /// in particular must be invariant ACROSS arms. That invariance is the
+    /// half of the check that pins the weight coefficients: it is scale-free,
+    /// so it survives a legitimate change to the init convention, which a
+    /// hard-coded 8.69 would not.
+    ///
+    /// A posterior near 0.5 in any arm means `ln alpha` is not reaching that
+    /// arm's softmax at all — the M-step then re-estimates abundances that no
+    /// posterior can see, and the "EM" is inert.
+    #[test]
+    fn test_e_step_reduces_to_the_abundance_prior_when_all_evidence_is_tied() {
+        let log_pal = (100.0_f32).log2();
+        // Equal mu and sigma2: the poly(A) Gaussian is a shared constant, so it
+        // cancels and poly_a_weight can be swept without breaking the tie.
+        let emission = scratch("identity_emission.parquet");
+        write_test_emission(
+            &emission,
+            &[
+                ("tx0", "gene0", log_pal as f64, 0.04),
+                ("tx1", "gene1", log_pal as f64, 0.04),
+            ],
+        );
+
+        // (poly_a_weight, five_prime_weight, aln_weight_lambda, label)
+        let arms: [(f64, f64, f64, &str); 6] = [
+            (0.0, FIVE_PRIME_OFF, 100.0, "AlignOnly"),
+            (0.0, FIVE_PRIME_OFF, 10.0, "AlignOnly, λ=10"),
+            (0.0, FIVE_PRIME_WEIGHT, 100.0, "no-polyA, 5' on"),
+            (POLY_A_ON, FIVE_PRIME_OFF, 100.0, "polyA on, 5' off"),
+            (POLY_A_ON, FIVE_PRIME_WEIGHT, 10.0, "Full, λ=10"),
+            (POLY_A_ON, FIVE_PRIME_WEIGHT, 100.0, "Full"),
+        ];
+
+        let mut reference_odds: Option<f64> = None;
+        for (poly_a_weight, five_prime_weight, lambda, label) in arms {
+            let profile = scratch(&format!("identity_profile_{label}.parquet"));
+            solve_and_write_profile(
+                prior_biased_graph(),
+                &emission,
+                "TEST",
+                &profile,
+                1e-6,
+                1, // one E-step: the posterior reflects the INIT prior
+                lambda,
+                five_prime_weight,
+                poly_a_weight,
+                FIVE_PRIME_WINDOW,
+                PRUNE_MAX_DELTA_AS,
+                0.0,
+                None,
+            )
+            .unwrap();
+
+            let rows = read_profile_by_read(&profile);
+            let w = |tx: &str| -> f64 {
+                rows.iter()
+                    .filter(|(r, t, _)| r == "PROBE" && t == tx)
+                    .map(|&(_, _, w)| w)
+                    .sum()
+            };
+            let (w0, w1) = (w("tx0"), w("tx1"));
+
+            assert!(
+                w0 > 0.7 && w1 < 0.3,
+                "[{label}] all evidence is tied, so the PROBE read must follow the \
+                 abundance prior alone (~0.90 onto tx0). It got w0={w0:.4} w1={w1:.4}. \
+                 A value near 0.5/0.5 means `ln alpha` is not reaching this arm's \
+                 softmax: the M-step re-estimates abundances that no posterior can \
+                 see, and the EM is inert."
+            );
+
+            let odds = w0 / w1;
+            match reference_odds {
+                None => reference_odds = Some(odds),
+                Some(ref0) => assert!(
+                    (odds / ref0 - 1.0).abs() < 1e-6,
+                    "[{label}] posterior odds {odds:.6} differ from the AlignOnly arm's \
+                     {ref0:.6}. With every evidence term tied, each weight is a constant \
+                     that must cancel, so no arm may change the odds. A weight is \
+                     reaching a term it must not."
+                ),
+            }
+        }
+    }
+
     /// The abundance prior `ln alpha` is the MIXTURE prior, not part of the
     /// poly(A) emission, so it must survive `poly_a_weight = 0`.
     ///
@@ -1425,61 +1590,9 @@ mod tests {
             ],
         );
 
-        // Build the graph by hand: pools are molecule-major / candidate-minor
-        // and all five must be the same length. 33 single-candidate molecules
-        // (30 -> tx0, 3 -> tx1) then one two-candidate probe.
-        let mut molecules = Vec::new();
-        let mut candidate_pool: Vec<u32> = Vec::new();
-        let mut candidate_as: Vec<i32> = Vec::new();
-        let mut n = 0usize;
-        for i in 0..30 {
-            molecules.push(MoleculeEvidence {
-                read_id: format!("u{i}"),
-                log_pal,
-                candidate_offset: n as u32,
-                candidate_count: 1,
-            });
-            candidate_pool.push(0);
-            candidate_as.push(900);
-            n += 1;
-        }
-        for i in 0..3 {
-            molecules.push(MoleculeEvidence {
-                read_id: format!("u{i}"),
-                log_pal,
-                candidate_offset: n as u32,
-                candidate_count: 1,
-            });
-            candidate_pool.push(1);
-            candidate_as.push(900);
-            n += 1;
-        }
-        molecules.push(MoleculeEvidence {
-            read_id: "PROBE".to_string(),
-            log_pal,
-            candidate_offset: n as u32,
-            candidate_count: 2,
-        });
-        candidate_pool.extend_from_slice(&[0, 1]); // tx0, tx1
-        candidate_as.extend_from_slice(&[900, 900]); // EQUAL alignment score
-        n += 2;
-
-        let graph = FlatEvidenceGraph {
-            molecules,
-            candidate_nm: vec![0; n],
-            candidate_mapq: vec![60; n],
-            candidate_5p_gap: vec![0; n],
-            candidate_pool: candidate_pool.clone(),
-            candidate_as,
-            transcript_names: vec!["tx0".to_string(), "tx1".to_string()],
-        };
-        assert_eq!(graph.candidate_pool.len(), n);
-        assert_eq!(graph.candidate_as.len(), n);
-        assert_eq!(graph.candidate_5p_gap.len(), n);
-
         let profile = scratch("prior_profile.parquet");
         solve_and_write_profile(
-            graph,
+            prior_biased_graph(),
             &emission,
             "TEST",
             &profile,
