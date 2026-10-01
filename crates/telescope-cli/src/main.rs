@@ -458,6 +458,11 @@ fn main() -> Result<()> {
             // NaN-safe: `!(w >= 0.0)` would let NaN through, and a NaN weight
             // propagates into every posterior weight. 0.0 is legal and is the
             // documented off switch for the 5' term.
+            //
+            // clippy's `neg_cmp_op_on_partial_ord` wants this rewritten with
+            // `partial_cmp`, which would be a REGRESSION: the point of the
+            // negated form is that it is false for NaN. Do not "fix" this.
+            #[allow(clippy::neg_cmp_op_on_partial_ord)]
             if !(five_prime_weight >= 0.0) {
                 anyhow::bail!(
                     "--five-prime-weight must be >= 0 and non-NaN (got {}); it is the \
