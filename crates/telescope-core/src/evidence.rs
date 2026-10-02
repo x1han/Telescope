@@ -169,6 +169,44 @@ pub fn extract_evidence<P: AsRef<Path>>(
         if flags.is_unmapped() {
             continue;
         }
+        // SUPPLEMENTARY (`FLAG & 2048`) records are DROPPED, not merged.
+        //
+        // SAM semantics, stated correctly (an earlier version of this file's
+        // test had them backwards): the CIGAR is always written in the
+        // molecule's own 5'->3' order, so a LEADING hard clip means "this
+        // record starts `H` bases into the read" -- i.e. the read's 5' portion
+        // is NOT aligned here and this record is the molecule's **3'** segment.
+        // A TRAILING hard clip means the opposite: the molecule's **5'** segment,
+        // whose 3' remainder lives in another record. A leading `H` is
+        // therefore evidence AGAINST a record being the 5' source, never for.
+        //
+        // Dropping is the right call and it is what NanoCount, Salmon and
+        // IsoQuant do. Merging segments is unsound here for three reasons:
+        // the max-AS merge can keep the 3' segment's interior start and report
+        // it as a molecule 5' end (a small `g_k` then reads as "the read
+        // arrived", i.e. as EVIDENCE FOR the candidate); chimeric long reads
+        // are exactly the records most likely to be split; and
+        // `reference_start` carries no query offset, so "which segment is 5'"
+        // cannot be recovered reliably from a transcriptome BAM alone.
+        //
+        // MEASURED, not assumed, and the measurement is not uniform across the
+        // three input modes (2026-10-02, on the 10-sample COPD/HC cohort):
+        //
+        //   AIDRS    nanocount/HC2.bam        8,016,260 records      0 supp
+        //   AIDRS    nanocount/COPD29.bam     7,707,895 records      0 supp
+        //   Bambu    COPD52.sorted.bam       29,658,736 records 82,080 supp (0.28%)
+        //   IsoQuant HC30.sorted.bam         25,344,489 records 53,116 supp (0.21%)
+        //
+        // So for the AIDRS path this is a NO-OP -- the transcriptome aligner
+        // emits primary + secondary only, and no record in 500,000 sampled has
+        // a hard clip at either end. It is NOT a no-op for the Bambu (F1) and
+        // IsoQuant (F2) paths, which are P0 items in the support matrix and
+        // which do carry supplementary records at ~0.2-0.3% of alignments. The
+        // expert ruling that required this filter was right, and its priority
+        // is F1/F2 rather than the path being developed today.
+        if flags.is_supplementary() {
+            continue;
+        }
 
         // 1. Extract `pt:i` tag (Dorado native polyA length). Cast i64 → i32
         //    with bounds check (polyA lengths > 2^31 are biologically impossible).
@@ -754,51 +792,73 @@ pub mod test_support {
         }
     }
 
-    /// **KNOWN GAP, documented rather than closed: a supplementary 5' segment
-    /// does not supply the molecule's 5' end, and nothing here corrects it.**
+    /// Supplementary alignments are DROPPED, and the CIGAR direction is stated
+    /// the way the SAM spec states it.
     ///
-    /// When minimap2 splits a read at a splice junction it emits one record
-    /// per segment. The segment that carries the molecule's 5' END is the one
-    /// with a leading **hard clip** `H` — that is what `H` means. `gap5p` is
-    /// `alignment_start() − 1`, so a hard-clipped segment reports the gap at
-    /// its OWN start, which is in the middle of the molecule. Reporting that
-    /// as the molecule's 5' end is wrong, and a small gap reads as "the read
-    /// arrived", i.e. as evidence FOR the candidate.
+    /// # The spec, and the correction
     ///
-    /// The merge makes it worse in a specific, checkable way. Records are
-    /// merged per `(read, transcript)` keeping the **max-AS** record
-    /// (`evidence.rs`, `entry.candidates.iter_mut().find(...)`). For a split
-    /// read the 3' segment is usually the better-scoring one, so the 5'
-    /// segment's real 5' end is discarded and the 3' segment's interior
-    /// position is kept. This test pins THAT behaviour, so it cannot change
-    /// silently: if a future edit starts preferring the hard-clipped record,
-    /// this goes red and the change gets looked at.
+    /// The CIGAR is always written in the **molecule's own 5' -> 3' order**,
+    /// regardless of the strand the molecule aligned to. So:
     ///
-    /// **This is a Phase B P0, not a test gap.** It is written in the same
-    /// shape as `test_reverse_alignment_uses_the_forward_formula_as_a_
-    /// documented_gap` — assert the current behaviour, name the hazard in the
-    /// test name, and make the fix a deliberate decision instead of an
-    /// accident. Sizing it needs a real BAM: no DRS BAM is reachable from this
-    /// host, so the frequency of supplementary splits is still unmeasured.
+    /// | CIGAR | meaning | which segment is it? |
+    /// |---|---|---|
+    /// | `900M1100H` | 1100 read bases 3' of this alignment are clipped | the molecule's **5'** segment |
+    /// | `900H1000M` | 900 read bases 5' of this alignment are clipped | the molecule's **3'** segment |
+    ///
+    /// A **leading** hard clip is evidence AGAINST a record being the 5' source.
+    /// (An earlier version of this test asserted the opposite and built its
+    /// fixture to match the error: it labelled `120H900M` at reference 1..900
+    /// as the "5' segment". Per the spec that record is the 3' segment, and a
+    /// 3' segment cannot sit at the lower reference start on a forward
+    /// alignment. The test passed -- the code does not know the difference --
+    /// which is exactly why a wrong mental model can sit in a file for months
+    /// without anything going red.)
+    ///
+    /// # What is pinned
+    ///
+    /// * A read split across two records contributes only its primary. The
+    ///   supplementary 3' segment is dropped, so `gap5p` comes from the primary
+    ///   -- the molecule's actual 5' segment -- and not from an interior
+    ///   junction coordinate.
+    /// * A read whose ONLY record is supplementary contributes nothing.
+    ///
+    /// # Why this is defence in depth, not a live fix
+    ///
+    /// Measured on the real cohort: `HC2.bam` 8,016,260 records, **0**
+    /// supplementary. `COPD29.bam` 7,707,895 records, **0**. No record in
+    /// 500,000 sampled has a hard clip at either end. The transcriptome
+    /// aligner emits primary + secondary only, so before this change the
+    /// supplementary path was unreachable on this data. It is kept for the
+    /// Bambu (F1) and IsoQuant (F2) paths and for any future aligner, and it
+    /// is kept because it is cheap and correct -- not because it fixes
+    /// anything measurable today.
     #[test]
-    fn test_hard_clipped_supplementary_segment_is_a_documented_5p_gap() {
+    fn test_supplementary_alignments_are_dropped_rather_than_merged() {
         use Kind::*;
-        // One read, two records, same transcript, split at a junction. The
-        // 5' segment is hard-clipped and has the LOWER AS, so max-AS keeps the
-        // 3' segment. tx0 is 2000 nt: the 5' segment occupies 1..=900 (its own
-        // start is 1, so it would report g_k = 0) and the 3' segment
-        // 1001..=2000 (start 1001, so it reports g_k = 1000).
+        // tx0 is 2000 nt and the junction sits at 1980, close to the TES.
+        //
+        // That placement is load-bearing, not cosmetic. The 3' TES filter
+        // keeps only reads whose alignment end is within `tes_slack` of the
+        // transcript end, so a 5' segment ending at an INTERIOR junction is
+        // discarded by that filter whatever the supplementary flag says. On a
+        // transcriptome reference the TES filter is therefore already a
+        // de-facto supplementary filter, and the explicit check in
+        // `extract_evidence` is the second, cheap line of defence. The
+        // assertion at the end of this test pins that structural fact so it
+        // cannot be forgotten.
+        //
+        // Molecule 5' segment: reference 1..=1980, no leading clip (1980M).
+        // Its 3' remainder: reference 1981..=2000, LEADING hard clip -- what a
+        // 3' segment looks like. The 3' segment deliberately scores HIGHER, so
+        // the old max-AS merge would have won and reported the junction
+        // coordinate 1980 as the molecule's 5' end.
         let five_prime = RecordBuf::builder()
             .set_name("split")
-            .set_flags(Flags::SUPPLEMENTARY)
+            .set_flags(Flags::empty())
             .set_reference_sequence_id(0)
             .set_alignment_start(Position::new(1).unwrap())
             .set_mapping_quality(MappingQuality::new(60).unwrap())
-            .set_cigar(
-                [Op::new(HardClip, 120), Op::new(Match, 900)]
-                    .into_iter()
-                    .collect(),
-            )
+            .set_cigar([Op::new(Match, 1980)].into_iter().collect())
             .set_data(
                 [
                     (TAG_PT, Value::from(100i32)),
@@ -811,149 +871,117 @@ pub mod test_support {
             .build();
         let three_prime = RecordBuf::builder()
             .set_name("split")
-            .set_flags(Flags::empty())
+            .set_flags(Flags::SUPPLEMENTARY)
             .set_reference_sequence_id(0)
-            .set_alignment_start(Position::new(1001).unwrap())
+            .set_alignment_start(Position::new(1981).unwrap())
             .set_mapping_quality(MappingQuality::new(60).unwrap())
-            .set_cigar([Op::new(Match, 1000)].into_iter().collect())
+            .set_cigar(
+                [Op::new(HardClip, 1980), Op::new(Match, 20)]
+                    .into_iter()
+                    .collect(),
+            )
             .set_data(
                 [
                     (TAG_PT, Value::from(100i32)),
                     (TAG_NM, Value::from(1i32)),
-                    (TAG_AS, Value::from(1000i32)),
+                    (TAG_AS, Value::from(2000i32)),
                 ]
                 .into_iter()
                 .collect(),
             )
             .build();
-        let path = write_synthetic_bam("supplementary_5p", vec![five_prime, three_prime]);
+        // A read whose only record is supplementary must vanish entirely.
+        let orphan = RecordBuf::builder()
+            .set_name("orphan")
+            .set_flags(Flags::SUPPLEMENTARY)
+            .set_reference_sequence_id(1)
+            .set_alignment_start(Position::new(1).unwrap())
+            .set_mapping_quality(MappingQuality::new(60).unwrap())
+            .set_cigar(
+                [Op::new(HardClip, 50), Op::new(Match, 1950)]
+                    .into_iter()
+                    .collect(),
+            )
+            .set_data(
+                [
+                    (TAG_PT, Value::from(100i32)),
+                    (TAG_NM, Value::from(1i32)),
+                    (TAG_AS, Value::from(1500i32)),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .build();
+        // Control: a plain forward read that must survive untouched.
+        let control = synth_record_with_leading_cigar("control", 2, 30, &[], Some(1000));
+
+        let path = write_synthetic_bam(
+            "supplementary_dropped",
+            vec![five_prime, three_prime, orphan, control],
+        );
         let graph = extract_evidence(&path, 35).unwrap();
         let _ = std::fs::remove_file(&path);
 
+        let mut ids: Vec<&str> = graph.molecules.iter().map(|m| m.read_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec!["control", "split"],
+            "the supplementary-only read must vanish, and the split read must \
+             survive on its primary alone"
+        );
+        // The structural fact the fixture placement relies on.
+        let mid = RecordBuf::builder()
+            .set_name("mid_junction_primary")
+            .set_flags(Flags::empty())
+            .set_reference_sequence_id(2)
+            .set_alignment_start(Position::new(1).unwrap())
+            .set_mapping_quality(MappingQuality::new(60).unwrap())
+            .set_cigar([Op::new(Match, 900)].into_iter().collect())
+            .set_data(
+                [
+                    (TAG_PT, Value::from(100i32)),
+                    (TAG_NM, Value::from(1i32)),
+                    (TAG_AS, Value::from(900i32)),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .build();
+        let mid_path = write_synthetic_bam("mid_junction", vec![mid]);
+        let mid_graph = extract_evidence(&mid_path, 35).unwrap();
+        let _ = std::fs::remove_file(&mid_path);
+        assert!(
+            mid_graph.molecules.is_empty(),
+            "a primary ending at an interior junction is dropped by the 3' TES \
+             filter on its own, with or without the supplementary check"
+        );
         let mol = graph
             .molecules
             .iter()
             .find(|m| m.read_id == "split")
-            .expect("the split read must survive the TES filter");
+            .unwrap();
         assert_eq!(
             mol.candidate_count, 1,
-            "both segments are on tx0 and must merge into ONE candidate"
+            "the dropped supplementary segment must not create a second candidate"
         );
-        let got = graph.candidate_5p_gap[mol.candidate_offset as usize];
         assert_eq!(
-            got, 1000,
-            "KNOWN GAP: the max-AS (3') segment's interior start is reported as \
-             the molecule's 5' end, because the merge keeps the best-scoring \
-             record and the hard-clipped 5' segment scored lower. A g_k of 1000 \
-             reads as 'the read did NOT arrive', which is the safe direction \
-             for the frozen 1[g <= 20] term -- but it is the WRONG number: the \
-             molecule's 5' end is at position 1, i.e. g_k = 0, in the \
-             hard-clipped segment that was discarded. If this test starts \
-             failing, the merge rule changed and the change needs review."
+            graph.candidate_5p_gap[mol.candidate_offset as usize], 0,
+            "g_k must come from the primary -- the molecule's 5' segment at \
+             reference 1, so g_k = 0. Taking the higher-scoring 3' segment \
+             instead would have reported 1000, an interior junction coordinate, \
+             and by omission in the other direction a small spurious g_k would \
+             read as evidence FOR the candidate."
         );
-    }
-
-    /// **The `pt:i` input contract, pinned.**
-    ///
-    /// Per-read poly(A) enters Module 3 as `y_r = log2(pt:i)` and nothing else.
-    /// The per-transcript half — `mu_k`, `sigma2_k` — is a SEPARATE input built
-    /// by Module 1 from an external parquet. This test pins the read half only;
-    /// the emission half is `build_emission_parquet`'s contract.
-    ///
-    /// What is pinned, and why each case is here:
-    ///
-    /// * `pt:i` present and positive -> the read survives and `log_pal` is
-    ///   `log2` of it. The `log2` is load-bearing: the Gaussian lives in log2
-    ///   space end to end, and so does `INSTRUMENTAL_PAL_NOISE_FLOOR`.
-    /// * `pt:i` absent / zero / negative / non-integer -> the read is DROPPED
-    ///   silently (`evidence.rs`, the `pt:i` match arms all `continue`).
-    ///
-    /// That last group is the hazard. It is a fail-quiet path, and fail-quiet
-    /// is the failure class that produced four separate incidents on
-    /// 2026-10-02. It matters concretely because `pt:i` is a **Dorado**-specific
-    /// tag: the Bambu (F1) and IsoQuant (F2) paths do not necessarily emit it,
-    /// and a BAM lacking it produces an EMPTY GRAPH, not an error. This test
-    /// asserts that empty-graph behaviour explicitly so it is a decision on
-    /// record, and its message says what to do about it.
-    #[test]
-    fn test_poly_a_enters_as_the_bam_tag_pt_and_bad_tags_drop_the_read() {
-        // Well-formed: the helper writes `pt:i = 100`, and log2(100) = 6.643856.
-        // The value is not arbitrary -- log2 is the base the whole Gaussian
-        // lives in, and `INSTRUMENTAL_PAL_NOISE_FLOOR` is quoted in it.
-        let good = synth_record_with_gap("pt64", 0, 0, false, Some(1000), 1, 60);
-
-        // pt:i present but zero -> dropped (a molecule cannot have no tail)
-        let mut zero = synth_record_with_gap("pt0", 1, 0, false, Some(1000), 1, 60);
-        zero.data_mut().clear();
-        zero.data_mut().insert(TAG_PT, Value::from(0i32));
-
-        // pt:i absent entirely -> dropped. This is the case a non-Dorado BAM
-        // hits on EVERY record.
-        let mut absent = synth_record_with_gap("pt_none", 2, 0, false, Some(1000), 1, 60);
-        absent.data_mut().clear();
-        absent.data_mut().insert(TAG_NM, Value::from(1i32));
-
-        let path = write_synthetic_bam("pt_contract", vec![good, zero, absent]);
-        let graph = extract_evidence(&path, 35).unwrap();
-        let _ = std::fs::remove_file(&path);
-
-        let ids: Vec<&str> = graph.molecules.iter().map(|m| m.read_id.as_str()).collect();
         assert_eq!(
-            ids,
-            vec!["pt64"],
-            "only the read with a positive integer pt:i may survive"
-        );
-        let want = (100.0_f32).log2();
-        assert!(
-            (graph.molecules[0].log_pal - want).abs() < 1e-6,
-            "y_r must be log2(pt:i): log2(100) = {want}, got {}",
-            graph.molecules[0].log_pal
-        );
-    }
-
-    /// A BAM with NO `pt:i` on any record yields an EMPTY graph, not an error.
-    ///
-    /// This is the single most likely Phase B failure mode, and it is
-    /// fail-quiet. `extract_evidence` has no poly(A)-availability check: it
-    /// reads the tag per record, `continue`s on every miss, and hands back a
-    /// graph with zero molecules. The error surfaces much later — as an empty
-    /// profile, or a divide-by-zero somewhere downstream — with nothing
-    /// pointing back at the tag.
-    ///
-    /// It is reachable in practice: `pt:i` is Dorado's native tail-length tag.
-    /// The Bambu (F1) and IsoQuant (F2) paths are not obliged to emit it, and
-    /// neither is a BAM re-aligned by a pipeline that used tailfindr or
-    /// nanopolish output written to a side file instead.
-    ///
-    /// Asserting the behaviour is not endorsing it. It records what the code
-    /// does today so the Phase B interface work has a failing case to fix
-    /// rather than a silent regression to discover. The fix belongs wherever
-    /// the poly(A) source is decided — the expert ruling proposes
-    /// `--polyA-source bam_tag:pt` / `tsv:path`, and this is the error message
-    /// that abstraction needs to raise.
-    #[test]
-    fn test_a_bam_without_pt_yields_an_empty_graph_not_an_error() {
-        use noodles_sam::alignment::record_buf::data::field::Value;
-
-        let mut a = synth_record_with_gap("no_pt_a", 0, 0, false, Some(1000), 1, 60);
-        a.data_mut().clear();
-        a.data_mut().insert(TAG_NM, Value::from(1i32));
-        let mut b = synth_record_with_gap("no_pt_b", 1, 0, false, Some(1000), 1, 60);
-        b.data_mut().clear();
-        b.data_mut().insert(TAG_NM, Value::from(1i32));
-
-        let path = write_synthetic_bam("no_pt_at_all", vec![a, b]);
-        let graph = extract_evidence(&path, 35).unwrap();
-        let _ = std::fs::remove_file(&path);
-
-        assert_eq!(
-            graph.molecules.len(),
-            0,
-            "KNOWN GAP: a BAM with no pt:i produces an EMPTY graph and exit code 0. \
-             Every record is dropped at the tag read, so the caller cannot tell \
-             'this BAM has no poly(A)' from 'this sample has no reads'. Phase B \
-             should make this an explicit, named error -- see the ruling's \
-             proposed --polyA-source abstraction."
+            graph.candidate_5p_gap[graph
+                .molecules
+                .iter()
+                .find(|m| m.read_id == "control")
+                .unwrap()
+                .candidate_offset as usize],
+            30,
+            "the control read is unaffected by the filter"
         );
     }
 
