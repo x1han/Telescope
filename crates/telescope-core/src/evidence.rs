@@ -220,6 +220,9 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
             // header be recognised on the first non-blank, non-comment line
             // without mistaking a real read called `read_id` for a header.
             let mut n_seen = 0usize;
+            // Rows carrying a non-positive length: an invalid measurement, and
+            // the read is dropped at lookup like any other uncovered read.
+            let mut n_invalid = 0usize;
             for (i, line) in text.lines().enumerate() {
                 let trimmed = line.trim();
                 if trimmed.is_empty()
@@ -251,12 +254,23 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
                         t.insert(rid.to_string(), v);
                         n += 1;
                     }
-                    // A malformed or non-positive row is a data error the
-                    // caller must see; skipping it silently would recreate the
-                    // fail-quiet shape this type exists to remove.
-                    _ => bail!(
+                    // `poly_a_len <= 0` is a PHYSICALLY INVALID MEASUREMENT
+                    // (adapter read-through, or a caller that could not call a
+                    // length), not a corrupt file. A read with no usable tail
+                    // is a normal outcome and the bam_tag path already treats
+                    // it that way — it drops the read. Bailing here made one
+                    // such row kill a 27 M-record batch, and it made the two
+                    // sources disagree about the same biology. Both now drop
+                    // the read, and the count is reported at the end.
+                    Ok(_) => n_invalid += 1,
+                    // A value that is not an integer at all IS a file-format
+                    // error: it means the columns are not what the caller
+                    // thinks they are, and every subsequent lookup would be
+                    // silently wrong.
+                    Err(_) => bail!(
                         "--polyA-source tsv:{} line {}: expected `read_id<TAB>positive_int`, \
-                         got `{rid}<TAB>{val}`",
+                         got `{rid}<TAB>{val}`. A non-positive length is skipped as an \
+                         invalid measurement; a non-integer is a column-layout error.",
                         path.display(),
                         i + 1
                     ),
@@ -264,12 +278,15 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
             }
             if n == 0 {
                 bail!(
-                    "--polyA-source tsv:{} contains no usable rows",
-                    path.display()
+                    "--polyA-source tsv:{} contains no usable rows ({} rows had a \
+                     non-positive length)",
+                    path.display(),
+                    n_invalid
                 );
             }
             eprintln!(
-                "[telescope] poly(A) source: tsv:{} ({n} entries)",
+                "[telescope] poly(A) source: tsv:{} ({n} entries, {n_invalid} rows with \
+                 an invalid length and dropped)",
                 path.display()
             );
             Some(t)
@@ -1562,32 +1579,76 @@ mod tests {
         );
     }
 
-    /// A malformed TSV is a startup error, not a per-record surprise. Skipping
-    /// the row would recreate the fail-quiet shape the source type exists to
-    /// remove, one layer up.
+    /// INVERTED per the 2026-10-02 ruling.
+    ///
+    /// This used to assert that a `poly_a_len = 0` row is FATAL. It is not, and
+    /// should never have been: `0` is a physically invalid measurement (adapter
+    /// read-through, or a caller that could not call a length), not a corrupt
+    /// file, and killing a 27 M-record batch because one read in it has no tail
+    /// is a self-inflicted outage. The bam_tag path has always dropped such a
+    /// read; the two sources now agree, and a Fatal is reserved for the global
+    /// probe (no valid measurement in the first 10,000 records) and for a
+    /// column-layout error, where every later lookup would be silently wrong.
     #[test]
-    fn test_a_malformed_tsv_row_is_rejected_at_load() {
+    fn test_a_non_positive_tsv_row_is_skipped_but_a_non_integer_row_is_fatal() {
+        use noodles_sam::alignment::record_buf::data::field::Value;
+
         let tsv_path = std::env::temp_dir().join(format!(
-            "telescope_evidence_malformed_tsv_{}.tsv",
+            "telescope_evidence_invalid_tsv_{}.tsv",
             std::process::id()
         ));
-        std::fs::write(&tsv_path, "read_id\tpoly_a_len\nread_a\t0\n").unwrap();
+        let mut a = synth_record_with_gap("inv_a", 0, 0, false, Some(1000), 1, 60);
+        a.data_mut().clear();
+        a.data_mut().insert(TAG_NM, Value::from(1i32));
+        let mut b = synth_record_with_gap("inv_b", 1, 0, false, Some(1000), 1, 60);
+        b.data_mut().clear();
+        b.data_mut().insert(TAG_NM, Value::from(1i32));
+        let bam_path = write_synthetic_bam("tsv_invalid", vec![a, b]);
 
-        let a = synth_record_with_gap("mal_a", 0, 0, false, Some(1000), 1, 60);
-        let bam_path = write_synthetic_bam("malformed_tsv", vec![a]);
-
+        // (1) every row invalid -> the table supplies no poly(A) at all, which
+        //     IS fatal, by the same global rule as a missing tag
+        std::fs::write(&tsv_path, "read_id\tpoly_a_len\ninv_a\t0\ninv_b\t0\n").unwrap();
         let err = extract_evidence_with(&bam_path, 35, &PolyASource::Tsv(tsv_path.clone()))
-            .expect_err("a non-positive poly(A) length is a data error, not a row to skip");
-        let _ = std::fs::remove_file(&bam_path);
-        let _ = std::fs::remove_file(&tsv_path);
+            .expect_err("a table whose only rows are invalid supplies no poly(A) at all");
+        assert!(
+            format!("{err:#}").contains("no usable rows"),
+            "the global `no usable rows` error is the right one here"
+        );
 
+        // (2) one invalid row beside a valid one -> the run CONTINUES, the
+        //     covered read is used, and the read with the invalid measurement
+        //     is dropped. This is the 27 M-record case the ruling is about.
+        std::fs::write(&tsv_path, "read_id\tpoly_a_len\ninv_a\t0\ninv_b\t70\n").unwrap();
+        let graph = extract_evidence_with(&bam_path, 35, &PolyASource::Tsv(tsv_path.clone()))
+            .expect("one invalid row must not kill a table that still has a valid row");
+        assert_eq!(
+            graph.molecules.len(),
+            1,
+            "only the read with a valid measurement survives"
+        );
+        assert_eq!(graph.molecules[0].read_id, "inv_b");
+        assert!((graph.molecules[0].log_pal - (70.0_f32).log2()).abs() < 1e-6);
+
+        // (3) a negative length is the same class as zero
+        std::fs::write(&tsv_path, "read_id\tpoly_a_len\ninv_a\t-5\ninv_b\t70\n").unwrap();
+        let graph = extract_evidence_with(&bam_path, 35, &PolyASource::Tsv(tsv_path.clone()))
+            .expect("a negative length is an invalid measurement, not a fatal one");
+        assert_eq!(graph.molecules.len(), 1, "inv_a drops, inv_b survives");
+
+        // (4) a NON-INTEGER stays fatal: it means the columns are not what the
+        //     caller thinks, and every later lookup would be silently wrong
+        std::fs::write(&tsv_path, "read_id\tpoly_a_len\ninv_a\tabc\n").unwrap();
+        let err = extract_evidence_with(&bam_path, 35, &PolyASource::Tsv(tsv_path.clone()))
+            .expect_err("a non-integer is a column-layout error");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("line 2") && msg.contains("read_a"),
+            msg.contains("line 2") && msg.contains("inv_a"),
             "the error must point at the offending line and read id, got: {msg}"
         );
-    }
 
+        let _ = std::fs::remove_file(&bam_path);
+        let _ = std::fs::remove_file(&tsv_path);
+    }
     /// `none` drops nothing, and the global-absence guard must not fire on it.
     ///
     /// Note what actually makes that true: the `None` arm reports a HIT on

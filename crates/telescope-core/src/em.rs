@@ -203,6 +203,13 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
     prune_max_delta_as: i32,
     min_weight: f64,
     mut output_em_trace: Option<&mut Vec<(usize, f64, f64)>>,
+    // Same idiom as `output_em_trace`: an optional out-param for state a caller
+    // may need to inspect. mu/sigma2 were previously unobservable --
+    // `TelEmStats` carries neither -- which is exactly why the
+    // `poly_a_weight == 0` M-step bypass was untestable when it was added, and
+    // why mutation showed removing it changed nothing. Same gap class as the
+    // unobservable alpha scale recorded in the Phase A closeout.
+    mut output_emission_params: Option<&mut Vec<Option<TranscriptParam>>>,
 ) -> Result<TelEmStats> {
     // NaN-safe equivalent of the CLI's `!(aln_weight_lambda > 0.0)`: `<= 0.0`
     // alone would let NaN through (every comparison with NaN is false) and NaN λ
@@ -623,21 +630,42 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         }
 
         // 3-step update: μ → σ² (around μ_new) → π. Order is locked (spec §F2).
+        //
+        // STEPS 1 AND 2 ARE SKIPPED ENTIRELY AT `poly_a_weight == 0`.
+        //
+        // The obvious implementation — guard the two `accum_w_y*` lines and
+        // leave the rest — does NOT work, and silently produces the very
+        // corruption it is meant to prevent. `accum_w` (W) is what STEP 3 needs
+        // and must keep accumulating, so with S1 = 0 and W large:
+        //
+        //     mu     = (0 + tau_0 * mu_cohort) / (w_sum + tau_0)  ->  0
+        //     sigma2 = (0 + 2 * beta_0 * sigma2_cohort) / (...)    ->  floor
+        //
+        // i.e. mu is dragged to 0 and sigma2 onto
+        // INSTRUMENTAL_PAL_NOISE_FLOOR, which is precisely the "none"-mode
+        // placeholder pollution this bypass exists to stop. Freezing the two
+        // STEPS is what "keep mu and sigma2 at their prior/initial values"
+        // actually requires.
+        //
+        // STEP 3 is NOT skipped: alpha is the abundance prior, it does not read
+        // poly(A) at all, and skipping it would silently delete the prior.
         for i in 0..num_transcripts {
             if let Some(ref mut p) = params[i] {
                 let w_sum = accum_w[i];
 
-                // STEP 1: μ update — weak empirical Bayes shrinkage (τ₀=2).
-                p.mu = (accum_w_y[i] + tau_0 * p.mu_cohort) / (w_sum + tau_0);
+                if poly_a_weight > 0.0 {
+                    // STEP 1: μ update — weak empirical Bayes shrinkage (τ₀=2).
+                    p.mu = (accum_w_y[i] + tau_0 * p.mu_cohort) / (w_sum + tau_0);
 
-                // STEP 2: σ² update — algebraic closed-form around μ_new.
-                //   Σ w·(y − μ_new)² = S2 − 2·μ_new·S1 + μ_new²·W   (identity).
-                let s1 = accum_w_y[i];
-                let s2 = accum_w_y2[i];
-                let sq_dev_new = (s2 - 2.0 * p.mu * s1 + p.mu * p.mu * w_sum).max(0.0);
-                p.sigma2 =
-                    (sq_dev_new + 2.0 * beta_0 * p.sigma2_cohort) / (w_sum + 2.0 * nu_0 + 3.0);
-                p.sigma2 = p.sigma2.max(INSTRUMENTAL_PAL_NOISE_FLOOR);
+                    // STEP 2: σ² update — algebraic closed-form around μ_new.
+                    //   Σ w·(y − μ_new)² = S2 − 2·μ_new·S1 + μ_new²·W   (identity).
+                    let s1 = accum_w_y[i];
+                    let s2 = accum_w_y2[i];
+                    let sq_dev_new = (s2 - 2.0 * p.mu * s1 + p.mu * p.mu * w_sum).max(0.0);
+                    p.sigma2 =
+                        (sq_dev_new + 2.0 * beta_0 * p.sigma2_cohort) / (w_sum + 2.0 * nu_0 + 3.0);
+                    p.sigma2 = p.sigma2.max(INSTRUMENTAL_PAL_NOISE_FLOOR);
+                }
 
                 // STEP 3: π update.
                 // P1 fix: defensive check for n_total_molecules == 0 (BAM
@@ -882,6 +910,10 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
     writer.write(&batch).context("Failed to write batch")?;
     writer.close().context("Failed to close writer")?;
 
+    if let Some(out) = output_emission_params.as_deref_mut() {
+        *out = params.clone();
+    }
+
     Ok(TelEmStats {
         n_unambiguous,
         n_ambiguous,
@@ -1101,6 +1133,122 @@ mod tests {
         synth_graph_with_gaps(log_pal, &with_gaps)
     }
 
+    /// At `poly_a_weight == 0` the M-step must FREEZE mu and sigma2, not
+    /// recompute them from a placeholder `y`.
+    ///
+    /// This is the test the bypass did not have when it was first written.
+    /// Removing the bypass (`if poly_a_weight > 0.0` -> always) left all 53
+    /// tests green, because mu/sigma2 were not observable from outside --
+    /// `TelEmStats` carries neither, and the profile's `polyA_length` column is
+    /// the READ's own length, not the fitted mu. The change was untested and
+    /// the suite said nothing about it.
+    ///
+    /// The failure it would have caused is specific, not cosmetic. With
+    /// `accum_w` (W) still accumulating and S1 forced to 0:
+    ///
+    ///     mu     = (0 + tau_0 * mu_cohort) / (w_sum + tau_0)  ->  0
+    ///     sigma2 -> INSTRUMENTAL_PAL_NOISE_FLOOR
+    ///
+    /// so every transcript would be dragged to the placeholder's value. The
+    /// emission parquet is written with mu = 7.0, which is far from both 0 and
+    /// the floor, so "unchanged" and "dragged" are trivially distinguishable.
+    #[test]
+    fn test_poly_a_weight_zero_freezes_mu_and_sigma2_instead_of_dragging_them() {
+        let log_pal = (100.0_f32).log2();
+        let emission = scratch("mstep_freeze_emission.parquet");
+        let profile = scratch("mstep_freeze_profile.parquet");
+        write_test_emission(
+            &emission,
+            &[("tx0", "gene0", 7.0, 0.5), ("tx1", "gene1", 7.0, 0.5)],
+        );
+        // Built twice rather than cloned: `FlatEvidenceGraph` is deliberately
+        // not `Clone` (it is a set of parallel pools, and a Clone would invite
+        // the two drifting apart).
+        let cands: [(&str, i32, u32); 2] = [("tx0", 1000, 0), ("tx1", 1000, 0)];
+
+        // Arm A: poly(A) ON. mu must move off its initial 7.0 -- this is the
+        // control, and without it the test below would pass for the wrong
+        // reason (e.g. a solver that never touches mu at all).
+        let mut params_on = Vec::new();
+        solve_and_write_profile(
+            synth_graph_with_gaps(log_pal, &cands),
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            5,
+            20.0,
+            FIVE_PRIME_OFF,
+            POLY_A_ON,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
+            None,
+            Some(&mut params_on),
+        )
+        .unwrap();
+        let mu_on = params_on[0].as_ref().expect("tx0 must have params").mu;
+        assert!(
+            (mu_on - 7.0).abs() > 1e-6,
+            "CONTROL: with poly(A) on, mu must be updated away from its initial \
+             7.0, otherwise this test proves nothing. mu_on = {mu_on}"
+        );
+
+        // Arm B: poly(A) OFF. mu and sigma2 must be exactly what the parquet
+        // said -- the placeholder `y` must not reach the accumulators at all.
+        let mut params_off = Vec::new();
+        solve_and_write_profile(
+            synth_graph_with_gaps(log_pal, &cands),
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            5,
+            20.0,
+            FIVE_PRIME_OFF,
+            0.0,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
+            None,
+            Some(&mut params_off),
+        )
+        .unwrap();
+
+        for (i, tx) in ["tx0", "tx1"].iter().enumerate() {
+            let p = params_off[i]
+                .as_ref()
+                .unwrap_or_else(|| panic!("{tx} must have params"));
+            assert!(
+                (p.mu - 7.0).abs() < 1e-12,
+                "{tx}: mu must stay at its loaded value 7.0 at poly_a_weight = 0, \
+                 got {} -- the placeholder y reached the M-step",
+                p.mu
+            );
+            assert!(
+                (p.sigma2 - 0.5).abs() < 1e-12,
+                "{tx}: sigma2 must stay at its loaded value 0.5 at poly_a_weight = 0, \
+                 got {} -- expected the INSTRUMENTAL_PAL_NOISE_FLOOR drag",
+                p.sigma2
+            );
+            assert!(p.mu.is_finite() && p.sigma2.is_finite());
+        }
+
+        // alpha is the abundance prior and does NOT read poly(A), so it must
+        // still be updated. If the bypass had swallowed STEP 3 as well, the
+        // prior would silently vanish and every candidate would be scored
+        // without it.
+        let alpha_off = params_off[0].as_ref().unwrap().alpha;
+        assert!(
+            alpha_off > 0.0,
+            "STEP 3 (alpha) must still run at poly_a_weight = 0: it is the \
+             abundance prior, not a poly(A) term"
+        );
+
+        let _ = std::fs::remove_file(&emission);
+        let _ = std::fs::remove_file(&profile);
+    }
+
     /// As `synth_graph`, but each candidate also carries its observed 5' gap
     /// `g_k` (bp from the transcript's 5' end, strand-corrected by Module 2).
     ///
@@ -1222,6 +1370,7 @@ mod tests {
             PRUNE_OFF,
             MIN_WEIGHT,
             None,
+            None,
         )
         .unwrap();
 
@@ -1338,6 +1487,7 @@ mod tests {
             FIVE_PRIME_WINDOW,
             PRUNE_MAX_DELTA_AS,
             MIN_WEIGHT,
+            None,
             None,
         )
         .unwrap();
@@ -1531,6 +1681,7 @@ mod tests {
                 PRUNE_MAX_DELTA_AS,
                 0.0,
                 None,
+                None,
             )
             .unwrap();
 
@@ -1612,6 +1763,7 @@ mod tests {
             PRUNE_MAX_DELTA_AS,
             0.0,
             None,
+            None,
         )
         .unwrap();
 
@@ -1683,6 +1835,7 @@ mod tests {
                 // otherwise a losing candidate vanishing would look like
                 // "removed by the parameter".
                 0.0,
+                None,
                 None,
             )
             .unwrap();
@@ -1760,6 +1913,7 @@ mod tests {
                 FIVE_PRIME_WINDOW,
                 PRUNE_MAX_DELTA_AS,
                 min_weight,
+                None,
                 None,
             )
             .unwrap();
@@ -1846,6 +2000,7 @@ mod tests {
             PRUNE_MAX_DELTA_AS,
             MIN_WEIGHT,
             None,
+            None,
         )
         .unwrap();
 
@@ -1925,6 +2080,7 @@ mod tests {
             PRUNE_MAX_DELTA_AS,
             MIN_WEIGHT,
             None,
+            None,
         )
         .unwrap_err();
         let _ = std::fs::remove_file(&emission);
@@ -2001,6 +2157,7 @@ mod tests {
             PRUNE_MAX_DELTA_AS,
             MIN_WEIGHT,
             None,
+            None,
         )
         .unwrap();
 
@@ -2069,6 +2226,7 @@ mod tests {
                 window,
                 prune,
                 MIN_WEIGHT,
+                None,
                 None,
             )
             .map(|_| ())
@@ -2147,6 +2305,7 @@ mod tests {
             FIVE_PRIME_WINDOW,
             prune_max_delta_as,
             MIN_WEIGHT,
+            None,
             None,
         )
         .unwrap();

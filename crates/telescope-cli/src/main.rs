@@ -707,6 +707,7 @@ fn main() -> Result<()> {
                 prune_max_delta_as,
                 min_weight,
                 trace_sink,
+                None,
             )
             .context("Module 3 solve_and_write_profile failed")?;
             eprintln!(
