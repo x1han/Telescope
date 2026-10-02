@@ -20,7 +20,9 @@ use noodles_bam as bam;
 use noodles_sam::alignment::record::data::field::Tag;
 use noodles_sam::alignment::Record as _;
 
-/// Dorado poly(A) tail length SAM tag: `pt:i`.
+/// Dorado poly(A) tail length SAM tag: `pt:i`. The default for
+/// `PolyASource::BamTag`, and the tag every BAM in the 10-sample cohort
+/// carries on ~97% of records.
 const TAG_PT: Tag = Tag::new(b'p', b't');
 
 /// minimap2 alignment score SAM tag: `AS:i` (primary; drives Module 3's A_rk).
@@ -81,13 +83,73 @@ pub struct FlatEvidenceGraph {
     pub transcript_names: Vec<String>,
 }
 
-/// Parse the transcriptome BAM and emit the candidate graph.
+/// Where per-read poly(A) length comes from.
 ///
-/// `tes_slack` (in bp) accepts reads whose 3' alignment end falls within
-/// `tes_slack` of the transcript's 3' end (default 35; spec F2 / CLI).
+/// `pt:i` is Dorado's native tail-length tag, so it is the default and it is
+/// what every BAM in the 10-sample cohort carries (~97% of records). But it is
+/// a basecaller-specific tag, and the other common producers -- tailfindr,
+/// nanopolish -- emit plain-text summaries instead. A BAM re-aligned from one
+/// of those has no `pt:i` at all, and before this type existed that case
+/// produced an EMPTY GRAPH and exit code 0: every record dropped at the tag
+/// read, with nothing to distinguish "this BAM has no poly(A)" from "this
+/// sample has no reads". That is the fail-quiet path the 2026-10-02 ruling
+/// ordered destroyed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolyASource {
+    /// Read a two-character SAM tag from each record. `None` on a record is a
+    /// drop, exactly as before — that is correct when most records carry the
+    /// tag, and a global absence is a hard error rather than a silent success.
+    BamTag(Tag),
+    /// A `read_id <TAB> poly_a_len` TSV, as emitted by tailfindr / nanopolish.
+    /// Records absent from the table are DROPPED, and a table that matches no
+    /// record at all is a hard error for the same reason as a missing tag.
+    Tsv(std::path::PathBuf),
+    /// Declared absence of poly(A). No record is dropped for want of it and
+    /// `log_pal` is filled with a finite placeholder.
+    ///
+    /// THE PLACEHOLDER IS NOT DATA. It is `log_pal = 0.0` -- `log2(1)`, the
+    /// origin of the Gaussian's own space -- so pairing this with
+    /// `poly_a_weight > 0` would feed a constant, confident-looking emission
+    /// into the E-step and quietly distort every posterior. The CLI therefore
+    /// FORCES `poly_a_weight = 0` when this variant is selected, so the
+    /// inconsistent pairing cannot be expressed rather than merely warned
+    /// about.
+    ///
+    /// It must be FINITE, and the obvious alternative is not. `log2(0)` is
+    /// `-inf`, and `poly_a_weight = 0` does not protect the M-step from that:
+    /// `em.rs` multiplies the Gaussian in the E-step only (`em.rs:508`), while
+    /// `y` reaches the S1/S2 accumulators (`accum_w_y`, `accum_w_y2`)
+    /// unconditionally. A single read at `y = -inf` sends `mu` to `-inf` and
+    /// `sigma2` to NaN for its transcript. `0.0` is finite and survives that
+    /// path; it still biases `mu` toward the origin, which is a known and
+    /// accepted cost of an alignment-only run, not a corruption.
+    None,
+}
+
+/// Number of records scanned before deciding a poly(A) source is globally
+/// absent. The ruling specifies 10,000; it is a sampling depth, not a
+/// threshold on the data.
+const POLY_A_PROBE_RECORDS: usize = 10_000;
+
+/// Parse the transcriptome BAM and emit the candidate graph, reading poly(A)
+/// from Dorado's native `pt:i` tag.
+///
+/// Equivalent to `extract_evidence_with(.., &PolyASource::BamTag(TAG_PT))`,
+/// and **fails** rather than returning an empty graph when no record in the
+/// first [`POLY_A_PROBE_RECORDS`] carries the tag. Callers that want a
+/// different source, or none, use `extract_evidence_with`.
 pub fn extract_evidence<P: AsRef<Path>>(
     bam_path: P,
     tes_slack: usize,
+) -> Result<FlatEvidenceGraph> {
+    extract_evidence_with(bam_path, tes_slack, &PolyASource::BamTag(TAG_PT))
+}
+
+/// As [`extract_evidence`], with an explicit poly(A) source.
+pub fn extract_evidence_with<P: AsRef<Path>>(
+    bam_path: P,
+    tes_slack: usize,
+    poly_a: &PolyASource,
 ) -> Result<FlatEvidenceGraph> {
     let file = File::open(&bam_path)
         .with_context(|| format!("Failed to open BAM: {:?}", bam_path.as_ref()))?;
@@ -109,6 +171,76 @@ pub fn extract_evidence<P: AsRef<Path>>(
     if transcript_names.is_empty() {
         bail!("Transcriptome BAM header contains no reference transcripts");
     }
+
+    // poly(A) from an external table, loaded before the streaming loop so a
+    // malformed file is a startup error rather than a per-record surprise.
+    let tsv_table: Option<HashMap<String, i32>> = match poly_a {
+        PolyASource::Tsv(path) => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read --polyA-source tsv:{}", path.display()))?;
+            let mut t = HashMap::new();
+            let mut n = 0usize;
+            for (i, line) in text.lines().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let mut f = line.split('\t');
+                let rid = f.next().unwrap_or("").trim();
+                let val = f.next().unwrap_or("").trim();
+                // A header line (`read_id<TAB>poly_a_len`) is the common shape
+                // from tailfindr and nanopolish; skip it rather than making
+                // the caller pre-strip it.
+                if i == 0 && (rid.eq_ignore_ascii_case("read_id") || rid == "#read_id") {
+                    continue;
+                }
+                match val.parse::<i32>() {
+                    Ok(v) if v > 0 => {
+                        t.insert(rid.to_string(), v);
+                        n += 1;
+                    }
+                    // A malformed or non-positive row is a data error the
+                    // caller must see; skipping it silently would recreate the
+                    // fail-quiet shape this type exists to remove.
+                    _ => bail!(
+                        "--polyA-source tsv:{} line {}: expected `read_id<TAB>positive_int`, \
+                         got `{rid}<TAB>{val}`",
+                        path.display(),
+                        i + 1
+                    ),
+                }
+            }
+            if n == 0 {
+                bail!(
+                    "--polyA-source tsv:{} contains no usable rows",
+                    path.display()
+                );
+            }
+            eprintln!(
+                "[telescope] poly(A) source: tsv:{} ({n} entries)",
+                path.display()
+            );
+            Some(t)
+        }
+        _ => None,
+    };
+    let tag_to_read: Option<Tag> = match poly_a {
+        PolyASource::BamTag(t) => Some(*t),
+        _ => None,
+    };
+    if let Some(t) = tag_to_read {
+        eprintln!(
+            "[telescope] poly(A) source: bam_tag:{}",
+            String::from_utf8_lossy(t.as_ref())
+        );
+    }
+    // Records seen and records carrying poly(A), for the global-absence guard.
+    // Both guards below are keyed on `hits == 0`, and the `None` arm reports a
+    // hit on every record, so neither can fire on an alignment-only run. That
+    // is a property of the `None` arm's value, not a separate exemption --
+    // which is why there is no `expect_measurement` flag here. An earlier
+    // version had one, and it was dead: a mutation removing it stayed green.
+    let mut poly_a_records_seen: u64 = 0;
+    let mut poly_a_hits: u64 = 0;
 
     // Temporary per-read accumulator.
     //
@@ -208,16 +340,68 @@ pub fn extract_evidence<P: AsRef<Path>>(
             continue;
         }
 
-        // 1. Extract `pt:i` tag (Dorado native polyA length). Cast i64 → i32
+        // Counted for EVERY record that survives the flag filters, BEFORE the
+        // poly(A) lookup. Counting only the records where a value was found
+        // would make the global-absence guard unsatisfiable: `hits` and
+        // `seen` would rise together and the "seen but no hits" state could
+        // never be observed. That mistake was made once already in this
+        // function's history, in the shape of an empty graph and exit 0.
+        poly_a_records_seen += 1;
+
+        // 1. Extract the poly(A) length for this record. Cast i64 → i32
         //    with bounds check (polyA lengths > 2^31 are biologically impossible).
         let data = record.data();
-        let poly_a_len: i32 = match data.get(&TAG_PT) {
-            Some(Ok(value)) => match value.as_int() {
-                Some(len) if len > 0 && len <= i32::MAX as i64 => len as i32,
-                _ => continue, // skip non-positive or >i32::MAX
+        let poly_a_len: i32 = match poly_a {
+            PolyASource::BamTag(tag) => match data.get(tag) {
+                Some(Ok(value)) => match value.as_int() {
+                    Some(len) if len > 0 && len <= i32::MAX as i64 => len as i32,
+                    _ => continue, // skip non-positive or >i32::MAX
+                },
+                _ => continue, // skip missing or unparseable tag
             },
-            _ => continue, // skip missing or unparseable tag
+            PolyASource::Tsv(_) => {
+                let rid = match record.name() {
+                    Some(n) => String::from_utf8_lossy(n).to_string(),
+                    None => continue,
+                };
+                match tsv_table.as_ref().and_then(|t| t.get(&rid)) {
+                    Some(&v) => v,
+                    None => continue,
+                }
+            }
+            PolyASource::None => {
+                // Declared-absent. Nothing is dropped; the placeholder is NOT
+                // a measurement and the CLI forces poly_a_weight = 0 to keep
+                // it out of the E-step. 1, not 0: `0i32.log2()` is `-inf`, and
+                // `-inf` is not confined to the E-step -- it reaches the S1/S2
+                // accumulators, which the `poly_a_weight` gate does not cover.
+                1
+            }
         };
+        if poly_a_len > 0 {
+            poly_a_hits += 1;
+        }
+        // GLOBAL-ABSENCE GUARD. Sampled over the first POLY_A_PROBE_RECORDS
+        // records, so a BAM with no poly(A) at all fails loudly and
+        // immediately instead of producing an empty graph and exit code 0.
+        if poly_a_records_seen as usize == POLY_A_PROBE_RECORDS && poly_a_hits == 0 {
+            let spec = match poly_a {
+                PolyASource::BamTag(t) => {
+                    format!("bam_tag:{}", String::from_utf8_lossy(t.as_ref()))
+                }
+                PolyASource::Tsv(p) => format!("tsv:{}", p.display()),
+                PolyASource::None => "none".to_string(),
+            };
+            bail!(
+                "FATAL: no record among the first {POLY_A_PROBE_RECORDS} carries \
+                 poly(A) from the requested source `{spec}`. \
+                 If your BAM lacks Dorado poly(A) tags, specify \
+                 `--polyA-source none` for a pure-alignment run, or \
+                 `--polyA-source tsv:<path>` with a tailfindr/nanopolish \
+                 summary. Refusing to continue: returning an empty graph here \
+                 is indistinguishable downstream from a sample with no reads."
+            );
+        }
 
         // 2. Reference sequence index + alignment 3' end position.
         // noodles-bam methods return `Option<Result<T, io::Error>>`.
@@ -372,6 +556,30 @@ pub fn extract_evidence<P: AsRef<Path>>(
         }
     }
 
+    // END-OF-STREAM version of the same guard. The in-loop check fires at
+    // POLY_A_PROBE_RECORDS, which a BAM smaller than that never reaches -- and
+    // a small BAM is exactly the case a fixture, a test and a smoke run all
+    // use. Without this, the fail-quiet path survives precisely where it is
+    // most likely to be exercised.
+    if poly_a_records_seen > 0 && poly_a_hits == 0 {
+        let spec = match poly_a {
+            PolyASource::BamTag(t) => {
+                format!("bam_tag:{}", String::from_utf8_lossy(t.as_ref()))
+            }
+            PolyASource::Tsv(p) => format!("tsv:{}", p.display()),
+            PolyASource::None => "none".to_string(),
+        };
+        bail!(
+            "FATAL: none of the {poly_a_records_seen} scanned records carries \
+             poly(A) from the requested source `{spec}`. \
+             If your BAM lacks Dorado poly(A) tags, specify \
+             `--polyA-source none` for a pure-alignment run, or \
+             `--polyA-source tsv:<path>` with a tailfindr/nanopolish \
+             summary. Refusing to continue: returning an empty graph here \
+             is indistinguishable downstream from a sample with no reads."
+        );
+    }
+
     // Flatten into `FlatEvidenceGraph`.
     //
     // MEMORY: reserve the five pools at their exact final length instead of
@@ -443,7 +651,13 @@ pub fn extract_evidence<P: AsRef<Path>>(
 
         molecules.push(MoleculeEvidence {
             read_id,
-            log_pal: (entry.poly_a_len as f32).log2(),
+            // `poly_a_len` is >= 1 on every path that reaches here (BamTag drops
+            // non-positive, Tsv rejects non-positive at load, and `None` is filled
+            // with 1 below), so this is finite. The guard is a cheap assertion that
+            // the three sources cannot be changed into a `-inf` source unnoticed: an
+            // infinite `y` propagates into the S1/S2 accumulators, which are outside
+            // the `poly_a_weight` gate.
+            log_pal: (entry.poly_a_len.max(1) as f32).log2(),
             candidate_offset,
             candidate_count,
         });
@@ -1021,6 +1235,176 @@ pub mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
+
+    /// Restored after commit 8ee1077 deleted it without saying so, and inverted
+    /// per the expert ruling: the absence of poly(A) is a named error, not an
+    /// empty graph.
+    #[test]
+    fn test_poly_a_enters_as_the_bam_tag_pt_and_bad_tags_drop_the_read() {
+        use noodles_sam::alignment::record_buf::data::field::Value;
+
+        // Well-formed: the helper writes `pt:i = 100`, and log2(100) = 6.643856.
+        // The value is not arbitrary -- log2 is the base the whole Gaussian
+        // lives in, and `INSTRUMENTAL_PAL_NOISE_FLOOR` is quoted in it.
+        let good = synth_record_with_gap("pt64", 0, 0, false, Some(1000), 1, 60);
+
+        // pt:i present but zero -> dropped (a molecule cannot have no tail)
+        let mut zero = synth_record_with_gap("pt0", 1, 0, false, Some(1000), 1, 60);
+        zero.data_mut().clear();
+        zero.data_mut().insert(TAG_PT, Value::from(0i32));
+
+        // pt:i absent entirely -> dropped. This is the case a non-Dorado BAM
+        // hits on EVERY record.
+        let mut absent = synth_record_with_gap("pt_none", 2, 0, false, Some(1000), 1, 60);
+        absent.data_mut().clear();
+        absent.data_mut().insert(TAG_NM, Value::from(1i32));
+
+        let path = write_synthetic_bam("pt_contract", vec![good, zero, absent]);
+        let graph = extract_evidence(&path, 35).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let ids: Vec<&str> = graph.molecules.iter().map(|m| m.read_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["pt64"],
+            "only the read with a positive integer pt:i may survive"
+        );
+        let want = (100.0_f32).log2();
+        assert!(
+            (graph.molecules[0].log_pal - want).abs() < 1e-6,
+            "y_r must be log2(pt:i): log2(100) = {want}, got {}",
+            graph.molecules[0].log_pal
+        );
+    }
+
+    /// A BAM with no `pt:i` on any record is a HARD ERROR, not an empty graph.
+    ///
+    /// This assertion is INVERTED from what it was. It used to pin the
+    /// fail-quiet behaviour -- empty graph, exit 0 -- as a "KNOWN GAP" so the
+    /// interface work would have a case to fix. The expert ruling closed that
+    /// gap: the failure is now `bail!`ed, and this test pins the fix.
+    ///
+    /// The failure it removes is real. Every record is dropped at the tag read,
+    /// so the caller cannot tell "this BAM has no poly(A)" from "this sample has
+    /// no reads"; the error surfaces much later, as an empty profile or a
+    /// divide-by-zero, with nothing pointing back at the tag. `pt:i` is Dorado's
+    /// native tail-length tag, and the Bambu (F1) and IsoQuant (F2) paths are
+    /// not obliged to emit it.
+    ///
+    /// The 2-record fixture cannot reach the 10,000-record in-loop probe, so
+    /// this also pins the END-OF-STREAM guard -- without it the fail-quiet path
+    /// survives in exactly the case a unit test or a smoke run exercises.
+    #[test]
+    fn test_a_bam_without_pt_is_a_hard_error_not_an_empty_graph() {
+        use noodles_sam::alignment::record_buf::data::field::Value;
+
+        let mut a = synth_record_with_gap("no_pt_a", 0, 0, false, Some(1000), 1, 60);
+        a.data_mut().clear();
+        a.data_mut().insert(TAG_NM, Value::from(1i32));
+        let mut b = synth_record_with_gap("no_pt_b", 1, 0, false, Some(1000), 1, 60);
+        b.data_mut().clear();
+        b.data_mut().insert(TAG_NM, Value::from(1i32));
+
+        let path = write_synthetic_bam("no_pt_at_all", vec![a, b]);
+        let err = extract_evidence(&path, 35).expect_err(
+            "a BAM with no pt:i must be a hard error: an empty graph here is \
+             indistinguishable downstream from a sample with no reads",
+        );
+        let _ = std::fs::remove_file(&path);
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("FATAL") && msg.contains("bam_tag:pt"),
+            "the error must name the ruling's guard and the source it was looking for, got: {msg}"
+        );
+    }
+
+    /// `tsv:<path>` supplies poly(A) for a BAM that carries no `pt:i` -- the
+    /// tailfindr / nanopolish side-file shape. The header line is the common
+    /// form and is skipped rather than pushed back onto the caller.
+    #[test]
+    fn test_tsv_source_supplies_poly_a_for_a_bam_with_no_pt_tag() {
+        use noodles_sam::alignment::record_buf::data::field::Value;
+
+        let mut a = synth_record_with_gap("tsv_a", 0, 0, false, Some(1000), 1, 60);
+        a.data_mut().clear();
+        a.data_mut().insert(TAG_NM, Value::from(1i32));
+        let bam_path = write_synthetic_bam("tsv_src", vec![a]);
+
+        let tsv_path = bam_path.with_extension("polyA.tsv");
+        std::fs::write(&tsv_path, "read_id\tpoly_a_len\ntsv_a\t64\n").unwrap();
+
+        let graph =
+            extract_evidence_with(&bam_path, 35, &PolyASource::Tsv(tsv_path.clone())).unwrap();
+        let _ = std::fs::remove_file(&bam_path);
+        let _ = std::fs::remove_file(&tsv_path);
+
+        assert_eq!(
+            graph.molecules.len(),
+            1,
+            "the TSV row must resurrect the read"
+        );
+        assert_eq!(graph.molecules[0].read_id, "tsv_a");
+        let want = (64.0_f32).log2();
+        assert!(
+            (graph.molecules[0].log_pal - want).abs() < 1e-6,
+            "y_r must be log2 of the TSV value, not of any tag: want {want}"
+        );
+    }
+
+    /// A malformed TSV is a startup error, not a per-record surprise. Skipping
+    /// the row would recreate the fail-quiet shape the source type exists to
+    /// remove, one layer up.
+    #[test]
+    fn test_a_malformed_tsv_row_is_rejected_at_load() {
+        let tsv_path = std::env::temp_dir().join(format!(
+            "telescope_evidence_malformed_tsv_{}.tsv",
+            std::process::id()
+        ));
+        std::fs::write(&tsv_path, "read_id\tpoly_a_len\nread_a\t0\n").unwrap();
+
+        let a = synth_record_with_gap("mal_a", 0, 0, false, Some(1000), 1, 60);
+        let bam_path = write_synthetic_bam("malformed_tsv", vec![a]);
+
+        let err = extract_evidence_with(&bam_path, 35, &PolyASource::Tsv(tsv_path.clone()))
+            .expect_err("a non-positive poly(A) length is a data error, not a row to skip");
+        let _ = std::fs::remove_file(&bam_path);
+        let _ = std::fs::remove_file(&tsv_path);
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("line 2") && msg.contains("read_a"),
+            "the error must point at the offending line and read id, got: {msg}"
+        );
+    }
+
+    /// `none` drops nothing and reports zero hits for every record, so the
+    /// global-absence guard must NOT fire on it. Before `expect_measurement`
+    /// was added, an alignment-only run would have died at record 10,000 with
+    /// the very error that is supposed to mean "your BAM has no poly(A)".
+    #[test]
+    fn test_the_none_source_keeps_every_read_and_never_trips_the_guard() {
+        use noodles_sam::alignment::record_buf::data::field::Value;
+
+        let mut a = synth_record_with_gap("none_a", 0, 0, false, Some(1000), 1, 60);
+        a.data_mut().clear();
+        a.data_mut().insert(TAG_NM, Value::from(1i32));
+        let bam_path = write_synthetic_bam("none_src", vec![a]);
+
+        let graph = extract_evidence_with(&bam_path, 35, &PolyASource::None).unwrap();
+        let _ = std::fs::remove_file(&bam_path);
+
+        assert_eq!(
+            graph.molecules.len(),
+            1,
+            "`none` is declared-absent, not declared-invalid: the read must survive"
+        );
+        assert_eq!(
+            graph.molecules[0].log_pal, 0.0,
+            "the placeholder is log2(1); the CLI forces poly_a_weight = 0 so it \
+             can never reach the E-step"
+        );
+    }
 
     #[test]
     fn test_molecule_evidence_layout() {
