@@ -853,6 +853,110 @@ pub mod test_support {
         );
     }
 
+    /// **The `pt:i` input contract, pinned.**
+    ///
+    /// Per-read poly(A) enters Module 3 as `y_r = log2(pt:i)` and nothing else.
+    /// The per-transcript half — `mu_k`, `sigma2_k` — is a SEPARATE input built
+    /// by Module 1 from an external parquet. This test pins the read half only;
+    /// the emission half is `build_emission_parquet`'s contract.
+    ///
+    /// What is pinned, and why each case is here:
+    ///
+    /// * `pt:i` present and positive -> the read survives and `log_pal` is
+    ///   `log2` of it. The `log2` is load-bearing: the Gaussian lives in log2
+    ///   space end to end, and so does `INSTRUMENTAL_PAL_NOISE_FLOOR`.
+    /// * `pt:i` absent / zero / negative / non-integer -> the read is DROPPED
+    ///   silently (`evidence.rs`, the `pt:i` match arms all `continue`).
+    ///
+    /// That last group is the hazard. It is a fail-quiet path, and fail-quiet
+    /// is the failure class that produced four separate incidents on
+    /// 2026-10-02. It matters concretely because `pt:i` is a **Dorado**-specific
+    /// tag: the Bambu (F1) and IsoQuant (F2) paths do not necessarily emit it,
+    /// and a BAM lacking it produces an EMPTY GRAPH, not an error. This test
+    /// asserts that empty-graph behaviour explicitly so it is a decision on
+    /// record, and its message says what to do about it.
+    #[test]
+    fn test_poly_a_enters_as_the_bam_tag_pt_and_bad_tags_drop_the_read() {
+        // Well-formed: the helper writes `pt:i = 100`, and log2(100) = 6.643856.
+        // The value is not arbitrary -- log2 is the base the whole Gaussian
+        // lives in, and `INSTRUMENTAL_PAL_NOISE_FLOOR` is quoted in it.
+        let good = synth_record_with_gap("pt64", 0, 0, false, Some(1000), 1, 60);
+
+        // pt:i present but zero -> dropped (a molecule cannot have no tail)
+        let mut zero = synth_record_with_gap("pt0", 1, 0, false, Some(1000), 1, 60);
+        zero.data_mut().clear();
+        zero.data_mut().insert(TAG_PT, Value::from(0i32));
+
+        // pt:i absent entirely -> dropped. This is the case a non-Dorado BAM
+        // hits on EVERY record.
+        let mut absent = synth_record_with_gap("pt_none", 2, 0, false, Some(1000), 1, 60);
+        absent.data_mut().clear();
+        absent.data_mut().insert(TAG_NM, Value::from(1i32));
+
+        let path = write_synthetic_bam("pt_contract", vec![good, zero, absent]);
+        let graph = extract_evidence(&path, 35).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let ids: Vec<&str> = graph.molecules.iter().map(|m| m.read_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["pt64"],
+            "only the read with a positive integer pt:i may survive"
+        );
+        let want = (100.0_f32).log2();
+        assert!(
+            (graph.molecules[0].log_pal - want).abs() < 1e-6,
+            "y_r must be log2(pt:i): log2(100) = {want}, got {}",
+            graph.molecules[0].log_pal
+        );
+    }
+
+    /// A BAM with NO `pt:i` on any record yields an EMPTY graph, not an error.
+    ///
+    /// This is the single most likely Phase B failure mode, and it is
+    /// fail-quiet. `extract_evidence` has no poly(A)-availability check: it
+    /// reads the tag per record, `continue`s on every miss, and hands back a
+    /// graph with zero molecules. The error surfaces much later — as an empty
+    /// profile, or a divide-by-zero somewhere downstream — with nothing
+    /// pointing back at the tag.
+    ///
+    /// It is reachable in practice: `pt:i` is Dorado's native tail-length tag.
+    /// The Bambu (F1) and IsoQuant (F2) paths are not obliged to emit it, and
+    /// neither is a BAM re-aligned by a pipeline that used tailfindr or
+    /// nanopolish output written to a side file instead.
+    ///
+    /// Asserting the behaviour is not endorsing it. It records what the code
+    /// does today so the Phase B interface work has a failing case to fix
+    /// rather than a silent regression to discover. The fix belongs wherever
+    /// the poly(A) source is decided — the expert ruling proposes
+    /// `--polyA-source bam_tag:pt` / `tsv:path`, and this is the error message
+    /// that abstraction needs to raise.
+    #[test]
+    fn test_a_bam_without_pt_yields_an_empty_graph_not_an_error() {
+        use noodles_sam::alignment::record_buf::data::field::Value;
+
+        let mut a = synth_record_with_gap("no_pt_a", 0, 0, false, Some(1000), 1, 60);
+        a.data_mut().clear();
+        a.data_mut().insert(TAG_NM, Value::from(1i32));
+        let mut b = synth_record_with_gap("no_pt_b", 1, 0, false, Some(1000), 1, 60);
+        b.data_mut().clear();
+        b.data_mut().insert(TAG_NM, Value::from(1i32));
+
+        let path = write_synthetic_bam("no_pt_at_all", vec![a, b]);
+        let graph = extract_evidence(&path, 35).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            graph.molecules.len(),
+            0,
+            "KNOWN GAP: a BAM with no pt:i produces an EMPTY graph and exit code 0. \
+             Every record is dropped at the tag read, so the caller cannot tell \
+             'this BAM has no poly(A)' from 'this sample has no reads'. Phase B \
+             should make this an explicit, named error -- see the ruling's \
+             proposed --polyA-source abstraction."
+        );
+    }
+
     /// Writes `records` under a 3-transcript header (tx0/tx1/tx2, `REF_LEN` bp
     /// each) to a BAM in the system temp dir named after `tag` and the process
     /// id. Returns its path; the caller removes it. `tag` must differ per
