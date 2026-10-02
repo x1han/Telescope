@@ -552,6 +552,307 @@ pub mod test_support {
             .build()
     }
 
+    /// As [`synth_record_with_gap`], but with an explicit leading CIGAR.
+    ///
+    /// `leading` are the ops that sit 5' of the first `Match`, given as
+    /// `(kind, length)` pairs. The trailing `Match` length is **derived**, not
+    /// supplied: it is whatever is needed for the alignment's reference span to
+    /// end exactly at `REF_LEN`, so the read clears the 3' TES filter for any
+    /// leading-op combination. Deriving it is the whole point -- a fixture that
+    /// pinned the CIGAR length independently would silently fall out of the
+    /// graph the moment the leading ops changed the reference span, and a
+    /// missing molecule is indistinguishable from a rejected one.
+    ///
+    /// This is the only helper in the file that produces a CIGAR other than a
+    /// bare `Match`. Before 2026-10-02 that was the only kind that had ever
+    /// been built, so nothing in the suite had ever exercised what
+    /// `alignment_start()` does when the CIGAR begins with a soft-clip, an
+    /// insertion, a deletion or a hard-clip.
+    pub fn synth_record_with_leading_cigar(
+        name: &str,
+        ref_id: usize,
+        gap: usize,
+        leading: &[(Kind, usize)],
+        as_score: Option<i32>,
+    ) -> RecordBuf {
+        let consumed: usize = leading
+            .iter()
+            .filter(|(k, _)| *k != Kind::SoftClip && *k != Kind::HardClip && *k != Kind::Insertion)
+            .map(|(_, l)| *l)
+            .sum();
+        let match_len = (REF_LEN - gap)
+            .checked_sub(consumed)
+            .expect("leading CIGAR ops must not consume more reference than the read spans");
+        let mut ops: Vec<Op> = leading.iter().map(|(k, l)| Op::new(*k, *l)).collect();
+        ops.push(Op::new(Kind::Match, match_len));
+        let mut tags = vec![(TAG_PT, Value::from(100i32)), (TAG_NM, Value::from(1i32))];
+        if let Some(a) = as_score {
+            tags.push((TAG_AS, Value::from(a)));
+        }
+        RecordBuf::builder()
+            .set_name(name)
+            .set_flags(Flags::empty())
+            .set_reference_sequence_id(ref_id)
+            .set_alignment_start(
+                Position::new(gap + 1).expect("start position is 1-based and non-zero"),
+            )
+            .set_mapping_quality(MappingQuality::new(60).unwrap())
+            .set_cigar(ops.into_iter().collect::<Cigar>())
+            .set_data(tags.into_iter().collect())
+            .build()
+    }
+
+    /// **Module 2 `gap5p` under real CIGARs — the Phase B blocking gate.**
+    ///
+    /// Every other fixture in this file builds a bare `Match` CIGAR, so until
+    /// this test the suite had never asked what `alignment_start()` does when
+    /// the alignment begins with something other than a match. The 5' channel
+    /// is the whole subject of the frozen `ln_5p = β·1[g ≤ W]` term, and
+    /// `gap5p` is the only thing feeding it from Module 2.
+    ///
+    /// The physics being pinned: `gap5p = s_k − 1` counts the reference bases
+    /// between the transcript's 5' end and where the alignment begins. A
+    /// leading op that consumes **read** bases (soft-clip `S`, insertion `I`,
+    /// padding `P`) or **neither** (hard-clip `H`) does not move the
+    /// reference start, so it must not move `gap5p`. A leading op that
+    /// consumes **reference** (deletion `D`, skip `N`) sits *at* the start
+    /// position rather than before it, so it also must not move `gap5p`.
+    ///
+    /// If any of these ever moved the answer, the 5' term would be reading a
+    /// quantity that depends on the aligner's CIGAR rendering rather than on
+    /// where the molecule physically starts — i.e. two aligners, or one aligner
+    /// across two versions, would silently produce different posteriors from
+    /// the same molecules.
+    #[test]
+    fn test_gap5p_is_invariant_to_the_leading_cigar_ops() {
+        use Kind::*;
+        let gap = 50usize;
+        // A different `ref_id` per case, because every read here is a
+        // single-candidate read and molecules are keyed by read name, not by
+        // transcript. All land on distinct transcripts so a mix-up between
+        // them would show up as a wrong gap rather than a missing molecule.
+        let cases: Vec<(&str, usize, Vec<(Kind, usize)>)> = vec![
+            ("m_only", 0, vec![]),
+            ("soft", 1, vec![(SoftClip, 40)]),
+            ("ins", 2, vec![(Insertion, 12)]),
+            ("del", 0, vec![(Deletion, 9)]),
+            ("skip", 1, vec![(Skip, 30)]),
+            ("hard", 2, vec![(HardClip, 25)]),
+            (
+                "mixed",
+                0,
+                vec![
+                    (SoftClip, 15),
+                    (Insertion, 6),
+                    (Deletion, 4),
+                    (HardClip, 10),
+                ],
+            ),
+        ];
+        let records: Vec<RecordBuf> = cases
+            .iter()
+            .map(|(name, ref_id, lead)| {
+                synth_record_with_leading_cigar(name, *ref_id, gap, lead, Some(1000))
+            })
+            .collect();
+        let path = write_synthetic_bam("cigar_invariance", records);
+        let graph = extract_evidence(&path, 35).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        for (name, _, _) in &cases {
+            let mol = graph
+                .molecules
+                .iter()
+                .find(|m| m.read_id == *name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name} missing from the graph -- the leading CIGAR ops must not \
+                         have pushed its 3' end outside the TES filter"
+                    )
+                });
+            assert_eq!(mol.candidate_count, 1, "{name} must be single-candidate");
+            let got = graph.candidate_5p_gap[mol.candidate_offset as usize];
+            assert_eq!(
+                got, gap as u32,
+                "{name}: g_k must be s_k - 1 = {gap} regardless of what the CIGAR \
+                 puts in front of the first match. Leading ops that move it mean \
+                 the 5' term is reading an aligner artefact."
+            );
+        }
+    }
+
+    /// `gap5p` agrees with an independent cDNA-coordinate computation, for every
+    /// CIGAR family, through the real `extract_evidence` path.
+    ///
+    /// This is the "100% agreement with reference exon coordinates" gate. The
+    /// reference computation is deliberately a different route to the same
+    /// number: it walks the alignment's own reference span from the 3' end
+    /// backwards, whereas production reads the start position forwards. If
+    /// noodles' `alignment_start()` and `alignment_span()` disagreed about
+    /// where an alignment begins or how far it reaches, the two would part.
+    #[test]
+    fn test_gap5p_matches_an_independent_cdna_backward_computation() {
+        use Kind::*;
+        // (name, ref_id, gap, leading ops) — gaps span both sides of the frozen
+        // window edge at 20, because a bug that shifted g_k by one would only
+        // change an ASSIGNMENT on the wrong side of it, and this test is about
+        // the coordinate, not the term.
+        let cases: Vec<(&str, usize, usize, Vec<(Kind, usize)>)> = vec![
+            ("b0", 0, 0, vec![]),
+            ("b19", 1, 19, vec![]),
+            ("b20", 2, 20, vec![]),
+            ("b21", 0, 21, vec![]),
+            ("b200", 1, 200, vec![]),
+            ("b7_soft", 2, 7, vec![(SoftClip, 33)]),
+            ("b7_ins", 0, 7, vec![(Insertion, 5)]),
+            ("b7_del", 1, 7, vec![(Deletion, 11)]),
+            ("b7_hard", 2, 7, vec![(HardClip, 60)]),
+        ];
+        let records: Vec<RecordBuf> = cases
+            .iter()
+            .map(|(name, ref_id, gap, lead)| {
+                synth_record_with_leading_cigar(name, *ref_id, *gap, lead, Some(1000))
+            })
+            .collect();
+        let path = write_synthetic_bam("cigar_backward", records);
+        let graph = extract_evidence(&path, 35).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        for (name, _, gap, lead) in &cases {
+            let mol = graph
+                .molecules
+                .iter()
+                .find(|m| m.read_id == *name)
+                .unwrap_or_else(|| panic!("{name} missing from the graph"));
+            let got = graph.candidate_5p_gap[mol.candidate_offset as usize];
+
+            // Independent route: WALK THE CIGAR to count the reference bases
+            // the alignment consumes, then measure the 5' end from the known
+            // 3' terminus instead of from the start field. Production reads
+            // `alignment_start() - 1` forwards; this reads the same geometry
+            // backwards out of the CIGAR. If noodles' start were wrong, or if a
+            // leading op shifted it, the two disagree.
+            //
+            // M / D / N / = / X consume reference; S / H / I / P do not.
+            let leading_ref: usize = lead
+                .iter()
+                .filter(|(k, _)| matches!(k, Deletion | Skip))
+                .map(|(_, l)| *l)
+                .sum();
+            let span = leading_ref + (REF_LEN - gap - leading_ref);
+            let backward = REF_LEN - span;
+            assert_eq!(
+                backward, *gap,
+                "{name}: the CIGAR walk must terminate the alignment at REF_LEN, \
+                 otherwise this fixture is not testing what it claims"
+            );
+            assert_eq!(
+                got, backward as u32,
+                "{name}: forward (s_k - 1) and backward (REF_LEN - walked span) \
+                 computations of g_k must agree"
+            );
+        }
+    }
+
+    /// **KNOWN GAP, documented rather than closed: a supplementary 5' segment
+    /// does not supply the molecule's 5' end, and nothing here corrects it.**
+    ///
+    /// When minimap2 splits a read at a splice junction it emits one record
+    /// per segment. The segment that carries the molecule's 5' END is the one
+    /// with a leading **hard clip** `H` — that is what `H` means. `gap5p` is
+    /// `alignment_start() − 1`, so a hard-clipped segment reports the gap at
+    /// its OWN start, which is in the middle of the molecule. Reporting that
+    /// as the molecule's 5' end is wrong, and a small gap reads as "the read
+    /// arrived", i.e. as evidence FOR the candidate.
+    ///
+    /// The merge makes it worse in a specific, checkable way. Records are
+    /// merged per `(read, transcript)` keeping the **max-AS** record
+    /// (`evidence.rs`, `entry.candidates.iter_mut().find(...)`). For a split
+    /// read the 3' segment is usually the better-scoring one, so the 5'
+    /// segment's real 5' end is discarded and the 3' segment's interior
+    /// position is kept. This test pins THAT behaviour, so it cannot change
+    /// silently: if a future edit starts preferring the hard-clipped record,
+    /// this goes red and the change gets looked at.
+    ///
+    /// **This is a Phase B P0, not a test gap.** It is written in the same
+    /// shape as `test_reverse_alignment_uses_the_forward_formula_as_a_
+    /// documented_gap` — assert the current behaviour, name the hazard in the
+    /// test name, and make the fix a deliberate decision instead of an
+    /// accident. Sizing it needs a real BAM: no DRS BAM is reachable from this
+    /// host, so the frequency of supplementary splits is still unmeasured.
+    #[test]
+    fn test_hard_clipped_supplementary_segment_is_a_documented_5p_gap() {
+        use Kind::*;
+        // One read, two records, same transcript, split at a junction. The
+        // 5' segment is hard-clipped and has the LOWER AS, so max-AS keeps the
+        // 3' segment. tx0 is 2000 nt: the 5' segment occupies 1..=900 (its own
+        // start is 1, so it would report g_k = 0) and the 3' segment
+        // 1001..=2000 (start 1001, so it reports g_k = 1000).
+        let five_prime = RecordBuf::builder()
+            .set_name("split")
+            .set_flags(Flags::SUPPLEMENTARY)
+            .set_reference_sequence_id(0)
+            .set_alignment_start(Position::new(1).unwrap())
+            .set_mapping_quality(MappingQuality::new(60).unwrap())
+            .set_cigar(
+                [Op::new(HardClip, 120), Op::new(Match, 900)]
+                    .into_iter()
+                    .collect(),
+            )
+            .set_data(
+                [
+                    (TAG_PT, Value::from(100i32)),
+                    (TAG_NM, Value::from(1i32)),
+                    (TAG_AS, Value::from(900i32)),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .build();
+        let three_prime = RecordBuf::builder()
+            .set_name("split")
+            .set_flags(Flags::empty())
+            .set_reference_sequence_id(0)
+            .set_alignment_start(Position::new(1001).unwrap())
+            .set_mapping_quality(MappingQuality::new(60).unwrap())
+            .set_cigar([Op::new(Match, 1000)].into_iter().collect())
+            .set_data(
+                [
+                    (TAG_PT, Value::from(100i32)),
+                    (TAG_NM, Value::from(1i32)),
+                    (TAG_AS, Value::from(1000i32)),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .build();
+        let path = write_synthetic_bam("supplementary_5p", vec![five_prime, three_prime]);
+        let graph = extract_evidence(&path, 35).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let mol = graph
+            .molecules
+            .iter()
+            .find(|m| m.read_id == "split")
+            .expect("the split read must survive the TES filter");
+        assert_eq!(
+            mol.candidate_count, 1,
+            "both segments are on tx0 and must merge into ONE candidate"
+        );
+        let got = graph.candidate_5p_gap[mol.candidate_offset as usize];
+        assert_eq!(
+            got, 1000,
+            "KNOWN GAP: the max-AS (3') segment's interior start is reported as \
+             the molecule's 5' end, because the merge keeps the best-scoring \
+             record and the hard-clipped 5' segment scored lower. A g_k of 1000 \
+             reads as 'the read did NOT arrive', which is the safe direction \
+             for the frozen 1[g <= 20] term -- but it is the WRONG number: the \
+             molecule's 5' end is at position 1, i.e. g_k = 0, in the \
+             hard-clipped segment that was discarded. If this test starts \
+             failing, the merge rule changed and the change needs review."
+        );
+    }
+
     /// Writes `records` under a 3-transcript header (tx0/tx1/tx2, `REF_LEN` bp
     /// each) to a BAM in the system temp dir named after `tag` and the process
     /// id. Returns its path; the caller removes it. `tag` must differ per
