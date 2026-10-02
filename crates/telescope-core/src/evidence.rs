@@ -216,8 +216,15 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
                 .with_context(|| format!("Failed to read --polyA-source tsv:{}", path.display()))?;
             let mut t = HashMap::new();
             let mut n = 0usize;
+            // Data lines seen so far, excluding a skipped header. Lets the
+            // header be recognised on the first non-blank, non-comment line
+            // without mistaking a real read called `read_id` for a header.
+            let mut n_seen = 0usize;
             for (i, line) in text.lines().enumerate() {
-                if line.trim().is_empty() {
+                let trimmed = line.trim();
+                if trimmed.is_empty()
+                    || trimmed.starts_with('#') && !trimmed.starts_with("#read_id")
+                {
                     continue;
                 }
                 let mut f = line.split('\t');
@@ -226,9 +233,19 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
                 // A header line (`read_id<TAB>poly_a_len`) is the common shape
                 // from tailfindr and nanopolish; skip it rather than making
                 // the caller pre-strip it.
-                if i == 0 && (rid.eq_ignore_ascii_case("read_id") || rid == "#read_id") {
+                //
+                // Keyed to the first line that SURVIVES the blank/comment skip,
+                // not to `i == 0`. A file that opens with a provenance comment
+                // -- which is what a hand-annotated table has -- put the header
+                // on line 2, and the whole run died on a valid file.
+                if n == 0
+                    && n_seen == 0
+                    && (rid.eq_ignore_ascii_case("read_id") || rid == "#read_id")
+                {
+                    n_seen += 1;
                     continue;
                 }
+                n_seen += 1;
                 match val.parse::<i32>() {
                     Ok(v) if v > 0 => {
                         t.insert(rid.to_string(), v);
@@ -384,6 +401,39 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
         // function's history, in the shape of an empty graph and exit 0.
         poly_a_records_seen += 1;
 
+        // GLOBAL-ABSENCE GUARD, in-loop form. Sampled over the first
+        // POLY_A_PROBE_RECORDS records so a BAM with no poly(A) fails at record
+        // 10,000 instead of at end-of-stream on a 27 M-record file.
+        //
+        // IT MUST SIT HERE, ABOVE THE LOOKUP. It used to sit below it, and was
+        // therefore dead code: every arm of the `match` below `continue`s on a
+        // record with no poly(A), and `poly_a_hits` is incremented by the same
+        // statement that survives those `continue`s. So reaching the old check
+        // implied `hits >= 1`, making `hits == 0` unsatisfiable -- a guard that
+        // could not fire, wrapped in a comment claiming it did. Mutation
+        // confirmed it: neutering it left the suite fully green.
+        //
+        // Checked BEFORE the lookup, `hits` reflects records 1..POLY_A_PROBE_RECORDS-1
+        // only, so a BAM whose poly(A) starts late is caught here.
+        if poly_a_records_seen as usize == POLY_A_PROBE_RECORDS && poly_a_hits == 0 {
+            let spec = match poly_a {
+                PolyASource::BamTag(t) => {
+                    format!("bam_tag:{}", String::from_utf8_lossy(t.as_ref()))
+                }
+                PolyASource::Tsv(p) => format!("tsv:{}", p.display()),
+                PolyASource::None => "none".to_string(),
+            };
+            bail!(
+                "FATAL: no record among the first {POLY_A_PROBE_RECORDS} carries \
+                 poly(A) from the requested source `{spec}`. \
+                 If your BAM lacks Dorado poly(A) tags, specify \
+                 `--polyA-source none` for a pure-alignment run, or \
+                 `--polyA-source tsv:<path>` with a tailfindr/nanopolish \
+                 summary. Refusing to continue: returning an empty graph here \
+                 is indistinguishable downstream from a sample with no reads."
+            );
+        }
+
         // 1. Extract the poly(A) length for this record. Cast i64 → i32
         //    with bounds check (polyA lengths > 2^31 are biologically impossible).
         let data = record.data();
@@ -417,28 +467,6 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
         if poly_a_len > 0 {
             poly_a_hits += 1;
         }
-        // GLOBAL-ABSENCE GUARD. Sampled over the first POLY_A_PROBE_RECORDS
-        // records, so a BAM with no poly(A) at all fails loudly and
-        // immediately instead of producing an empty graph and exit code 0.
-        if poly_a_records_seen as usize == POLY_A_PROBE_RECORDS && poly_a_hits == 0 {
-            let spec = match poly_a {
-                PolyASource::BamTag(t) => {
-                    format!("bam_tag:{}", String::from_utf8_lossy(t.as_ref()))
-                }
-                PolyASource::Tsv(p) => format!("tsv:{}", p.display()),
-                PolyASource::None => "none".to_string(),
-            };
-            bail!(
-                "FATAL: no record among the first {POLY_A_PROBE_RECORDS} carries \
-                 poly(A) from the requested source `{spec}`. \
-                 If your BAM lacks Dorado poly(A) tags, specify \
-                 `--polyA-source none` for a pure-alignment run, or \
-                 `--polyA-source tsv:<path>` with a tailfindr/nanopolish \
-                 summary. Refusing to continue: returning an empty graph here \
-                 is indistinguishable downstream from a sample with no reads."
-            );
-        }
-
         // 2. Reference sequence index + alignment 3' end position.
         // noodles-bam methods return `Option<Result<T, io::Error>>`.
         let ref_id = match record.reference_sequence_id() {
@@ -1272,6 +1300,108 @@ mod tests {
     use super::test_support::*;
     use super::*;
 
+    /// The in-loop probe, which the end-of-stream guard cannot stand in for.
+    ///
+    /// The fixture is the case the ruling was written for and that only this
+    /// guard can catch: 10,000 records with NO poly(A), then records that DO
+    /// have it. The end-of-stream check passes on this file -- poly(A) exists,
+    /// so the run is not a global absence -- and the 10,000-record probe is
+    /// what must stop it. Before the guard was hoisted above the lookup it
+    /// could not fire, and this fixture returned `Ok` with the read included.
+    #[test]
+    fn test_the_in_loop_probe_catches_poly_a_that_only_starts_after_10000_records() {
+        use noodles_sam::alignment::record_buf::data::field::Value;
+
+        let mut recs = Vec::new();
+        for i in 0..(POLY_A_PROBE_RECORDS + 1) {
+            let mut r = synth_record_with_gap(&format!("late_{i}"), 0, 0, false, Some(1000), 1, 60);
+            r.data_mut().clear();
+            if i < POLY_A_PROBE_RECORDS {
+                r.data_mut().insert(TAG_NM, Value::from(1i32)); // no pt:i
+            } else {
+                r.data_mut().insert(TAG_PT, Value::from(80i32));
+            }
+            recs.push(r);
+        }
+        let path = write_synthetic_bam("late_polya", recs);
+        let err = extract_evidence(&path, 35).expect_err(
+            "the first 10,000 records carry no poly(A); the probe must stop the run \
+             even though later records do",
+        );
+        let _ = std::fs::remove_file(&path);
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("among the first 10000"),
+            "must name the probe depth, not the end-of-stream count, got: {msg}"
+        );
+    }
+
+    /// A TSV whose first data line is preceded by a comment must still be
+    /// accepted. The header skip used to be keyed to the raw line index, so a
+    /// provenance comment -- the first line of any hand-annotated table --
+    /// pushed the header to line 2 and killed a valid file.
+    #[test]
+    fn test_a_tsv_header_behind_a_comment_line_is_still_recognised() {
+        use noodles_sam::alignment::record_buf::data::field::Value;
+
+        let mut a = synth_record_with_gap("cmt_a", 0, 0, false, Some(1000), 1, 60);
+        a.data_mut().clear();
+        a.data_mut().insert(TAG_NM, Value::from(1i32));
+        let bam_path = write_synthetic_bam("tsv_comment", vec![a]);
+
+        let tsv = bam_path.with_extension("comment.tsv");
+        std::fs::write(
+            &tsv,
+            "# tailfindr v0.3 on HC2, run 2026-10-02\n\nread_id\tpoly_a_len\ncmt_a\t48\n",
+        )
+        .unwrap();
+
+        let graph = extract_evidence_with(&bam_path, 35, &PolyASource::Tsv(tsv.clone())).unwrap();
+        let _ = std::fs::remove_file(&bam_path);
+        let _ = std::fs::remove_file(&tsv);
+
+        assert_eq!(
+            graph.molecules.len(),
+            1,
+            "the commented header must be skipped, not parsed"
+        );
+        assert!((graph.molecules[0].log_pal - (48.0_f32).log2()).abs() < 1e-6);
+    }
+
+    /// A read ABSENT from the table is DROPPED, not defaulted. This is the
+    /// contract that turns a mismatched table (wrong sample, a `/1` vs `/2`
+    /// suffix mismatch) into a loud failure rather than a full, confident-looking
+    /// graph built on placeholder values -- and it was unpinned: changing the
+    /// `None => continue` to keep the read with a fabricated poly(A) of 1 left
+    /// the whole suite green.
+    #[test]
+    fn test_a_read_absent_from_the_tsv_is_dropped_not_defaulted() {
+        use noodles_sam::alignment::record_buf::data::field::Value;
+
+        let mut in_table = synth_record_with_gap("tbl_yes", 0, 0, false, Some(1000), 1, 60);
+        in_table.data_mut().clear();
+        in_table.data_mut().insert(TAG_NM, Value::from(1i32));
+        let mut not_in_table = synth_record_with_gap("tbl_no", 1, 0, false, Some(1000), 1, 60);
+        not_in_table.data_mut().clear();
+        not_in_table.data_mut().insert(TAG_NM, Value::from(1i32));
+        let bam_path = write_synthetic_bam("tsv_partial", vec![in_table, not_in_table]);
+
+        let tsv = bam_path.with_extension("partial.tsv");
+        std::fs::write(&tsv, "read_id\tpoly_a_len\ntbl_yes\t64\n").unwrap();
+
+        let graph = extract_evidence_with(&bam_path, 35, &PolyASource::Tsv(tsv.clone())).unwrap();
+        let _ = std::fs::remove_file(&bam_path);
+        let _ = std::fs::remove_file(&tsv);
+
+        let ids: Vec<&str> = graph.molecules.iter().map(|m| m.read_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["tbl_yes"],
+            "a read the table does not cover must be DROPPED; a fabricated poly(A) \
+             would let a half-matched table produce a full, plausible graph"
+        );
+    }
+
     /// The three CLI spellings, and the rejections. The spelling is load-bearing
     /// beyond cosmetics: the guard's FATAL message quotes `--polyA-source` to
     /// the user, so a parser that only accepted some spelling would produce an
@@ -1458,10 +1588,14 @@ mod tests {
         );
     }
 
-    /// `none` drops nothing and reports zero hits for every record, so the
-    /// global-absence guard must NOT fire on it. Before `expect_measurement`
-    /// was added, an alignment-only run would have died at record 10,000 with
-    /// the very error that is supposed to mean "your BAM has no poly(A)".
+    /// `none` drops nothing, and the global-absence guard must not fire on it.
+    ///
+    /// Note what actually makes that true: the `None` arm reports a HIT on
+    /// every record, so `hits == 0` is unreachable and both guards pass by
+    /// construction. An earlier version used a placeholder of 0, which made
+    /// `hits == 0` reachable and would have killed a healthy alignment-only run
+    /// at record 10,000. The flag `expect_measurement` that briefly existed to
+    /// prevent exactly that was dead -- removing it left the suite green.
     #[test]
     fn test_the_none_source_keeps_every_read_and_never_trips_the_guard() {
         use noodles_sam::alignment::record_buf::data::field::Value;
