@@ -421,12 +421,19 @@ where
         candidate_mapq: Vec::new(),
         candidate_5p_gap: Vec::new(),
         transcript_names: Vec::new(),
+        // Pools graphs that came from `extract_evidence`, i.e. real
+        // measurements, never a `PolyASource::None` placeholder. The flag is
+        // re-derived below from the graphs being pooled rather than assumed.
+        poly_a_is_placeholder: false,
     };
     let mut count: usize = 0;
 
     for (bam_path, sample_id) in bam_paths {
         let g = extract_evidence(bam_path.as_ref(), tes_slack)
             .with_context(|| format!("extract_evidence failed for {:?}", bam_path.as_ref()))?;
+        // Propagate the provenance flag rather than leaving the `false` above as
+        // a claim: `pooled` is only a placeholder graph if EVERY input was one.
+        pooled.poly_a_is_placeholder &= g.poly_a_is_placeholder;
         if pooled.transcript_names.is_empty() {
             pooled.transcript_names = g.transcript_names;
         } else if pooled.transcript_names != g.transcript_names {
@@ -594,6 +601,8 @@ mod tests {
             candidate_mapq: vec![0; 5],
             candidate_5p_gap: vec![0; 5],
             transcript_names: vec!["tx_a".into(), "tx_b".into(), "tx_c".into(), "tx_d".into()],
+            // synthetic/test graph: `log_pal` is a real measurement
+            poly_a_is_placeholder: false,
         };
         let mut tx2g = HashMap::new();
         tx2g.insert("tx_a".into(), "gene_a".into());
@@ -652,6 +661,8 @@ mod tests {
             candidate_mapq: vec![0; 3],
             candidate_5p_gap: vec![0; 3],
             transcript_names: vec!["tx_a".into(), "tx_b".into()],
+            // synthetic/test graph: `log_pal` is a real measurement
+            poly_a_is_placeholder: false,
         };
         let mut tx2g = HashMap::new();
         tx2g.insert("tx_a".into(), "gene_a".into());
@@ -690,6 +701,8 @@ mod tests {
             candidate_mapq: vec![0; 1],
             candidate_5p_gap: vec![0; 1],
             transcript_names: vec!["tx_a".into(), "tx_b".into()],
+            // synthetic/test graph: `log_pal` is a real measurement
+            poly_a_is_placeholder: false,
         };
         let mut tx2g = HashMap::new();
         tx2g.insert("tx_a".into(), "gene_a".into());

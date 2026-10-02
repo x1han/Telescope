@@ -262,6 +262,8 @@ fn build_graph(fx: &Fixture) -> FlatEvidenceGraph {
         candidate_nm: vec![0_i32; n_cands],
         candidate_mapq: vec![60_u8; n_cands],
         transcript_names: vec!["tx0".to_string(), "tx1".to_string()],
+        // synthetic graph: `log_pal` is a real measurement
+        poly_a_is_placeholder: false,
     }
 }
 

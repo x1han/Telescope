@@ -81,6 +81,24 @@ pub struct FlatEvidenceGraph {
     /// parameter, and must never be folded into an accumulator.
     pub candidate_5p_gap: Vec<u32>,
     pub transcript_names: Vec<String>,
+    /// PROVENANCE, not measurement: true iff this graph was built with
+    /// `PolyASource::None`, so every molecule's `log_pal` is the placeholder
+    /// rather than an observed tail length.
+    ///
+    /// This is a property of the GRAPH, not of a molecule, which is why it is
+    /// one bool here and not `Option<f32>` on `MoleculeEvidence`. The
+    /// distinction is the whole point: `Option<f32>` would double the
+    /// per-molecule field and have to be threaded through the flat pools,
+    /// while this is O(1) on the struct (a handful of Vec handles, not
+    /// per-read data) and touches no Parquet schema, because
+    /// `FlatEvidenceGraph` is never serialised.
+    ///
+    /// It exists so `em::solve_and_write_profile` can refuse the combination
+    /// that is silently wrong: a placeholder graph at `poly_a_weight > 0`
+    /// feeds a constant emission into the E-step. The CLI forces the weight to
+    /// 0, but `solve_and_write_profile` is a public function and a library
+    /// caller never touches the CLI.
+    pub poly_a_is_placeholder: bool,
 }
 
 /// Where per-read poly(A) length comes from.
@@ -759,6 +777,7 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
         candidate_mapq,
         candidate_5p_gap,
         transcript_names,
+        poly_a_is_placeholder: matches!(poly_a, PolyASource::None),
     })
 }
 
@@ -1419,6 +1438,40 @@ mod tests {
         );
     }
 
+    /// The provenance flag is set by the source, not inferred from the data.
+    /// `log_pal == 0.0` in a REAL graph is not evidence of a placeholder: a BAM
+    /// legitimately contains reads with no usable `pt:i`, and those are dropped
+    /// at extraction rather than filled in, so a real graph can and does reach
+    /// 0.0. Deciding the flag from the values would reject ordinary runs.
+    #[test]
+    fn test_the_placeholder_flag_is_source_derived_not_inferred_from_log_pal() {
+        use noodles_sam::alignment::record_buf::data::field::Value;
+
+        // `src_pt` carries a real tail length; `src_none` has none, exactly
+        // like a BAM where some reads lack a usable `pt:i`. Both must survive
+        // the tag lookup for the measured arm, so only ONE is stripped.
+        let mut a = synth_record_with_gap("src_pt", 0, 0, false, Some(1000), 1, 60);
+        a.data_mut().clear();
+        a.data_mut().insert(TAG_PT, Value::from(90i32));
+        let mut b = synth_record_with_gap("src_none", 1, 0, false, Some(1000), 1, 60);
+        b.data_mut().clear();
+        b.data_mut().insert(TAG_NM, Value::from(1i32));
+        let path = write_synthetic_bam("provenance", vec![a, b]);
+
+        let measured = extract_evidence_with(&path, 35, &PolyASource::BamTag(TAG_PT)).unwrap();
+        assert!(
+            !measured.poly_a_is_placeholder,
+            "a bam_tag graph is a measurement, whatever its log_pal values are"
+        );
+
+        let none_src = extract_evidence_with(&path, 35, &PolyASource::None).unwrap();
+        assert!(
+            none_src.poly_a_is_placeholder,
+            "a PolyASource::None graph must be flagged, or the em.rs guard cannot fire"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// The three CLI spellings, and the rejections. The spelling is load-bearing
     /// beyond cosmetics: the guard's FATAL message quotes `--polyA-source` to
     /// the user, so a parser that only accepted some spelling would produce an
@@ -1992,6 +2045,8 @@ mod tests {
             candidate_mapq: vec![0; 8],
             candidate_5p_gap: vec![0; 8],
             transcript_names: vec![],
+            // synthetic/test graph: `log_pal` is a real measurement
+            poly_a_is_placeholder: false,
         };
 
         let hist = graph.candidate_count_histogram();
@@ -2056,6 +2111,8 @@ mod tests {
             candidate_mapq: vec![],
             candidate_5p_gap: vec![],
             transcript_names: vec![],
+            // synthetic/test graph: `log_pal` is a real measurement
+            poly_a_is_placeholder: false,
         };
         assert!(graph.candidate_count_histogram().is_empty());
     }

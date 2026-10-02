@@ -211,6 +211,29 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
     // unobservable alpha scale recorded in the Phase A closeout.
     mut output_emission_params: Option<&mut Vec<Option<TranscriptParam>>>,
 ) -> Result<TelEmStats> {
+    // API-LEVEL DEFENCE, per the 2026-10-02 ruling.
+    //
+    // The CLI forces `poly_a_weight = 0` when `--polyA-source none`, but this
+    // is a public function and a library caller never goes through the CLI.
+    // Pairing a placeholder graph with a positive weight feeds a constant
+    // emission into the E-step and silently distorts every posterior — the
+    // exact failure the `None` variant's docstring promises cannot be
+    // expressed. At the library boundary it CAN be, so it is refused here.
+    //
+    // The check is on the graph's provenance flag, not on `log_pal` values:
+    // a real BAM can legitimately contain reads whose `pt:i` is absent, and
+    // those reads are dropped at extraction rather than filled in, so
+    // `log_pal == 0.0` in a real graph is not evidence of a placeholder.
+    if poly_a_weight > 0.0 && graph.poly_a_is_placeholder {
+        anyhow::bail!(
+            "FATAL: poly_a_weight = {poly_a_weight} on a graph built with \
+             --polyA-source none. Every molecule's log_pal is the placeholder, \
+             not an observed tail length, so the Gaussian would score a constant \
+             emission and distort every posterior. Re-run with \
+             --polyA-source bam_tag:pt / tsv:<path>, or set --poly-a-weight 0."
+        );
+    }
+
     // NaN-safe equivalent of the CLI's `!(aln_weight_lambda > 0.0)`: `<= 0.0`
     // alone would let NaN through (every comparison with NaN is false) and NaN λ
     // emits NaN posterior weights instead of failing. +inf stays accepted, as
@@ -1249,6 +1272,92 @@ mod tests {
         let _ = std::fs::remove_file(&profile);
     }
 
+    /// `solve_and_write_profile` is public, so the CLI's `poly_a_weight = 0`
+    /// interlock is not enough: a library caller can pair a placeholder graph
+    /// with a positive weight, which feeds a constant emission into the E-step
+    /// and distorts every posterior. That combination must be unexpressible at
+    /// the API boundary too.
+    #[test]
+    fn test_quant_refuses_a_placeholder_graph_with_a_positive_poly_a_weight() {
+        let log_pal = (100.0_f32).log2();
+        let emission = scratch("placeholder_guard_emission.parquet");
+        let profile = scratch("placeholder_guard_profile.parquet");
+        write_test_emission(&emission, &[("tx0", "gene0", log_pal as f64, 0.04)]);
+
+        let mut graph = synth_graph(log_pal, &[("tx0", 1000)]);
+        graph.poly_a_is_placeholder = true;
+
+        let err = solve_and_write_profile(
+            graph,
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            1,
+            20.0,
+            FIVE_PRIME_OFF,
+            POLY_A_ON,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
+            None,
+            None,
+        )
+        .expect_err("a placeholder graph at poly_a_weight > 0 is the silently-wrong pairing");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("FATAL") && msg.contains("--poly-a-weight 0"),
+            "the error must name the fix, or the caller cannot act on it: {msg}"
+        );
+
+        // The SAME graph at weight 0 must still run: the guard is about the
+        // pairing, not about the placeholder existing.
+        let mut graph = synth_graph(log_pal, &[("tx0", 1000)]);
+        graph.poly_a_is_placeholder = true;
+        solve_and_write_profile(
+            graph,
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            1,
+            20.0,
+            FIVE_PRIME_OFF,
+            0.0,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
+            None,
+            None,
+        )
+        .expect("a placeholder graph at weight 0 is the supported alignment-only run");
+
+        // And a REAL graph at a positive weight must be unaffected -- otherwise
+        // the guard would fire on ordinary runs.
+        let graph = synth_graph(log_pal, &[("tx0", 1000)]);
+        solve_and_write_profile(
+            graph,
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            1,
+            20.0,
+            FIVE_PRIME_OFF,
+            POLY_A_ON,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
+            None,
+            None,
+        )
+        .expect("a measured graph at a positive weight is the normal case");
+
+        let _ = std::fs::remove_file(&emission);
+        let _ = std::fs::remove_file(&profile);
+    }
+
     /// As `synth_graph`, but each candidate also carries its observed 5' gap
     /// `g_k` (bp from the transcript's 5' end, strand-corrected by Module 2).
     ///
@@ -1280,6 +1389,8 @@ mod tests {
             candidate_as,
             candidate_5p_gap,
             transcript_names,
+            // synthetic/test graph: `log_pal` is a real measurement
+            poly_a_is_placeholder: false,
         }
     }
 
@@ -1602,6 +1713,8 @@ mod tests {
             candidate_pool,
             candidate_as,
             transcript_names: vec!["tx0".to_string(), "tx1".to_string()],
+            // synthetic/test graph: `log_pal` is a real measurement
+            poly_a_is_placeholder: false,
         };
         assert_eq!(graph.candidate_pool.len(), n);
         assert_eq!(graph.candidate_as.len(), n);
