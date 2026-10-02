@@ -122,9 +122,15 @@
 //! |---|---|
 //! | `ln_5p` neutered (`em.rs:488` → always 0) | tests 2 and 3 |
 //! | window gate `<=` → `<` | test 3, and `em.rs:2294` |
-//! | M-step numerator `+= 1.0` → `+= 0.5` (`em.rs:605`) | tests 1, 2, 3 |
+//! | window gate always fires (`em.rs:488` → unconditional) | tests 2 and 3 |
+//! | M-step numerator `+= 1.0` → `+= 0.5` (`em.rs:605`) | **all four** |
 //! | M-step denominator `/7` → `/2` (`em.rs:648`) | **nothing** — see the scale-invariance note above |
 //! | output-stage renormalisation removed (`em.rs:789`) | **nothing** — at `min_weight = 0` the retained sum is already 1 to ~1e-16; covered by the `em.rs` unit tests instead |
+//!
+//! Re-run with `bash ci/gates.sh full`, or
+//! `bash workspace/validation/controls/mutation_battery.sh`. The last row of
+//! that table is a **prediction**: M5 turning anything red would mean the
+//! scale-invariance argument above is wrong, and that is worth knowing.
 //!
 //! So: each test detects a real class, no test detects everything, and two
 //! whole classes are invisible to this file by construction. Both are stated
