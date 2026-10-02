@@ -88,11 +88,27 @@
 //!
 //! # Tolerances
 //!
-//! Test 1 asserts a **converged fixed point**, so how close the EM gets is set
-//! by the stopping rule rather than the arithmetic; it runs `tol` far below the
-//! shipped `1e-6` and asserts to `1e-9`. Tests 2–4 assert **exact**
-//! relationships — a symmetric quadratic root, and two cancellations that must
-//! hold to the last bit — and are 1e-12.
+//! Tests 1, 2 and 3 assert a **converged fixed point**, so how close the EM
+//! gets is set by the stopping rule rather than the arithmetic; they run `tol`
+//! far below the shipped `1e-6` and assert to `1e-9`. Test 4 asserts an
+//! **exact cancellation** — a constant added to both `ll`s must vanish in the
+//! softmax to the last bit — and is 1e-12.
+//!
+//! # What each test can and cannot detect
+//!
+//! The mutation result (neutering `ln_5p` and re-running) is the only honest
+//! answer to "is this a gate or decoration", and it is recorded in
+//! `workspace/comms/2026-10-02-toy-em/`. Neutering turns **Test 2** red by
+//! 5.6e-2 and leaves the other three green. That is not a weakness, but it
+//! does mean only one test is load-bearing against *that* mutation, so each
+//! test's docstring below states which mutation it is aimed at:
+//!
+//! | test | detects |
+//! |---|---|
+//! | 1 | any E-step/M-step disagreement; initialiser drift |
+//! | 2 | a neutered or wrong-magnitude `ln_5p` |
+//! | 3 | the window gate being wrong at its own edge (`<` vs `<=`, wrong candidate's gap) |
+//! | 4 | `ln_5p` leaking into the normalisation or the `max_ll` shift |
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -249,7 +265,8 @@ fn write_emission(path: &PathBuf) {
     w.close().expect("close emission");
 }
 
-fn read_profile(path: &std::path::Path) -> Vec<(String, f64)> {
+/// `(read_id, transcript_id, posterior_weight)`, one entry per profile row.
+fn read_profile(path: &std::path::Path) -> Vec<(String, String, f64)> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     let file = std::fs::File::open(path).expect("open profile");
     let reader = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -260,6 +277,12 @@ fn read_profile(path: &std::path::Path) -> Vec<(String, f64)> {
     let mut out = Vec::new();
     for batch in reader {
         let batch = batch.expect("read profile batch");
+        let rid = batch
+            .column_by_name("read_id")
+            .expect("read_id")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("read_id is StringArray");
         let tx = batch
             .column_by_name("transcript_id")
             .expect("transcript_id")
@@ -273,7 +296,11 @@ fn read_profile(path: &std::path::Path) -> Vec<(String, f64)> {
             .downcast_ref::<Float64Array>()
             .expect("posterior_weight is Float64Array");
         for i in 0..batch.num_rows() {
-            out.push((tx.value(i).to_string(), w.value(i)));
+            out.push((
+                rid.value(i).to_string(),
+                tx.value(i).to_string(),
+                w.value(i),
+            ));
         }
     }
     out
@@ -307,20 +334,75 @@ fn run(fx: &Fixture, beta: f64, tag: &str) -> Vec<(f64, f64)> {
     let _ = std::fs::remove_file(&emission);
     let _ = std::fs::remove_file(&profile);
 
-    let single = N_UNAMB_TX0 + N_UNAMB_TX1;
+    // Rows are looked up BY READ ID, not by position. The profile happens to
+    // write the unambiguous reads first (`em.rs:672` then the ambiguous block
+    // at 704), but that ordering is an implementation detail and it is
+    // conditional: an unambiguous read whose transcript is missing from the
+    // emission, or `is_polyA_competent == false`, is `continue`d without
+    // emitting a row. A positional slice would then be off by one and quietly
+    // compare the wrong numbers. Keying on `read_id` makes the test immune to
+    // both the ordering and the skipped row, and it also lets the test ASSERT
+    // that the ambiguous reads really did emit two rows each.
     let mut out = Vec::new();
     for i in 0..N_AMBIG {
-        let base = single + i * 2;
-        let (t0, w0) = &rows[base];
-        let (t1, w1) = &rows[base + 1];
+        let rid = format!("amb_{i}");
+        let got: Vec<(&str, f64)> = rows
+            .iter()
+            .filter(|(r, _, _)| r == &rid)
+            .map(|(_, t, w)| (t.as_str(), *w))
+            .collect();
         assert_eq!(
-            (t0.as_str(), t1.as_str()),
-            ("tx0", "tx1"),
-            "ambiguous molecule {i} must emit both candidates, in candidate order"
+            got.len(),
+            2,
+            "ambiguous molecule {rid} must emit exactly 2 rows at \
+             min_weight = 0, one per candidate; got {}: {got:?}",
+            got.len()
         );
-        out.push((*w0, *w1));
+        assert_eq!(
+            (got[0].0, got[1].0),
+            ("tx0", "tx1"),
+            "both candidates of {rid} must be present"
+        );
+        out.push((got[0].1, got[1].1));
+    }
+    // The unambiguous reads must be present too, at weight exactly 1.0 — they
+    // are what the M-step's numerator is built from, so a silently dropped one
+    // would move the fixed point and the closed forms would stop matching.
+    for (i, tx) in (0..N_UNAMB_TX0)
+        .map(|i| (i, "tx0"))
+        .chain((0..N_UNAMB_TX1).map(|i| (i, "tx1")))
+    {
+        let rid = if tx == "tx0" {
+            format!("u0_{i}")
+        } else {
+            format!("u1_{i}")
+        };
+        let got: Vec<(&str, f64)> = rows
+            .iter()
+            .filter(|(r, _, _)| r == &rid)
+            .map(|(_, t, w)| (t.as_str(), *w))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(tx, 1.0)],
+            "unambiguous molecule {rid} must emit exactly one row at weight 1.0"
+        );
     }
     out
+}
+
+/// tx0's gap exactly on the window edge — the atom fires (`<=`, `em.rs:488`).
+fn gaps_at_window() -> Fixture {
+    Fixture {
+        ambiguous_gaps: [(WINDOW, 100); N_AMBIG],
+    }
+}
+
+/// tx0's gap one nucleotide past the edge — the atom must NOT fire.
+fn gaps_one_past_window() -> Fixture {
+    Fixture {
+        ambiguous_gaps: [(WINDOW + 1, 100); N_AMBIG],
+    }
 }
 
 /// Both candidates outside the window — β is on but the atom fires for nobody.
@@ -389,10 +471,17 @@ fn expected_beta_on_tx0() -> f64 {
 
 /// **Test 1 — the M-step fixed point, by hand, with the 5' term off.**
 ///
-/// Pins `p = 4/(4+g)`. This is the assertion the whole file exists for: it
-/// exercises the M-step, which no other test does, and it is independent of the
-/// initialiser, so it can only be satisfied by a solver whose E-step and
-/// M-step agree on a common fixed point.
+/// Pins `p` to the positive root of `2(1−g)·p² + (2+3g)·p − 4 = 0` — the
+/// quadratic, NOT the linear `4/(4+g)` that the first draft of this file used
+/// and that is off by 1.8 pp. See the module docstring: the `2p²` and
+/// `−2p²g` terms only cancel at `g = 1`, so the equation is genuinely
+/// quadratic. If you are reading this and "simplifying" it back to the linear
+/// form, that is the exact regression this file was written to prevent.
+///
+/// This is the assertion the whole file exists for: it exercises the M-step,
+/// which no other test does, and it is independent of the initialiser, so it
+/// can only be satisfied by a solver whose E-step and M-step agree on a common
+/// fixed point.
 #[test]
 fn toy_m_step_fixed_point_is_the_hand_computed_ratio() {
     let out = run(&gaps_none(), BETA_OFF, "beta_off");
@@ -463,24 +552,69 @@ fn toy_five_prime_moves_the_fixed_point_to_the_hand_computed_root() {
     );
 }
 
-/// **Test 3 — the controlled arm: changing ONLY the gap must reproduce the
-/// β = 0 posterior exactly.**
+/// **Test 3 — the gate boundary: β is held ON and only `gap5p` moves, by
+/// one nucleotide, across the window edge.**
 ///
-/// β stays at 1.8 and only the gaps move outside the window, so `ln_5p = 0`
-/// for both candidates and the run must be indistinguishable from β = 0. This
-/// is what makes Test 2 a statement about the 5' term: two runs, one changed
-/// observable, and the null is an exact constant rather than "the number went
-/// down somewhere".
+/// `em.rs:488` reads `if graph.candidate_5p_gap[idx] <= five_prime_window` —
+/// inclusive, and it must be the *candidate's own* gap, not the read's or the
+/// other candidate's. Nothing else in this file pins either. Test 2 shows the
+/// term fires somewhere; this shows it fires in exactly the right place:
+///
+/// ```text
+///   gap5p = (WINDOW, 100)  →  atom fires on tx0  →  p = expected_beta_on_tx0()
+///   gap5p = (WINDOW+1, 100) →  atom fires on nobody →  p = expected_beta_off()
+/// ```
+///
+/// Both expectations are the same closed-form roots Tests 1 and 2 use, so this
+/// is a statement about the gate and not a new constant. The `AS` values are
+/// module constants, so they do not move with the gap and `g` is identical in
+/// both runs — the gate is the only thing that changed.
+///
+/// **Overlap with an existing test, stated rather than hidden.**
+/// `em.rs:2294 test_five_prime_window_is_inclusive_at_20` already pins this
+/// edge, against a hardcoded `0.858_149`, through a one-iteration helper. This
+/// test is kept because it checks the same gate through a different seam — the
+/// full `solve_and_write_profile` loop and a parquet round-trip, against a
+/// *closed-form* root rather than a transcribed decimal, and after convergence
+/// rather than after one step. A hand-typed constant and a hand-derived root
+/// fail independently; the same constant typed twice does not.
+///
+/// **What it catches:** `<` for `<=` (off-by-one at the edge), a window read
+/// as exclusive or off-by-one, the wrong candidate's gap, or a gate applied to
+/// the read instead of the candidate. Each moves one of the two arms onto the
+/// other's answer, and the pair is asymmetric by construction, so the
+/// assertion cannot pass by coincidence.
+/// **What it does not catch:** a neutered term — that puts both arms on
+/// `expected_beta_off()` and only the first half goes red. It is not coverage
+/// of the 5' channel's magnitude; Test 2 is. See the module docstring for the
+/// mutation result.
+///
+/// 1e-9, not 1e-12: both halves assert a *converged fixed point*, so they are
+/// subject to the stopping rule exactly like Test 1.
 #[test]
 fn toy_changing_only_the_gap_reproduces_the_bonus_off_posterior_exactly() {
-    let off = run(&gaps_none(), BETA_OFF, "ctrl_off");
-    let neither = run(&gaps_none(), BETA_ON, "ctrl_neither");
-    for (i, (&(a0, _), &(b0, _))) in off.iter().zip(neither.iter()).enumerate() {
+    let at_edge = run(&gaps_at_window(), BETA_ON, "gate_at");
+    let past_edge = run(&gaps_one_past_window(), BETA_ON, "gate_past");
+    for (i, (&(a0, _), &(b0, _))) in at_edge.iter().zip(past_edge.iter()).enumerate() {
+        assert_close(
+            a0,
+            expected_beta_on_tx0(),
+            1e-9,
+            &format!("molecule {i}: gap5p.tx0 == WINDOW must fire the atom"),
+        );
         assert_close(
             b0,
-            a0,
-            1e-12,
-            &format!("molecule {i}: β on with neither atom firing must equal β off"),
+            expected_beta_off(),
+            1e-9,
+            &format!("molecule {i}: gap5p.tx0 == WINDOW+1 must NOT fire the atom"),
+        );
+        // The two arms must straddle, not merely each hit its own target: a
+        // solver that ignored the gate entirely would satisfy neither, but
+        // this pins that the edge is where the model says it is.
+        assert!(
+            a0 > b0,
+            "molecule {i}: the atom firing must RAISE the posterior on tx0 \
+             (at edge {a0}, past edge {b0})"
         );
     }
 }
