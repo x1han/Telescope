@@ -49,17 +49,34 @@
 //!
 //! # The derivation
 //!
-//! The M-step sets `alpha = w_sum / n_total_molecules` (`em.rs:644`) and
+//! The M-step sets `alpha = w_sum / n_total_molecules` (`em.rs:648`), and
 //! `n_total_molecules = graph.molecules.len()` — it counts the **unambiguous**
-//! reads too, which is the detail the whole result turns on. The two ambiguous
-//! molecules are identical, so each contributes the same `p`:
+//! reads too. The two ambiguous molecules are identical, so each contributes
+//! the same `p`:
 //!
 //! ```text
-//!     E-step:  p  = α₀ / (α₀ + α₁·g)
-//!     M-step:  α₀ = (4 + 2p) / 7        α₁ = 1 − α₀ = (3 − 2p) / 7
+//!     alpha_0 = (4 + 2p) / N        alpha_1 = (3 - 2p) / N      N = 7
 //! ```
 //!
-//! Substituting α in terms of p and clearing denominators:
+//! **The DENOMINATOR cancels, and the NUMERATOR is the load-bearing part.**
+//! `p.alpha` is read at exactly two places (`em.rs:495` and `em.rs:507`), both
+//! inside the E-step softmax, so alpha enters only through
+//! `exp(ln alpha_k + ...) / Σ_j exp(ln alpha_j + ...)` — invariant under a
+//! common rescaling. Substituting gives
+//!
+//! ```text
+//!     p = (4 + 2p) / [(4 + 2p) + (3 - 2p)·g]        <- no N anywhere
+//! ```
+//!
+//! and indeed mutating `/7` to `/2` turns **0 of 4** tests red. What the fixed
+//! point does depend on is the numerator `4 + 2p`, i.e. the `+= 1.0` that each
+//! unambiguous read contributes at `em.rs:605`: changing that to `+= 0.5` turns
+//! **3 of 4** red. So the unambiguous reads matter through the *numerator*, and
+//! this file's expectations would be unchanged if `N` were anything at all.
+//!
+//! The E-step is `p = α₀ / (α₀ + α₁·g)` — alpha as the mixture prior, not as
+//! part of the poly(A) emission. Substituting alpha in terms of p and clearing
+//! denominators:
 //!
 //! ```text
 //!     p·[(4 + 2p) + (3 − 2p)·g] = 4 + 2p
@@ -76,7 +93,7 @@
 //! one.
 //!
 //! **The value is independent of the initialiser.** The init carries `ε = 0.01`
-//! per transcript plus `1/count` per ambiguous read (`em.rs:338-357`), which
+//! per transcript plus `1/count` per ambiguous read (`em.rs:339-359`), which
 //! gives 0.7137, not 0.9337. The M-step washes it out. A test that pins the
 //! quadratic root is therefore testing the fixed-point equation itself, and
 //! would survive changing ε tomorrow.
@@ -96,19 +113,29 @@
 //!
 //! # What each test can and cannot detect
 //!
-//! The mutation result (neutering `ln_5p` and re-running) is the only honest
-//! answer to "is this a gate or decoration", and it is recorded in
-//! `workspace/comms/2026-10-02-toy-em/`. Neutering turns **Test 2** red by
-//! 5.6e-2 and leaves the other three green. That is not a weakness, but it
-//! does mean only one test is load-bearing against *that* mutation, so each
-//! test's docstring below states which mutation it is aimed at:
+//! The only honest answer to "is this a gate or decoration" is to mutate the
+//! solver and re-run, so that is what was done, in isolated git worktrees with
+//! their own `CARGO_TARGET_DIR` so the primary tree is never written to.
+//! Measured:
+//!
+//! | mutation | turns red |
+//! |---|---|
+//! | `ln_5p` neutered (`em.rs:488` → always 0) | tests 2 and 3 |
+//! | window gate `<=` → `<` | test 3, and `em.rs:2294` |
+//! | M-step numerator `+= 1.0` → `+= 0.5` (`em.rs:605`) | tests 1, 2, 3 |
+//! | M-step denominator `/7` → `/2` (`em.rs:648`) | **nothing** — see the scale-invariance note above |
+//! | output-stage renormalisation removed (`em.rs:789`) | **nothing** — at `min_weight = 0` the retained sum is already 1 to ~1e-16; covered by the `em.rs` unit tests instead |
+//!
+//! So: each test detects a real class, no test detects everything, and two
+//! whole classes are invisible to this file by construction. Both are stated
+//! rather than left for a reader to assume.
 //!
 //! | test | detects |
 //! |---|---|
-//! | 1 | any E-step/M-step disagreement; initialiser drift |
+//! | 1 | a change to the M-step's numerator; initialiser drift |
 //! | 2 | a neutered or wrong-magnitude `ln_5p` |
 //! | 3 | the window gate being wrong at its own edge (`<` vs `<=`, wrong candidate's gap) |
-//! | 4 | `ln_5p` leaking into the normalisation or the `max_ll` shift |
+//! | 4 | an **asymmetric** leak of `ln_5p` into the normalisation or the `max_ll` shift — a leak that is uniform across candidates still cancels in the softmax, which is why this test is green under both a neuter and a gate-always-on |
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -335,8 +362,8 @@ fn run(fx: &Fixture, beta: f64, tag: &str) -> Vec<(f64, f64)> {
     let _ = std::fs::remove_file(&profile);
 
     // Rows are looked up BY READ ID, not by position. The profile happens to
-    // write the unambiguous reads first (`em.rs:672` then the ambiguous block
-    // at 704), but that ordering is an implementation detail and it is
+    // write the unambiguous reads first (`em.rs:673` then the ambiguous block
+    // at 715), but that ordering is an implementation detail and it is
     // conditional: an unambiguous read whose transcript is missing from the
     // emission, or `is_polyA_competent == false`, is `continue`d without
     // emitting a row. A positional slice would then be off by one and quietly
@@ -496,7 +523,13 @@ fn toy_m_step_fixed_point_is_the_hand_computed_ratio() {
             p0 + p1,
             1.0,
             1e-12,
-            &format!("molecule {i} must renormalise to 1"),
+            &format!(
+                "molecule {i}: the emitted weights must sum to 1. NOTE this does NOT \
+                 test the output-stage renormalisation -- at min_weight = 0 the \
+                 retained sum is already 1 to ~1e-16, so deleting `w / retained_sum` \
+                 leaves this green. It is a sanity check on the emit path, not \
+                 coverage of that code; see the module docstring."
+            ),
         );
     }
 }
@@ -572,12 +605,22 @@ fn toy_five_prime_moves_the_fixed_point_to_the_hand_computed_root() {
 ///
 /// **Overlap with an existing test, stated rather than hidden.**
 /// `em.rs:2294 test_five_prime_window_is_inclusive_at_20` already pins this
-/// edge, against a hardcoded `0.858_149`, through a one-iteration helper. This
-/// test is kept because it checks the same gate through a different seam — the
-/// full `solve_and_write_profile` loop and a parquet round-trip, against a
-/// *closed-form* root rather than a transcribed decimal, and after convergence
-/// rather than after one step. A hand-typed constant and a hand-derived root
-/// fail independently; the same constant typed twice does not.
+/// edge, and both were kept — settled by mutation rather than by taste. The
+/// `<=` → `<` mutation turns **both** red, so neither is redundant. Three
+/// concrete differences:
+///
+/// 1. It runs **after convergence**. The existing pair uses `max_iter = 1`
+///    (`em.rs:2143`), so it pins the gate in the initialiser's neighbourhood —
+///    re-testing a `max_iter = 1` property inside a file whose founding
+///    observation is that `max_iter = 1` never reaches the fixed point would add
+///    nothing; re-testing it AT the fixed point does.
+/// 2. Its "must not fire" arm pins **0.5**, the degenerate flat answer, which an
+///    always-on gate, an always-off gate, a correct gate, and a solver that
+///    never reads `five_prime_weight` all satisfy. This test's corresponding arm
+///    pins 0.933695 where firing would give 0.989727 — a 5.6e-2 separation, so
+///    a wrong gate cannot land on the right number.
+/// 3. It is an integration test of the public API; `two_candidate_posteriors` is
+///    private to `src/em.rs` and cannot run through the parquet round-trip.
 ///
 /// **What it catches:** `<` for `<=` (off-by-one at the edge), a window read
 /// as exclusive or off-by-one, the wrong candidate's gap, or a gate applied to
