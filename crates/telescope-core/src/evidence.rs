@@ -126,6 +126,42 @@ pub enum PolyASource {
     None,
 }
 
+/// Parse the `--polyA-source` CLI value into a [`PolyASource`].
+///
+/// Three forms, exactly as the expert ruling specifies them:
+///   `bam_tag:pt`     Dorado's native tail-length tag (the historical default)
+///   `tsv:<path>`     `read_id<TAB>poly_a_len`, the tailfindr / nanopolish shape
+///   `none`           declared-absent; alignment-only, `poly_a_weight` forced 0
+///
+/// The tag is a parameter rather than the literal `pt` so a re-basecaller that
+/// emits a different tag can be used without a code change — but the ruling
+/// names `pt`, and that is the default, because it is the tag the 10-sample
+/// cohort actually carries.
+pub fn parse_poly_a_source(spec: &str) -> Result<PolyASource> {
+    let spec = spec.trim();
+    if spec == "none" {
+        return Ok(PolyASource::None);
+    }
+    if let Some(path) = spec.strip_prefix("tsv:") {
+        if path.is_empty() {
+            anyhow::bail!("--polyA-source tsv: needs a path, e.g. tsv:tailfindr.tsv");
+        }
+        return Ok(PolyASource::Tsv(std::path::PathBuf::from(path)));
+    }
+    if let Some(tag) = spec.strip_prefix("bam_tag:") {
+        let bytes = tag.as_bytes();
+        // SAM tags are exactly two alphanumeric characters. Checking here
+        // rather than unwrapping keeps a typo from a panic in a long batch run.
+        if bytes.len() != 2 || !bytes.iter().all(u8::is_ascii_alphanumeric) {
+            anyhow::bail!("--polyA-source bam_tag: needs a 2-character SAM tag, got `{tag}`");
+        }
+        return Ok(PolyASource::BamTag(Tag::from([bytes[0], bytes[1]])));
+    }
+    anyhow::bail!(
+        "--polyA-source must be one of `bam_tag:<TAG>`, `tsv:<path>` or `none`; got `{spec}`"
+    );
+}
+
 /// Number of records scanned before deciding a poly(A) source is globally
 /// absent. The ruling specifies 10,000; it is a sampling depth, not a
 /// threshold on the data.
@@ -1235,6 +1271,50 @@ pub mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
+
+    /// The three CLI spellings, and the rejections. The spelling is load-bearing
+    /// beyond cosmetics: the guard's FATAL message quotes `--polyA-source` to
+    /// the user, so a parser that only accepted some spelling would produce an
+    /// error naming a flag that cannot be typed.
+    #[test]
+    fn test_parse_poly_a_source_accepts_the_three_forms_and_rejects_the_rest() {
+        assert_eq!(
+            parse_poly_a_source("bam_tag:pt").unwrap(),
+            PolyASource::BamTag(TAG_PT)
+        );
+        // The tag is a parameter, not a literal, so a re-basecaller's tag works
+        // without a code change.
+        assert_eq!(
+            parse_poly_a_source("bam_tag:Zt").unwrap(),
+            PolyASource::BamTag(Tag::from(*b"Zt"))
+        );
+        assert_eq!(
+            parse_poly_a_source("tsv:/tmp/tailfindr.tsv").unwrap(),
+            PolyASource::Tsv(std::path::PathBuf::from("/tmp/tailfindr.tsv"))
+        );
+        assert_eq!(parse_poly_a_source(" none ").unwrap(), PolyASource::None);
+
+        // Every one of these must be a message naming the flag, not a panic and
+        // not a silent fallback to the default -- a typo that quietly ran with
+        // `bam_tag:pt` would reintroduce exactly the fail-quiet this exists to
+        // remove.
+        for bad in [
+            "",
+            "pt",
+            "bam_tag:",
+            "bam_tag:p",
+            "bam_tag:pts",
+            "tsv:",
+            "BAM_TAG:pt",
+        ] {
+            let err = parse_poly_a_source(bad).expect_err(&format!("{bad:?} must be rejected"));
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("--polyA-source"),
+                "the rejection for {bad:?} must name the flag to retype, got: {msg}"
+            );
+        }
+    }
 
     /// Restored after commit 8ee1077 deleted it without saying so, and inverted
     /// per the expert ruling: the absence of poly(A) is a named error, not an

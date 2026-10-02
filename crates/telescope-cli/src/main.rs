@@ -15,6 +15,14 @@ use clap::{Parser, Subcommand};
 use telescope_core::emission_model::FallbackConfig;
 use telescope_core::{anchor_builder, em, emission_model, evidence, resolver, summary};
 
+/// The `--polyA-source` argument, shared verbatim by `extract-evidence` and
+/// `quant` so the two subcommands cannot drift apart.
+const POLY_A_SOURCE_HELP: &str = "Where per-read poly(A) length comes from: \
+     `bam_tag:pt` (Dorado native, default), `tsv:<path>` (read_id<TAB>len from \
+     tailfindr/nanopolish), or `none` (declared-absent; forces \
+     `--poly-a-weight 0`). A BAM carrying no poly(A) at all is a hard error, \
+     not an empty graph.";
+
 /// Default λ of the F-EM-4 alignment term `ln A_rk = (AS_rk − max_j AS_rj)/λ`.
 /// Referenced by both clap's default and the `quant` telemetry so the shipped
 /// default and the claim printed next to it cannot drift apart. Provenance is
@@ -134,6 +142,19 @@ enum Cmd {
         /// 3' TES boundary slack in bp (default 35).
         #[arg(long, default_value_t = 35)]
         tes_slack: usize,
+
+        // The ruling specifies this spelling, and the FATAL message in
+        // `evidence.rs` quotes it -- the flag and the error that names it have
+        // to agree, or the error tells the user to type something that does not
+        // exist. The lowercase form is accepted as an alias because the
+        // neighbouring `--polya-parquet` sets that precedent.
+        #[arg(
+            long = "polyA-source",
+            alias = "polya-source",
+            default_value = "bam_tag:pt",
+            help = POLY_A_SOURCE_HELP
+        )]
+        poly_a_source: String,
     },
 
     /// Modules 2 + 3: BAM → evidence → TEL-EM profile.
@@ -157,6 +178,19 @@ enum Cmd {
         /// 3' TES boundary slack in bp (default 35).
         #[arg(long, default_value_t = 35)]
         tes_slack: usize,
+
+        // The ruling specifies this spelling, and the FATAL message in
+        // `evidence.rs` quotes it -- the flag and the error that names it have
+        // to agree, or the error tells the user to type something that does not
+        // exist. The lowercase form is accepted as an alias because the
+        // neighbouring `--polya-parquet` sets that precedent.
+        #[arg(
+            long = "polyA-source",
+            alias = "polya-source",
+            default_value = "bam_tag:pt",
+            help = POLY_A_SOURCE_HELP
+        )]
+        poly_a_source: String,
 
         /// EM log-likelihood convergence tolerance (per-molecule average LL).
         #[arg(long, default_value_t = 1e-6)]
@@ -420,11 +454,17 @@ fn main() -> Result<()> {
             eprintln!("[telescope] done.");
             Ok(())
         }
-        Cmd::ExtractEvidence { bam, tes_slack } => {
+        Cmd::ExtractEvidence {
+            bam,
+            tes_slack,
+            poly_a_source,
+        } => {
+            let poly_a = evidence::parse_poly_a_source(&poly_a_source)?;
             eprintln!("[telescope] Module 2: extracting single-molecule evidence");
             eprintln!("  bam:        {}", bam.display());
             eprintln!("  tes_slack:  {} bp", tes_slack);
-            let graph = evidence::extract_evidence(&bam, tes_slack)
+            eprintln!("  polyA-src:  {}", poly_a_source);
+            let graph = evidence::extract_evidence_with(&bam, tes_slack, &poly_a)
                 .context("Module 2 extract_evidence failed")?;
             eprintln!("[telescope]  molecules:        {}", graph.molecules.len());
             eprintln!(
@@ -464,8 +504,27 @@ fn main() -> Result<()> {
             prune_max_delta_as,
             min_weight,
             tx_id_mapping,
+            poly_a_source,
             debug,
         } => {
+            let poly_a = evidence::parse_poly_a_source(&poly_a_source)?;
+            // `--polyA-source none` fills `log_pal` with a placeholder, not a
+            // measurement. The ruling requires the inconsistent pairing to be
+            // UNEXPRESSIBLE rather than merely warned about, so the weight is
+            // forced here instead of erroring on a value the user may have set
+            // for a different reason (a global default, a wrapper script).
+            let poly_a_weight = if matches!(poly_a, evidence::PolyASource::None) {
+                if poly_a_weight != 0.0 {
+                    eprintln!(
+                        "[telescope] WARNING: --polyA-source none forces --poly-a-weight 0 \
+                         (was {poly_a_weight}); the placeholder is not a measurement and \
+                         would otherwise enter the E-step as a constant emission."
+                    );
+                }
+                0.0
+            } else {
+                poly_a_weight
+            };
             if !(aln_weight_lambda > 0.0) {
                 anyhow::bail!(
                     "--aln-weight-lambda must be > 0 (got {}); it scales \
@@ -558,7 +617,8 @@ fn main() -> Result<()> {
             };
 
             eprintln!("[telescope]  M2: extract evidence…");
-            let mut graph = evidence::extract_evidence(&bam, tes_slack)
+            eprintln!("[telescope]  polyA-src:  {}", poly_a_source);
+            let mut graph = evidence::extract_evidence_with(&bam, tes_slack, &poly_a)
                 .context("Module 2 extract_evidence failed")?;
             // Apply optional id mapping to transcript names (BAM @SQ → emission parquet keys).
             if let Some(ref map) = id_mapping {
