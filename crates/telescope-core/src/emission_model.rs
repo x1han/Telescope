@@ -74,12 +74,44 @@ use parquet::file::properties::WriterProperties;
 /// `sigma^2(m+1) = 0 / (w_rk + 5) = 0`, locking sigma at 0 and
 /// starving subsequent E-steps of the Gaussian likelihood.
 ///
-/// We pin a numerical floor of 0.04 in `log2(PAL)` space, which
-/// corresponds to a per-transcript CV of ~15% — roughly the ONT
-/// physical measurement noise floor. This is consistent with
-/// `alevin-fry`'s `MIN_OUTPUT_ALPHA=0.01` philosophy of always
-/// keeping a non-degenerate posterior.
-pub const MIN_COHORT_VARIANCE: f64 = 0.04;
+/// The floor is a **physical** quantity, not a numerical convenience, and the
+/// name says so. Renamed from `MIN_COHORT_VARIANCE` on 2026-10-02 by expert
+/// ruling, which required the constant to carry its justification rather than
+/// a bare number.
+///
+/// # Why 0.04
+///
+/// The floor lives in `log2(PAL)` space — `evidence.rs` computes
+/// `log_pal = (poly_a_len as f32).log2()`, so `y` is base 2 throughout. With
+/// `sigma^2 = 0.04` we have `sigma = 0.20` in log2 units, and a lognormal with
+/// log2-scale sd `sigma` has a physical CV of
+///
+/// ```text
+///     CV = 2^sigma - 1 = 2^0.20 - 1 = 0.1487
+/// ```
+///
+/// i.e. **~15%**. That matches the instrument: a poly(A) tail measured by
+/// nanopore current (Dorado, tailfindr, Nanopolish) carries a signal-noise
+/// floor of roughly +/- 5-10 nt, and on a 60-80 nt tail that is a 10-15% CV.
+/// The floor is that floor, expressed in the units the model works in.
+///
+/// # Why it must not be removed
+///
+/// The inverse-gamma prior already prevents the *posterior mean* from
+/// collapsing, so the floor is partly redundant with it — a MAP estimate under
+/// `nu_0`/`beta_0` cannot reach zero no matter how few reads land on a
+/// transcript. What the prior does not do is stop the LIKELIHOOD from becoming
+/// degenerate: with `sigma^2 -> 0` and `y_r == mu_k` exactly, the Gaussian
+/// density is unbounded, and a single coincidental read can dominate the
+/// E-step for that transcript.
+///
+/// This is the same philosophy as `alevin-fry`'s `MIN_OUTPUT_ALPHA = 0.01`:
+/// always keep the posterior non-degenerate, whatever the data does.
+///
+/// Renamed, NOT removed. The removal argument is a testable claim and is
+/// recorded as one rather than settled by assertion — see
+/// `workspace/notes/EXPERIMENT.md`, 2026-10-02.
+pub const INSTRUMENTAL_PAL_NOISE_FLOOR: f64 = 0.04;
 
 /// MAD-to-sigma scale factor for normal-consistency.
 ///
@@ -220,7 +252,7 @@ pub fn output_schema() -> Arc<Schema> {
 /// Reads `aidrs.transcript_polyA_len.parquet` row-by-row (chunked),
 /// joins each row's `TrID` against the assessment TSV to get
 /// `polyA_frac` and `is_polyA_competent`, computes the log2(pal)
-/// mean/variance per transcript, applies `MIN_COHORT_VARIANCE`
+/// mean/variance per transcript, applies `INSTRUMENTAL_PAL_NOISE_FLOOR`
 /// floor, and writes the 7-column output schema above.
 pub fn build_emission_parquet<P: AsRef<Path>>(
     poly_a_parquet_path: P,
@@ -303,12 +335,12 @@ pub fn build_emission_parquet<P: AsRef<Path>>(
                     let sq_diff_sum: f64 = log_lens.iter().map(|&x| (x - mean).powi(2)).sum();
                     sq_diff_sum / ((n_flnc - 1) as f64) // sample variance
                 } else {
-                    MIN_COHORT_VARIANCE
+                    INSTRUMENTAL_PAL_NOISE_FLOOR
                 };
-                (mean, variance.max(MIN_COHORT_VARIANCE))
+                (mean, variance.max(INSTRUMENTAL_PAL_NOISE_FLOOR))
             } else {
                 // State 2/3 -> emit placeholder mu=0 and floored sigma.
-                (0.0, MIN_COHORT_VARIANCE)
+                (0.0, INSTRUMENTAL_PAL_NOISE_FLOOR)
             };
 
             tr_id_builder.append_value(tr_id);
@@ -385,14 +417,14 @@ impl TxAccumulator {
 /// Both AIDRS and Universal modes produce identical shape:
 /// `mu` is the arithmetic mean (L1) or median (L3) of
 /// `log2(PAL)`; `sigma2` is the sample variance (L1/L2) or
-/// `(MAD * 1.4826)^2` (L3), floored at `MIN_COHORT_VARIANCE`.
+/// `(MAD * 1.4826)^2` (L3), floored at `INSTRUMENTAL_PAL_NOISE_FLOOR`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct LogNormalFit {
     mu: f64,
     sigma2: f64,
 }
 
-/// Fit `(mean, sample variance floored at MIN_COHORT_VARIANCE)`
+/// Fit `(mean, sample variance floored at INSTRUMENTAL_PAL_NOISE_FLOOR)`
 /// from a slice of `log2(PAL)` values. Returns `None` iff
 /// `values` is empty.
 fn fit_log_normal(values: &[f64]) -> Option<LogNormalFit> {
@@ -405,17 +437,17 @@ fn fit_log_normal(values: &[f64]) -> Option<LogNormalFit> {
         let sq_diff_sum: f64 = values.iter().map(|&x| (x - mean).powi(2)).sum();
         sq_diff_sum / ((n - 1) as f64) // Bessel-corrected sample variance
     } else {
-        MIN_COHORT_VARIANCE
+        INSTRUMENTAL_PAL_NOISE_FLOOR
     };
     Some(LogNormalFit {
         mu: mean,
-        sigma2: variance.max(MIN_COHORT_VARIANCE),
+        sigma2: variance.max(INSTRUMENTAL_PAL_NOISE_FLOOR),
     })
 }
 
 /// Cohort-level robust fit: `mu` = median(log2(PAL)),
 /// `sigma2` = `(MAD * 1.4826)^2`, floored at
-/// `MIN_COHORT_VARIANCE`. Returns `None` iff `values` is empty.
+/// `INSTRUMENTAL_PAL_NOISE_FLOOR`. Returns `None` iff `values` is empty.
 fn cohort_log_normal_fit(values: &[f64]) -> Option<LogNormalFit> {
     let n = values.len();
     if n == 0 {
@@ -438,7 +470,7 @@ fn cohort_log_normal_fit(values: &[f64]) -> Option<LogNormalFit> {
     };
 
     let sigma = MAD_TO_SIGMA * mad;
-    let sigma2 = (sigma * sigma).max(MIN_COHORT_VARIANCE);
+    let sigma2 = (sigma * sigma).max(INSTRUMENTAL_PAL_NOISE_FLOOR);
     Some(LogNormalFit { mu: median, sigma2 })
 }
 
@@ -724,7 +756,7 @@ mod tests {
     #[test]
     fn min_cohort_variance_value() {
         // Pinned in spec F3 / spec-self-audit-v0.1.3 R1.
-        assert!((MIN_COHORT_VARIANCE - 0.04).abs() < f64::EPSILON);
+        assert!((INSTRUMENTAL_PAL_NOISE_FLOOR - 0.04).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1140,7 +1172,7 @@ mod tests {
                 .sum();
             sq / (expected_l1_vals.len() as f64 - 1.0)
         }
-        .max(MIN_COHORT_VARIANCE);
+        .max(INSTRUMENTAL_PAL_NOISE_FLOOR);
         assert!((r1.5 - exp_mu_1).abs() < 1e-12, "L1 mu for tx_1");
         assert!((r1.6 - exp_var_1).abs() < 1e-12, "L1 sigma2 for tx_1");
 
@@ -1163,7 +1195,7 @@ mod tests {
             let sq: f64 = gene_a_vals.iter().map(|&x| (x - exp_mu_g).powi(2)).sum();
             sq / (gene_a_vals.len() as f64 - 1.0)
         }
-        .max(MIN_COHORT_VARIANCE);
+        .max(INSTRUMENTAL_PAL_NOISE_FLOOR);
         assert!((r2.5 - exp_mu_g).abs() < 1e-12, "L2 mu == gene_A mean");
         assert!(
             (r2.6 - exp_var_g).abs() < 1e-12,
@@ -1190,7 +1222,9 @@ mod tests {
         } else {
             0.5 * (devs[devs.len() / 2 - 1] + devs[devs.len() / 2])
         };
-        let exp_sigma2_c = (MAD_TO_SIGMA * mad).powi(2).max(MIN_COHORT_VARIANCE);
+        let exp_sigma2_c = (MAD_TO_SIGMA * mad)
+            .powi(2)
+            .max(INSTRUMENTAL_PAL_NOISE_FLOOR);
         assert!((r4.5 - exp_mu_c).abs() < 1e-12, "L3 mu == cohort median");
         assert!(
             (r4.6 - exp_sigma2_c).abs() < 1e-12,

@@ -33,7 +33,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use rayon::prelude::*;
 
-use crate::emission_model::MIN_COHORT_VARIANCE;
+use crate::emission_model::INSTRUMENTAL_PAL_NOISE_FLOOR;
 use crate::evidence::{FlatEvidenceGraph, MoleculeEvidence};
 
 /// Per-transcript parameters loaded from `telescope.emission.parquet`.
@@ -637,7 +637,7 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
                 let sq_dev_new = (s2 - 2.0 * p.mu * s1 + p.mu * p.mu * w_sum).max(0.0);
                 p.sigma2 =
                     (sq_dev_new + 2.0 * beta_0 * p.sigma2_cohort) / (w_sum + 2.0 * nu_0 + 3.0);
-                p.sigma2 = p.sigma2.max(MIN_COHORT_VARIANCE);
+                p.sigma2 = p.sigma2.max(INSTRUMENTAL_PAL_NOISE_FLOOR);
 
                 // STEP 3: π update.
                 // P1 fix: defensive check for n_total_molecules == 0 (BAM
