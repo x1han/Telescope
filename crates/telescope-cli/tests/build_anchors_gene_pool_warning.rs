@@ -125,9 +125,22 @@ fn build_anchors_is_silent_when_the_pool_has_real_gene_structure() {
     let stderr = run_build_anchors(&bam, &out, Some(&tsv));
     cleanup(&[&bam, &out, &tsv]);
 
+    // Assert on a string the message ACTUALLY emits. An earlier version of this
+    // test asserted the absence of "STRUCTURALLY UNREACHABLE" — a phrase that
+    // was then removed from the message to scope the claim to the default
+    // thresholds. That silently turned the guard into a tautology: forcing the
+    // warning to fire in both configurations left this test green. A negative
+    // assertion is only worth anything if the string it forbids is one the
+    // positive case really produces. "NO gene structure" is that string, and
+    // the positive test above already pins its presence.
     assert!(
-        !stderr.contains("STRUCTURALLY UNREACHABLE"),
+        !stderr.contains("NO gene structure"),
         "a run WITH --tx-to-gene supplying real structure must not warn; got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("[telescope][WARN]"),
+        "no warning of any kind may be emitted for a pool with real gene \
+         structure; got:\n{stderr}"
     );
     assert!(
         stderr.contains("tx_to_gene entries: 3"),

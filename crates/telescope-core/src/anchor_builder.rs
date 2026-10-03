@@ -147,8 +147,17 @@ fn pool_gene_tx_cardinality(anchors: &[AnchorRecord]) -> (usize, usize) {
 ///
 /// WHY THIS IS EXACT, NOT A HEURISTIC. The degenerate state is precisely
 /// `distinct gene_id == distinct transcript_id`, and the consequence follows
-/// from that alone: a gene's pool IS its own transcript's pool, so no two
-/// transcripts ever share fitted poly(A) parameters through the L2 tier.
+/// from that alone: every gene holds exactly one transcript's anchors, so no
+/// two transcripts ever share fitted poly(A) parameters through the L2 tier.
+///
+/// Note what the counts do and do not prove. They show the gene -> transcript
+/// relation is INJECTIVE; they do not show `gene_id` is literally the
+/// `transcript_id` string. A legitimate 1:1 map that renames (`T1 -> G1`) is
+/// equally degenerate and equally deserves the warning, so the message must not
+/// claim the ids were equal — for that user that would be false. The repo's own
+/// `test_detector_is_exactly_equality_of_the_two_distinct_counts` builds
+/// `G1`/`T1` and expects a warning, which is the case that makes this a real
+/// hazard rather than a theoretical one.
 ///
 /// The thresholds are `build-emission` flags that this function cannot see, so
 /// the message must not state an unconditional claim about them. At the
@@ -180,8 +189,8 @@ pub fn degenerate_gene_pool_warning(
     }
     Some(format!(
         "[telescope][WARN] anchor pool has NO gene structure: {} distinct \
-         transcript_id == {} distinct gene_id (gene_id was set equal to \
-         transcript_id on every row).\n\
+         transcript_id == {} distinct gene_id, i.e. every gene here has \
+         exactly one transcript.\n\
          [telescope][WARN]   Consequence: every gene's pool IS its own \
          transcript's pool, so no two transcripts ever share fitted poly(A) \
          parameters through the L2 gene-level tier. At the DEFAULT thresholds \
