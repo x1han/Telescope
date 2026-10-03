@@ -2224,6 +2224,133 @@ mod tests {
         }
     }
 
+    /// The M-step's `alpha` denominator is `n_total_molecules`, and that is
+    /// OBSERVABLE even though nothing downstream can see the scale.
+    ///
+    /// `alpha` is a mixture weight vector, and `p.alpha = w_sum /
+    /// n_total_molecules` is what makes it one: every molecule contributes
+    /// total weight 1 (an unambiguous read contributes exactly 1.0; an
+    /// ambiguous read's posteriors sum to 1 by construction of the
+    /// log-sum-exp), so `sum_k w_sum_k == n_total_molecules` and the updated
+    /// `alpha` sums to 1 across transcripts.
+    ///
+    /// This is the gap the mutation battery walked into. Its M5 mutation
+    /// changed the divisor from the total molecule count to that count minus
+    /// 5.0, and left all four `toy_analytic_em` tests green, so the battery
+    /// concluded "the DENOMINATOR is not [load-bearing] (alpha enters only
+    /// through the E-step softmax, so any positive rescaling of it is
+    /// invisible to every posterior)". Both halves of that are right and
+    /// neither is sufficient: `N / (N - 5)` IS a uniform rescale, so the
+    /// softmax genuinely cannot see it, and `alpha` is written to no output
+    /// parquet, so no emitted number can see it. But the rescale is uniform
+    /// only BECAUSE the divisor is the total molecule count. The same rescale
+    /// leaves the vector summing to `N / (N - 5)` = 1.1724 on this fixture
+    /// instead of 1.
+    ///
+    /// (The mutation's exact source text is deliberately NOT quoted here: the
+    /// battery's patcher requires its search string to match exactly once, and
+    /// a doc comment restating it would make M5 abort with "PATCH DID NOT
+    /// APPLY, count = 2". See `mutation_battery.sh`.)
+    ///
+    /// `output_emission_params` is what makes the vector readable at all; the
+    /// comment on that parameter records the same gap class ("mu/sigma2 were
+    /// previously unobservable ... which is exactly why the `poly_a_weight ==
+    /// 0` M-step bypass was untestable when it was added"). Reaching for a
+    /// public out-param rather than a golden posterior is deliberate: the
+    /// posteriors cannot pin this at any `alpha` scale, so a test that asserts
+    /// on them would be the fourth green test the battery already found.
+    #[test]
+    fn test_m_step_alpha_is_normalised_by_the_total_molecule_count() {
+        let log_pal = (100.0_f32).log2();
+        let emission = scratch("alpha_norm_emission.parquet");
+        let profile = scratch("alpha_norm_profile.parquet");
+        write_test_emission(
+            &emission,
+            &[
+                ("tx0", "gene0", log_pal as f64, 0.04),
+                ("tx1", "gene1", log_pal as f64, 0.04),
+            ],
+        );
+
+        // 30 unambiguous molecules on tx0, 3 on tx1, 1 ambiguous PROBE: 34
+        // molecules over 2 transcripts, every one of them with at least one
+        // candidate that has emission parameters. That last property is what
+        // the sum-to-1 invariant rests on -- a molecule whose every candidate
+        // is missing from the emission parquet contributes 0 to `accum_w` while
+        // still counting in `n_total_molecules`, and would legitimately pull
+        // the sum below 1.
+        let mut params = Vec::new();
+        solve_and_write_profile(
+            prior_biased_graph(),
+            &emission,
+            "TEST",
+            &profile,
+            1e-9,
+            5,
+            100.0,
+            FIVE_PRIME_OFF,
+            POLY_A_ON,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
+            None,
+            Some(&mut params),
+            None,
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&emission);
+        let _ = std::fs::remove_file(&profile);
+
+        let alpha: Vec<f64> = params
+            .iter()
+            .map(|p| {
+                p.as_ref()
+                    .expect("both transcripts are in the emission")
+                    .alpha
+            })
+            .collect();
+
+        // CONTROL, and it has to come first: `init_counts / total_init` ALSO
+        // sums to 1, so the assertion below would pass on a solver whose
+        // M-step never ran. The init prior here is Laplace eps=0.01 plus the
+        // unambiguous counts plus the PROBE's 1/2 share, over both transcripts.
+        let init_alpha: Vec<f64> = [30.01 + 0.5, 3.01 + 0.5]
+            .iter()
+            .map(|&c| c / (30.01 + 3.01 + 1.0))
+            .collect();
+        assert!(
+            alpha
+                .iter()
+                .zip(&init_alpha)
+                .any(|(a, i)| (a - i).abs() > 1e-6),
+            "CONTROL: alpha must have been RE-ESTIMATED by the M-step, not left \
+             at its init value. alpha={alpha:?} init={init_alpha:?}. Without this \
+             the sum assertion below would be satisfied by the initialiser."
+        );
+
+        let sum: f64 = alpha.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-12,
+            "alpha is a mixture weight vector: the M-step divides by the TOTAL \
+             molecule count (34 here) precisely so the vector sums to 1. It sums \
+             to {sum}. A divisor of `n_total_molecules - 5.0` would rescale every \
+             component by 34/29 = {:.4} and leave the vector unnormalised, which is \
+             invisible to the E-step softmax and to every emitted column but is \
+             still a wrong abundance.",
+            34.0 / 29.0
+        );
+
+        // The numerator is the unambiguous counts plus the PROBE's soft share,
+        // so tx0 (30) must stay above tx1 (3) by a wide margin: the PROBE can
+        // move at most 1.0 of weight between them. Pins that the M-step read the
+        // same `accum_w` its denominator is normalised by.
+        assert!(
+            alpha[0] > alpha[1] && (alpha[0] - alpha[1]).abs() > 0.5,
+            "tx0 carries 30 unambiguous molecules against tx1's 3, so alpha must \
+             stay strongly ordered: {alpha:?}"
+        );
+    }
+
     /// The abundance prior `ln alpha` is the MIXTURE prior, not part of the
     /// poly(A) emission, so it must survive `poly_a_weight = 0`.
     ///
@@ -2552,6 +2679,175 @@ mod tests {
         // loses the incompetent one silently. Worth a counter; out of scope
         // for a test-only change, flagged to the reviewer instead.
         let _ = stats;
+    }
+
+    /// The output stage's `retained_sum` denominator, with ALL THREE of the
+    /// routes by which a candidate can leave `weights` or the emitted rows
+    /// present at once.
+    ///
+    /// `retained_sum` sums `{w >= min_weight}` over `weights`, and the emit
+    /// loop then drops rows that are `!p.is_competent` or missing from
+    /// `params`. Those two later filters are currently unreachable -- the
+    /// E-step has already pushed incompetent candidates as `-inf` (and
+    /// `filter(ll > -inf)` removed them) and `if let Some(ref p) = params[…]`
+    /// SKIPS a candidate with no emission row instead of pushing anything. So
+    /// the denominator is right only because the E-step and the emit loop
+    /// agree on the candidate set, and that agreement is what this fixture
+    /// exercises end to end.
+    ///
+    /// Why this is not a third copy of the two tests above. Each of those
+    /// isolates ONE route on a two-candidate read whose survivor absorbs the
+    /// entire posterior, so the per-row value is 1.0 either way and only the
+    /// row COUNT is load-bearing. Here the surviving mass is SPLIT, so the
+    /// denominator is pinned by the per-row values as well as by the sum, and
+    /// all three exclusion routes are in the same read:
+    ///
+    /// | candidate | route out                                    | weight |
+    /// |-----------|----------------------------------------------|--------|
+    /// | `tx0`     | retained                                    | 0.80   |
+    /// | `tx1`     | retained                                    | 0.15   |
+    /// | `tx2`     | `w = 0.005 < min_weight` -> TRUNCATED        | 0.005  |
+    /// | `tx3`     | `is_polyA_competent = false` -> E-step `-inf`| 1.00   |
+    /// | `tx4`     | no emission row -> E-step `if let Some` skip | 1.00   |
+    ///
+    /// The handicaps are `mu` offsets sized so `(y − mu)² / (2σ²)` differs by
+    /// exactly `ln(0.80/0.15)` and `ln(0.80/0.005)` nats. All five candidates
+    /// carry EQUAL `AS`, so `ln_a = 0` for all and the split is the emission
+    /// term alone. `max_iter = 1` freezes the posterior to the E-step that ran
+    /// on the initial (uniform) prior, so the expected values below are exact
+    /// rather than a property of where the EM happened to converge.
+    ///
+    /// Mutation targets, both confirmed to turn this red:
+    ///   * the denominator summing over ALL weights (`*w >= 0.0`) leaves the
+    ///     two survivors at 0.8377 / 0.1571 and the read summing to 0.9948;
+    ///   * the E-step's competence mask bypassed lets `tx3` -- the FAVOURED
+    ///     candidate, by construction -- take ~0.98 of the mass into
+    ///     `retained_sum` and into a row, dropping `tx0` to ~0.0067. The sum
+    ///     stays 1.0 under that mutation, which is why the per-row values are
+    ///     asserted and not just the sum.
+    #[test]
+    fn test_retained_sum_covers_exactly_the_rows_emitted_when_all_three_exclusions_fire() {
+        let log_pal = (100.0_f32).log2();
+        let sigma2 = 0.04;
+        let emission = scratch("retained_emission.parquet");
+        let profile = scratch("retained_profile.parquet");
+        // tx4 is deliberately ABSENT: the E-step's `if let Some(ref p) =
+        // params[tx_id]` has nothing to score it with and skips it outright.
+        write_test_emission_with_competence(
+            &emission,
+            &[
+                (
+                    "tx0",
+                    "gene0",
+                    log_pal as f64 - (2.0_f64 * sigma2 * 5.0).sqrt(),
+                    sigma2,
+                    true,
+                ),
+                (
+                    "tx1",
+                    "gene1",
+                    log_pal as f64 - (2.0 * sigma2 * (5.0 + (0.80_f64 / 0.15).ln())).sqrt(),
+                    sigma2,
+                    true,
+                ),
+                (
+                    "tx2",
+                    "gene2",
+                    log_pal as f64 - (2.0 * sigma2 * (5.0 + (0.80_f64 / 0.005).ln())).sqrt(),
+                    sigma2,
+                    true,
+                ),
+                // No handicap at all: the FAVOURED candidate is the doomed one.
+                ("tx3", "gene3", log_pal as f64, sigma2, false),
+            ],
+        );
+        let graph = synth_graph(
+            log_pal,
+            &[
+                ("tx0", 900),
+                ("tx1", 900),
+                ("tx2", 900),
+                ("tx3", 900),
+                ("tx4", 900),
+            ],
+        );
+
+        solve_and_write_profile(
+            graph,
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            // 1 iteration: the emitted posterior is the E-step on the uniform
+            // init prior, so the expected split is exact rather than
+            // convergence-dependent.
+            1,
+            100.0,
+            FIVE_PRIME_OFF,
+            POLY_A_ON,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let rows = read_profile_by_read(&profile);
+        let _ = std::fs::remove_file(&emission);
+        let _ = std::fs::remove_file(&profile);
+
+        let w = |tx: &str| -> f64 {
+            rows.iter()
+                .filter(|(r, t, _)| r == "r1" && t == tx)
+                .map(|&(_, _, w)| w)
+                .sum()
+        };
+        let emitted: Vec<&str> = rows.iter().map(|(_, t, _)| t.as_str()).collect();
+        assert_eq!(
+            emitted.len(),
+            2,
+            "exactly tx0 and tx1 may be emitted -- tx2 is truncated, tx3 is \
+             incompetent, tx4 has no emission row: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|(_, t, _)| t == "tx2"),
+            "tx2's weight is 0.005/0.955 = 0.0052, below MIN_WEIGHT = {MIN_WEIGHT}, \
+             so it must be truncated: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|(_, t, _)| t == "tx3"),
+            "tx3 is is_polyA_competent=false and must never reach the profile"
+        );
+        assert!(
+            !rows.iter().any(|(_, t, _)| t == "tx4"),
+            "tx4 has no emission row, so it can carry neither weight nor mass"
+        );
+
+        let sum: f64 = rows.iter().map(|&(_, _, w)| w).sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-12,
+            "the emitted posterior must sum to 1.0, got {sum}. A denominator \
+             taken over all of `weights` instead of the retained ones leaves the \
+             truncated 0.005 stranded here."
+        );
+
+        // The split, not just the sum. These pin the denominator to the
+        // RETAINED set: with tx0 and tx1 sharing `0.80 : 0.15` of the
+        // untruncated mass, the only denominator that yields them is
+        // `0.80 + 0.15 = 0.95`.
+        assert!(
+            (w("tx0") - 0.842_105).abs() < 1e-5,
+            "tx0 must absorb the truncated mass: 0.80/0.95 = 0.842105, got {}",
+            w("tx0")
+        );
+        assert!(
+            (w("tx1") - 0.157_895).abs() < 1e-5,
+            "tx1 must be renormalised by the same denominator: 0.15/0.95 = \
+             0.157895, got {}",
+            w("tx1")
+        );
     }
 
     /// Disjoint id spaces must be REFUSED, not silently absorbed.

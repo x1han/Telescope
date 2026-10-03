@@ -507,14 +507,27 @@ struct LogNormalFit {
 /// Fit `(mean, sample variance floored at INSTRUMENTAL_PAL_NOISE_FLOOR)`
 /// from a slice of `log2(PAL)` values. Returns `None` iff
 /// `values` is empty.
+///
+/// The result is a function of the VALUES, not of the order they arrive in.
+/// `f64` addition is not associative, so the sum of a multiset depends on the
+/// order it is accumulated in, and the L2 gene pool is assembled by iterating
+/// `tx_accums` -- a `HashMap`, whose iteration order is a function of the
+/// insertion history and the per-process random seed. Summing in that order
+/// made the same anchor pool emit L2 rows differing in the last 1-2 mantissa
+/// bits between runs (~1e-16 relative, measured over 12 runs; L1 and L3 were
+/// already bit-reproducible). Sorting first costs microseconds on a few
+/// thousand values and removes the seed from the result. Pinned by
+/// `test_l2_gene_fit_is_bit_identical_across_accumulator_insertion_orders`.
 fn fit_log_normal(values: &[f64]) -> Option<LogNormalFit> {
     let n = values.len();
     if n == 0 {
         return None;
     }
-    let mean = values.iter().sum::<f64>() / n as f64;
+    let mut sorted: Vec<f64> = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mean = sorted.iter().sum::<f64>() / n as f64;
     let variance = if n > 1 {
-        let sq_diff_sum: f64 = values.iter().map(|&x| (x - mean).powi(2)).sum();
+        let sq_diff_sum: f64 = sorted.iter().map(|&x| (x - mean).powi(2)).sum();
         sq_diff_sum / ((n - 1) as f64) // Bessel-corrected sample variance
     } else {
         INSTRUMENTAL_PAL_NOISE_FLOOR
@@ -528,6 +541,12 @@ fn fit_log_normal(values: &[f64]) -> Option<LogNormalFit> {
 /// Cohort-level robust fit: `mu` = median(log2(PAL)),
 /// `sigma2` = `(MAD * 1.4826)^2`, floored at
 /// `INSTRUMENTAL_PAL_NOISE_FLOOR`. Returns `None` iff `values` is empty.
+///
+/// Order-independent by construction, and for a different reason than
+/// `fit_log_normal` needs its sort: both statistics are ORDER STATISTICS read
+/// off a sorted copy, and nothing here is summed, so no accumulation order
+/// reaches the result. The sort is load-bearing -- do not remove it as a
+/// micro-optimisation.
 fn cohort_log_normal_fit(values: &[f64]) -> Option<LogNormalFit> {
     let n = values.len();
     if n == 0 {
@@ -1689,13 +1708,16 @@ mod tests {
         // sharing is the mechanism behind `n_polya_zero_power` in Module 3, and
         // an L2 that recomputed per transcript would break that metric.
         //
-        // BIT-IDENTICAL TO EACH OTHER, but only CLOSE to `l2_fit` as recomputed
-        // here. The gene pool is assembled by iterating `tx_accums`, a
-        // `HashMap`, so the order the 36 values are summed in is not fixed, and
-        // `fit_log_normal`'s `sum::<f64>()` is not associative. The observed
-        // spread is a few ULPs (~4e-15 on mu here); asserting exact equality
-        // against a re-derived value would be asserting the HashMap's
-        // iteration order, which is not a property this code owns.
+        // BIT-IDENTICAL TO EACH OTHER, and now also bit-identical to
+        // `l2_fit` as recomputed here. The gene pool is assembled by iterating
+        // `tx_accums`, a `HashMap`, so the order the 36 values arrive in is not
+        // fixed and `fit_log_normal`'s `sum::<f64>()` is not associative --
+        // which is why `fit_log_normal` sorts before summing. The 1e-9
+        // tolerance below is therefore slack the code no longer needs; it is
+        // kept because the re-derivation is a second, independent call and a
+        // ULP-level assertion is a poor failure message. The exact-equality
+        // claim lives in
+        // `test_l2_gene_fit_is_bit_identical_across_accumulator_insertion_orders`.
         let l2_rows: Vec<&(String, String, f64, bool, u32, f64, f64)> =
             rows.iter().filter(|r| r.0.starts_with("tx_l2_")).collect();
         assert_eq!(l2_rows.len(), 4);
@@ -1750,5 +1772,104 @@ mod tests {
         assert!((tiers.l3 as f64 * 100.0 / total as f64 - 100.0 / 6.0).abs() < 1e-12);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// L2 must be bit-reproducible across processes.
+    ///
+    /// The L2 fit is the only one that reads a `HashMap`-derived slice: the
+    /// gene pool is assembled by iterating `tx_accums`, so the order its
+    /// `log2(PAL)` values are handed to `fit_log_normal` depends on the
+    /// insertion history and the per-process random seed. `f64` addition is not
+    /// associative, so before `fit_log_normal` sorted, the same anchor pool
+    /// emitted L2 rows differing in the last 1-2 mantissa bits between runs
+    /// (~1e-16 relative, measured over 12 runs on a fixture; L1 and L3 were
+    /// already bit-reproducible and stayed that way).
+    ///
+    /// WHY THIS TEST IS NOT "RUN THE BUILD TWICE". `HashMap` iteration order is
+    /// STABLE WITHIN A PROCESS, so re-running the same build in the same
+    /// process reproduces the non-deterministic value exactly and passes with
+    /// the bug present. The only way to reach two different iteration orders
+    /// from one process is to build two maps with different insertion
+    /// histories, which is what the three orders below do. (The alternative —
+    /// hard-coding the expected bits — was rejected: it pins the summation
+    /// order, so any later change to how the mean is accumulated, e.g.
+    /// `powi(2)` -> `x * x`, would fail for a reason that has nothing to do
+    /// with determinism.)
+    ///
+    /// `to_bits()`, not `==`: `PartialEq for f64` is a numeric comparison, and
+    /// the point of the test is the bit pattern, not the value.
+    #[test]
+    fn test_l2_gene_fit_is_bit_identical_across_accumulator_insertion_orders() {
+        // A realistic pool, and deliberately large: PAL lengths spread over
+        // 10..=400 (~2.3 nats of range) over 3000 values. The order of a
+        // 3000-term f64 sum of numbers this size IS observable in the last
+        // mantissa bits; a handful of values would sum identically in any
+        // order and this test would pass with the bug.
+        let per_tx: Vec<Vec<f64>> = ["tx_a", "tx_b", "tx_c", "tx_d"]
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                (0..750)
+                    .map(|j| ((10 + ((i * 750 + j) * 37) % 391) as f64).log2())
+                    .collect()
+            })
+            .collect();
+
+        // The production assembly, verbatim: one accumulator per transcript,
+        // then pool the accumulators in map order, then fit. Reproduced here
+        // rather than calling `build_emission_from_anchors` so that the ONLY
+        // thing varying between the three calls is the insertion order.
+        let tx_names = ["tx_a", "tx_b", "tx_c", "tx_d"];
+        let fit_for_order = |order: &[usize]| -> LogNormalFit {
+            let mut accums: HashMap<String, TxAccumulator> = HashMap::new();
+            for &i in order {
+                accums
+                    .entry(tx_names[i].to_string())
+                    .or_insert_with(|| TxAccumulator::new(format!("gene_{i}")))
+                    .log2_pals
+                    .extend_from_slice(&per_tx[i]);
+            }
+            let mut gene_pool: Vec<f64> = Vec::new();
+            for acc in accums.values() {
+                gene_pool.extend_from_slice(&acc.log2_pals);
+            }
+            assert_eq!(gene_pool.len(), 3000, "every value reaches the pool");
+            fit_log_normal(&gene_pool).expect("gene pool is non-empty")
+        };
+
+        let orders: [&[usize]; 3] = [&[0, 1, 2, 3], &[3, 2, 1, 0], &[1, 3, 0, 2]];
+        let reference = fit_for_order(orders[0]);
+        for order in orders.iter().copied().skip(1) {
+            let other = fit_for_order(order);
+            assert_eq!(
+                (other.mu.to_bits(), other.sigma2.to_bits()),
+                (reference.mu.to_bits(), reference.sigma2.to_bits()),
+                "accumulator insertion order {order:?} changed the L2 gene fit by \
+                 at least one mantissa bit: {other:?} vs {reference:?}. \
+                 `fit_log_normal` must sort before summing."
+            );
+        }
+
+        // L3 shares the fixture and the concern but not the mechanism: it reads
+        // order STATISTICS off an already-sorted copy and sums nothing, so it
+        // was bit-reproducible before the fix and must stay that way. Cheap to
+        // assert, and it stops the sort in `cohort_log_normal_fit` from being
+        // removed as a micro-optimisation on the strength of "it sums
+        // nothing, the sort is redundant".
+        let flat: Vec<f64> = per_tx.concat();
+        for order in orders.iter().copied().skip(1) {
+            let mut reordered: Vec<f64> = Vec::with_capacity(flat.len());
+            for &i in order {
+                reordered.extend_from_slice(&per_tx[i]);
+            }
+            let a = cohort_log_normal_fit(&flat).expect("cohort is non-empty");
+            let b = cohort_log_normal_fit(&reordered).expect("cohort is non-empty");
+            assert_eq!(
+                (b.mu.to_bits(), b.sigma2.to_bits()),
+                (a.mu.to_bits(), a.sigma2.to_bits()),
+                "L3 must not depend on input order either, order {order:?}: \
+                 {b:?} vs {a:?}"
+            );
+        }
     }
 }
