@@ -361,7 +361,7 @@ fn run(fx: &Fixture, beta: f64, tag: &str) -> Vec<(f64, f64)> {
 
     solve_and_write_profile(
         graph, &emission, "TOY", &profile, TOL_TIGHT, MAX_ITER, LAMBDA, beta, POLY_A_OFF, WINDOW,
-        PRUNE, MIN_WEIGHT, None, None,
+        PRUNE, MIN_WEIGHT, None, None, None,
     )
     .expect("solve_and_write_profile");
 

@@ -178,7 +178,7 @@ fn run_pipeline(beta: f64, tag: &str) -> (f64, usize) {
     // Module 3.
     solve_and_write_profile(
         graph, &emission, "TEST", &profile, 1e-6, 1, LAMBDA, beta, POLY_A_ON, WINDOW, PRUNE,
-        MIN_WEIGHT, None, None,
+        MIN_WEIGHT, None, None, None,
     )
     .expect("solve_and_write_profile");
 

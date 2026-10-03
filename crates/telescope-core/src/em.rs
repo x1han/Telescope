@@ -210,6 +210,14 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
     // why mutation showed removing it changed nothing. Same gap class as the
     // unobservable alpha scale recorded in the Phase A closeout.
     mut output_emission_params: Option<&mut Vec<Option<TranscriptParam>>>,
+    // Per-READ posterior summary. The profile parquet is per (read, candidate)
+    // PAIR and carries no per-read summary, so "what did this read end up
+    // assigned to, and how sure was it" was not recoverable from any output --
+    // the entropy existed only as a mean inside `output_em_trace`. This is the
+    // `output_emission_params` idiom (filled once, after the solve), not the
+    // `output_em_trace` one (pushed per iteration): the state being reported is
+    // the FINAL iterate, not the trajectory.
+    output_read_assignments: Option<&mut Vec<ReadAssignment>>,
 ) -> Result<TelEmStats> {
     // API-LEVEL DEFENCE, per the 2026-10-02 ruling.
     //
@@ -705,6 +713,8 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         }
     }
 
+    let want_read_assignments = output_read_assignments.is_some();
+
     // 4. Build output parquet.
     let mut sample_b = StringBuilder::new();
     let mut read_b = StringBuilder::new();
@@ -719,6 +729,27 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
     let mut n_entropy_clean = 0_u64;
     let mut n_entropy_partial = 0_u64;
     let mut n_entropy_degenerate = 0_u64;
+
+    // Per-read assignments are filled into a molecule-indexed slot vector and
+    // flattened at the end, so the emitted table is in MOLECULE order and
+    // carries exactly one row per read. The two loops below write disjoint
+    // slots (`unambiguous_indices` vs `ambiguous_indices`), so the two passes
+    // cannot clobber each other -- and slotting by molecule index is what
+    // keeps the read_id attached to its OWN posterior. An earlier draft zipped
+    // the E-step's `final_weights` against `graph.molecules` directly, which is
+    // wrong twice over: `final_weights` is indexed by AMBIGUOUS RANK (see
+    // `ambiguous_indices[i]` in the M-step and in the loop below), and `zip`
+    // truncates to the shorter side, so ~99.7% of reads would have been
+    // missing and the survivors mislabelled. Both output loops below index
+    // explicitly, copying the pattern already used at the M-step.
+    //
+    // Allocated only when the caller asked for it: `quant` without
+    // `--read-assignments` pays nothing for this.
+    let mut read_assign: Vec<Option<ReadAssignment>> = if want_read_assignments {
+        vec![None; graph.molecules.len()]
+    } else {
+        Vec::new()
+    };
 
     // Unambiguous rows: 1 per read.
     for &idx in &unambiguous_indices {
@@ -737,6 +768,23 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
             if !p.is_competent {
                 n_dropped_incompetent += 1;
                 continue;
+            }
+            if want_read_assignments {
+                // An unambiguous read has one candidate, so its posterior is the
+                // deterministic `w ≡ 1.0` and its entropy is exactly 0.0 --
+                // which is what `posterior_entropy` returns for a one-element
+                // vector. Emitting these is not optional bookkeeping: they are
+                // ~99.7% of the read set (see the module header), so a table of
+                // ambiguous reads only would silently answer "top-1 switch rate
+                // among CONTESTED reads", a much smaller question than the one
+                // this table exists for.
+                read_assign[idx] = Some(ReadAssignment {
+                    read_id: mol.read_id.clone(),
+                    n_candidates_before_cutoff: ncand as usize,
+                    top_tx_id: Some(p.transcript_id.clone()),
+                    top_weight: 1.0,
+                    entropy: 0.0,
+                });
             }
             sample_b.append_value(sample_id);
             read_b.append_value(&mol.read_id);
@@ -792,6 +840,45 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
             } else {
                 n_entropy_degenerate += 1;
             }
+        }
+
+        if want_read_assignments {
+            // `weights` is already empty for a ghost read (no competent
+            // candidate), and that case must NOT fall through to an argmax:
+            // over an empty vector that is either a panic or, via a default,
+            // transcript 0 -- a real transcript this read was never assigned
+            // to. `None` is the honest answer, and the profile parquet has no
+            // row for such a read either.
+            //
+            // `weights` is pre-truncation and pre-renormalisation (it is what
+            // the M-step consumed), so `top_weight` here is the RAW E-step
+            // weight. The `posterior_weight` column in the profile is
+            // `w / retained_sum` after the `min_weight` cutoff. Different
+            // quantities on purpose; do not treat them as interchangeable.
+            let (top, top_w) = weights.iter().fold((None, 0.0f64), |acc, &(tx, w)| {
+                // Strict `>` => first-in-pool-order wins a tie, deterministically.
+                if w > acc.1 {
+                    (Some(tx), w)
+                } else {
+                    acc
+                }
+            });
+            read_assign[mol_idx] = Some(ReadAssignment {
+                read_id: mol.read_id.clone(),
+                n_candidates_before_cutoff: ncand as usize,
+                top_tx_id: top.and_then(|tx| {
+                    params
+                        .get(tx)
+                        .and_then(|o| o.as_ref())
+                        .map(|p| p.transcript_id.clone())
+                }),
+                top_weight: top_w,
+                entropy: if weights.is_empty() {
+                    0.0
+                } else {
+                    posterior_entropy(&weights)
+                },
+            });
         }
 
         // Renormalize the retained weights so each read's emitted posterior
@@ -937,6 +1024,17 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         *out = params.clone();
     }
 
+    if let Some(out) = output_read_assignments {
+        // `flatten()` drops the `None` slots. Every molecule is visited by
+        // exactly one of the two loops above, so the only `None`s left are
+        // reads that produced no profile row at all (transcript absent from
+        // the emission parquet). Those are genuinely unassignable, and dropping
+        // them keeps this table a strict subset of the profile's reads -- which
+        // is what makes the cross-run join denominator auditable rather than
+        // assumed.
+        *out = read_assign.into_iter().flatten().collect();
+    }
+
     Ok(TelEmStats {
         n_unambiguous,
         n_ambiguous,
@@ -1023,6 +1121,107 @@ fn posterior_entropy(weights: &[(usize, f64)]) -> f64 {
         .iter()
         .map(|&(_, w)| if w > 0.0 { -w * w.ln() } else { 0.0 })
         .sum()
+}
+
+/// Per-read posterior summary, for callers that need read-level outcomes
+/// (top-1 switch rate between two runs, entropy shift) which the per
+/// (read, candidate) profile cannot express.
+///
+/// Three decisions here are load-bearing and each has bitten before:
+///
+/// - `top_tx_id` is the transcript NAME, not the pool index. The index is only
+///   meaningful relative to one run's `transcript_names` order, and this table's
+///   whole purpose is being joined against a SECOND run's table.
+/// - `n_candidates_before_cutoff` is `MoleculeEvidence::candidate_count`, i.e.
+///   the fan-out BEFORE the `ΔAS` prune, the `is_competent` filter and the
+///   `min_weight` truncation. Using the post-prune `weights.len()` instead
+///   would silently redefine "candidate count" and, at the shipped
+///   `prune_max_delta_as = 50`, would select a different and much smaller
+///   population for any "fan-out >= N" question. It matches the
+///   `n_candidates_before_cutoff` column the profile parquet already emits.
+/// - `top_tx_id` is `None` for a read with no competent candidate (a ghost
+///   drop). An argmax over an empty vector would either panic or, worse, yield
+///   transcript 0 -- a real transcript the read was never assigned to.
+#[derive(Debug, Clone)]
+pub struct ReadAssignment {
+    pub read_id: String,
+    pub n_candidates_before_cutoff: usize,
+    /// `None` when every candidate was dropped (ghost read).
+    pub top_tx_id: Option<String>,
+    /// Raw E-step weight of the top candidate: PRE `min_weight` truncation and
+    /// PRE renormalisation. It is therefore NOT equal to the `posterior_weight`
+    /// the profile parquet reports for the same read, which is `w /
+    /// retained_sum`. Both are defensible; they are different quantities.
+    pub top_weight: f64,
+    /// Posterior entropy in nats, recomputed from the final weights with the
+    /// same `posterior_entropy` the output stage uses. 0.0 for an unambiguous
+    /// read, which is what that function returns for a one-element vector and
+    /// is consistent with its deterministic `w ≡ 1.0` branch.
+    pub entropy: f64,
+}
+
+/// Write the per-read posterior summary as Parquet, matching every other
+/// output this tool produces (profile, emission, anchors, summary are all
+/// Parquet; TSV appears in this codebase only as an INPUT format).
+///
+/// `top_tx_id` is written as a nullable string rather than an index: the whole
+/// purpose of this table is to be joined against another run's table, and a
+/// pool index only means something relative to one run's `transcript_names`.
+pub fn write_read_assignments_parquet(
+    rows: &[ReadAssignment],
+    path: &std::path::Path,
+) -> Result<()> {
+    use std::sync::Arc;
+
+    use arrow::array::{Float64Builder, Int64Builder, StringBuilder};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+
+    let mut read_b = StringBuilder::new();
+    let mut ncand_b = Int64Builder::new();
+    let mut top_b = StringBuilder::new();
+    let mut w_b = Float64Builder::new();
+    let mut h_b = Float64Builder::new();
+    for r in rows {
+        read_b.append_value(&r.read_id);
+        ncand_b.append_value(r.n_candidates_before_cutoff as i64);
+        // Null, not "" and not index 0: an empty string would be a transcript
+        // that does not exist, and index 0 is a real transcript this read was
+        // never assigned to.
+        top_b.append_option(r.top_tx_id.as_deref());
+        w_b.append_value(r.top_weight);
+        h_b.append_value(r.entropy);
+    }
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("read_id", DataType::Utf8, false),
+        Field::new("n_candidates_before_cutoff", DataType::Int64, false),
+        Field::new("top_tx_id", DataType::Utf8, true),
+        Field::new("top_weight", DataType::Float64, false),
+        Field::new("entropy", DataType::Float64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(read_b.finish()),
+            Arc::new(ncand_b.finish()),
+            Arc::new(top_b.finish()),
+            Arc::new(w_b.finish()),
+            Arc::new(h_b.finish()),
+        ],
+    )
+    .context("Failed to build read-assignments RecordBatch")?;
+
+    let f = std::fs::File::create(path).with_context(|| format!("Failed to create {:?}", path))?;
+    let mut w = ArrowWriter::try_new(f, schema, Some(WriterProperties::builder().build()))
+        .context("Failed to create ArrowWriter for read assignments")?;
+    w.write(&batch)
+        .context("Failed to write read-assignments batch")?;
+    w.close()
+        .context("Failed to close read-assignments writer")?;
+    Ok(())
 }
 
 /// TEL-EM execution stats for logging / telemetry.
@@ -1208,6 +1407,7 @@ mod tests {
             MIN_WEIGHT,
             None,
             Some(&mut params_on),
+            None,
         )
         .unwrap();
         let mu_on = params_on[0].as_ref().expect("tx0 must have params").mu;
@@ -1235,6 +1435,7 @@ mod tests {
             MIN_WEIGHT,
             None,
             Some(&mut params_off),
+            None,
         )
         .unwrap();
 
@@ -1302,6 +1503,7 @@ mod tests {
             MIN_WEIGHT,
             None,
             None,
+            None,
         )
         .expect_err("a placeholder graph at poly_a_weight > 0 is the silently-wrong pairing");
 
@@ -1330,6 +1532,7 @@ mod tests {
             MIN_WEIGHT,
             None,
             None,
+            None,
         )
         .expect("a placeholder graph at weight 0 is the supported alignment-only run");
 
@@ -1349,6 +1552,7 @@ mod tests {
             FIVE_PRIME_WINDOW,
             PRUNE_MAX_DELTA_AS,
             MIN_WEIGHT,
+            None,
             None,
             None,
         )
@@ -1482,6 +1686,7 @@ mod tests {
             MIN_WEIGHT,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -1598,6 +1803,7 @@ mod tests {
             FIVE_PRIME_WINDOW,
             PRUNE_MAX_DELTA_AS,
             MIN_WEIGHT,
+            None,
             None,
             None,
         )
@@ -1795,6 +2001,7 @@ mod tests {
                 0.0,
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -1877,6 +2084,7 @@ mod tests {
             0.0,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -1948,6 +2156,7 @@ mod tests {
                 // otherwise a losing candidate vanishing would look like
                 // "removed by the parameter".
                 0.0,
+                None,
                 None,
                 None,
             )
@@ -2026,6 +2235,7 @@ mod tests {
                 FIVE_PRIME_WINDOW,
                 PRUNE_MAX_DELTA_AS,
                 min_weight,
+                None,
                 None,
                 None,
             )
@@ -2114,6 +2324,7 @@ mod tests {
             MIN_WEIGHT,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -2194,6 +2405,7 @@ mod tests {
             MIN_WEIGHT,
             None,
             None,
+            None,
         )
         .unwrap_err();
         let _ = std::fs::remove_file(&emission);
@@ -2271,6 +2483,7 @@ mod tests {
             MIN_WEIGHT,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -2339,6 +2552,7 @@ mod tests {
                 window,
                 prune,
                 MIN_WEIGHT,
+                None,
                 None,
                 None,
             )
@@ -2418,6 +2632,7 @@ mod tests {
             FIVE_PRIME_WINDOW,
             prune_max_delta_as,
             MIN_WEIGHT,
+            None,
             None,
             None,
         )
@@ -2780,5 +2995,246 @@ mod tests {
             PRUNE_MAX_DELTA_AS,
         );
         assert_eq!(rows_51.len(), 1, "ΔAS = 51 must be pruned: {rows_51:?}");
+    }
+
+    // ---------------------------------------------------------------------
+    // Per-read assignments
+    // ---------------------------------------------------------------------
+
+    /// A graph where the AMBIGUOUS reads are not the leading molecules, so
+    /// `ambiguous_indices != identity`. This is the shape that makes the
+    /// read_id-to-posterior join testable at all.
+    ///
+    /// The single-molecule fixtures every other test here uses would align by
+    /// ACCIDENT under a `zip(graph.molecules, final_weights)`, which is the bug
+    /// this fixture exists to rule out.
+    fn mixed_unambiguous_then_ambiguous(log_pal: f32) -> FlatEvidenceGraph {
+        // molecule 0: unambiguous, points ONLY at tx2 -> top must be tx2
+        // molecule 1: ambiguous, tx0 wins on AS   -> top must be tx0
+        // molecule 2: ambiguous, tx1 wins on AS   -> top must be tx1
+        //
+        // The two ambiguous reads point at DIFFERENT transcripts, so a join
+        // that is off by one position is caught by content and not merely by
+        // row count.
+        let mut molecules = vec![
+            MoleculeEvidence {
+                read_id: "UNAMB".to_string(),
+                log_pal,
+                candidate_offset: 0,
+                candidate_count: 1,
+            },
+            MoleculeEvidence {
+                read_id: "AMB_TX0".to_string(),
+                log_pal,
+                candidate_offset: 1,
+                candidate_count: 2,
+            },
+            MoleculeEvidence {
+                read_id: "AMB_TX1".to_string(),
+                log_pal,
+                candidate_offset: 3,
+                candidate_count: 2,
+            },
+        ];
+        molecules.shrink_to_fit();
+        // AMB_TX0 sees [tx0@900, tx1@800] and AMB_TX1 sees [tx1@900, tx0@800]
+        // -- MIRRORED, so each resolves to a DIFFERENT transcript. An earlier
+        // draft gave both reads the same pair in the same order, which made
+        // both resolve to tx0 and would have let an off-by-one join pass.
+        let mut candidate_pool = vec![2, 0, 1, 1, 0];
+        // Each ambiguous read's own two candidates get the SAME AS, so the
+        // winner is decided by the alignment term, not by pool order or a
+        // prior -- this keeps the assertion about join identity.
+        candidate_pool.shrink_to_fit();
+        let candidate_as = vec![1000, 900, 800, 900, 800];
+        let n = candidate_pool.len();
+        FlatEvidenceGraph {
+            molecules,
+            candidate_nm: vec![0; n],
+            candidate_mapq: vec![60; n],
+            candidate_5p_gap: vec![0; n],
+            candidate_pool,
+            candidate_as,
+            transcript_names: vec!["tx0".to_string(), "tx1".to_string(), "tx2".to_string()],
+            poly_a_is_placeholder: false,
+        }
+    }
+
+    /// The P0 this whole output path could have shipped: `final_weights` is
+    /// indexed by AMBIGUOUS RANK, not molecule index, so pairing it with
+    /// `graph.molecules` positionally attributes each read's top-1 to the
+    /// WRONG read. `ambiguous_indices` here is `[1, 2]`, so a positional zip
+    /// would hand molecule 0's posterior to `UNAMB` and shift both ambiguous
+    /// reads by one.
+    #[test]
+    fn test_read_assignments_attach_each_posterior_to_its_own_read() {
+        let log_pal = (100.0_f32).log2();
+        let emission = scratch("readassign_emission.parquet");
+        let profile = scratch("readassign_profile.parquet");
+        write_test_emission(
+            &emission,
+            &[
+                ("tx0", "gene0", 7.0, 0.5),
+                ("tx1", "gene1", 7.0, 0.5),
+                ("tx2", "gene2", 7.0, 0.5),
+            ],
+        );
+
+        let mut assigns: Vec<ReadAssignment> = Vec::new();
+        solve_and_write_profile(
+            mixed_unambiguous_then_ambiguous(log_pal),
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            5,
+            20.0,
+            FIVE_PRIME_OFF,
+            POLY_A_ON,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
+            None,
+            None,
+            Some(&mut assigns),
+        )
+        .unwrap();
+
+        let by_id: std::collections::HashMap<&str, &ReadAssignment> =
+            assigns.iter().map(|a| (a.read_id.as_str(), a)).collect();
+
+        // Every read must be present -- including the unambiguous one, which is
+        // ~99.7% of a real read set. A table of ambiguous reads only would
+        // silently answer a different question than the one this exists for.
+        assert_eq!(
+            assigns.len(),
+            3,
+            "one row per read expected, got {}: {assigns:#?}",
+            assigns.len()
+        );
+
+        // The unambiguous read: one candidate, so w == 1.0 and H == 0.0, and
+        // its top-1 is the single candidate it was built with.
+        let u = by_id.get("UNAMB").expect("UNAMB must be present");
+        assert_eq!(
+            u.top_tx_id.as_deref(),
+            Some("tx2"),
+            "the unambiguous read's only candidate must be its top-1"
+        );
+        assert_eq!(u.entropy, 0.0, "a one-candidate posterior is deterministic");
+        assert!(
+            (u.top_weight - 1.0).abs() < 1e-12,
+            "a one-candidate posterior has weight 1.0, got {}",
+            u.top_weight
+        );
+        assert_eq!(u.n_candidates_before_cutoff, 1);
+
+        // The two ambiguous reads point at different transcripts. Their AS
+        // values are equal within each read, so the winner is decided by pool
+        // order: AMB_TX0 sees tx0 first, AMB_TX1 sees tx1 first.
+        let a0 = by_id.get("AMB_TX0").expect("AMB_TX0 must be present");
+        let a1 = by_id.get("AMB_TX1").expect("AMB_TX1 must be present");
+        assert_eq!(
+            a0.top_tx_id.as_deref(),
+            Some("tx0"),
+            "AMB_TX0's top-1 must be ITS first candidate, not a neighbour's"
+        );
+        assert_eq!(
+            a1.top_tx_id.as_deref(),
+            Some("tx1"),
+            "AMB_TX1's top-1 must be ITS first candidate, not a neighbour's"
+        );
+        assert_ne!(
+            a0.top_tx_id, a1.top_tx_id,
+            "fixture is broken: the two reads must resolve differently, otherwise \
+             a mis-attributed join would still pass"
+        );
+
+        // `n_candidates_before_cutoff` is the PRE-prune fan-out, matching the
+        // profile column of the same name -- not the post-prune weights.len().
+        for a in &assigns {
+            assert_eq!(a.n_candidates_before_cutoff as u16, {
+                match a.read_id.as_str() {
+                    "UNAMB" => 1,
+                    _ => 2,
+                }
+            });
+        }
+
+        let _ = std::fs::remove_file(&emission);
+        let _ = std::fs::remove_file(&profile);
+    }
+
+    /// The out-param is optional. When it is not supplied the solve must still
+    /// produce a byte-identical profile -- this path adds no observable state
+    /// to the fit, and a change to the E-step that leaked in through the
+    /// bookkeeping would show up here as a different profile.
+    #[test]
+    fn test_read_assignments_are_absent_unless_requested() {
+        let log_pal = (100.0_f32).log2();
+        let emission = scratch("readassign_absent_emission.parquet");
+        let with_p = scratch("readassign_absent_with.parquet");
+        let without_p = scratch("readassign_absent_without.parquet");
+        write_test_emission(
+            &emission,
+            &[
+                ("tx0", "gene0", 7.0, 0.5),
+                ("tx1", "gene1", 7.0, 0.5),
+                ("tx2", "gene2", 7.0, 0.5),
+            ],
+        );
+        let graph = || mixed_unambiguous_then_ambiguous(log_pal);
+
+        let mut assigns: Vec<ReadAssignment> = Vec::new();
+        solve_and_write_profile(
+            graph(),
+            &emission,
+            "TEST",
+            &with_p,
+            1e-6,
+            5,
+            20.0,
+            FIVE_PRIME_OFF,
+            POLY_A_ON,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
+            None,
+            None,
+            Some(&mut assigns),
+        )
+        .unwrap();
+        assert!(!assigns.is_empty());
+
+        solve_and_write_profile(
+            graph(),
+            &emission,
+            "TEST",
+            &without_p,
+            1e-6,
+            5,
+            20.0,
+            FIVE_PRIME_OFF,
+            POLY_A_ON,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let a = std::fs::read(&with_p).expect("profile with assignments must exist");
+        let b = std::fs::read(&without_p).expect("profile without must exist");
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "requesting per-read assignments must not change the profile"
+        );
+
+        for f in [&emission, &with_p, &without_p] {
+            let _ = std::fs::remove_file(f);
+        }
     }
 }

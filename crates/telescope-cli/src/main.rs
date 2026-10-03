@@ -304,6 +304,24 @@ enum Cmd {
         /// Print EM per-iter trace (log-L + mean entropy) to stderr.
         #[arg(long)]
         debug: bool,
+
+        /// Also write a per-READ posterior summary
+        /// (`read_assignments.parquet`: read_id, n_candidates_before_cutoff,
+        /// top_tx_id, top_weight, entropy).
+        ///
+        /// The profile parquet is per (read, candidate) PAIR and carries no
+        /// per-read summary, so "which transcript did this read end up on, and
+        /// how sure was it" is not recoverable from it. This exists for
+        /// comparing two runs read-by-read (e.g. an alignment re-run at a
+        /// different `-N`), which needs a per-read key.
+        ///
+        /// `top_tx_id` is the transcript NAME, not a pool index, so the table
+        /// can be joined against another run's table. It is null for a read
+        /// with no nameable transcript. `top_weight` is the raw E-step weight
+        /// and is deliberately NOT the profile's `posterior_weight` (that one
+        /// is post-truncation and renormalised).
+        #[arg(long)]
+        read_assignments: Option<PathBuf>,
     },
 
     /// Profile Summary Engine: aggregate profile.parquet → sample_summary.parquet.
@@ -506,6 +524,7 @@ fn main() -> Result<()> {
             tx_id_mapping,
             poly_a_source,
             debug,
+            read_assignments,
         } => {
             let poly_a = evidence::parse_poly_a_source(&poly_a_source)?;
             // `--polyA-source none` fills `log_pal` with a placeholder, not a
@@ -693,6 +712,11 @@ fn main() -> Result<()> {
             let mut em_trace: Vec<(usize, f64, f64)> = Vec::new();
             let trace_sink: Option<&mut Vec<(usize, f64, f64)>> =
                 if debug { Some(&mut em_trace) } else { None };
+            // Collected only when the caller asked for the per-read table. The
+            // Vec is always declared (it is empty otherwise and is never
+            // filled), which keeps the borrow a plain `&mut` for the duration
+            // of the call rather than a borrow of a temporary.
+            let mut read_sink: Vec<em::ReadAssignment> = Vec::new();
             let stats = em::solve_and_write_profile(
                 graph,
                 &emission,
@@ -708,8 +732,26 @@ fn main() -> Result<()> {
                 min_weight,
                 trace_sink,
                 None,
+                if read_assignments.is_some() {
+                    Some(&mut read_sink)
+                } else {
+                    None
+                },
             )
             .context("Module 3 solve_and_write_profile failed")?;
+            if let Some(path) = read_assignments {
+                let rows = std::mem::take(&mut read_sink);
+                anyhow::ensure!(
+                    !rows.is_empty(),
+                    "--read-assignments was set but the solve produced no rows"
+                );
+                em::write_read_assignments_parquet(&rows, &path)?;
+                eprintln!(
+                    "[telescope]    read assignments:       {} rows -> {}",
+                    rows.len(),
+                    path.display()
+                );
+            }
             eprintln!(
                 "[telescope]    n_unambig / sample:      {}",
                 stats.n_unambiguous
