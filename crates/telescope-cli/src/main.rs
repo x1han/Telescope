@@ -18,8 +18,8 @@ use telescope_core::{anchor_builder, em, emission_model, evidence, resolver, sum
 /// The `--polyA-source` argument, shared verbatim by `extract-evidence` and
 /// `quant` so the two subcommands cannot drift apart.
 const POLY_A_SOURCE_HELP: &str = "Where per-read poly(A) length comes from: \
-     `bam_tag:pt` (Dorado native, default), `tsv:<path>` (read_id<TAB>len from \
-     tailfindr/nanopolish), or `none` (declared-absent; forces \
+     `bam_tag:<TAG>` (a two-character SAM tag; `bam_tag:pt` is Dorado native and \
+     the default), or `none` (declared-absent; forces \
      `--poly-a-weight 0`). A BAM carrying no poly(A) at all is a hard error, \
      not an empty graph.";
 
@@ -81,31 +81,23 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Module 1: build `telescope.emission.parquet` from AIDRS
-    /// outputs (AIDRS mode) or anchor pool (Universal mode).
+    /// Module 1: build `telescope.emission.parquet` from an anchor pool
+    /// (Universal mode).
     ///
-    /// The two input modes are MUTUALLY EXCLUSIVE:
-    /// - AIDRS mode: `--polya-parquet X --assessment-tsv Y`
-    /// - Universal mode: `--anchor-pool X [--transcript-evidence Z]`
+    /// `--anchor-pool` is the sole input; there is no alternative input mode.
+    /// An external poly(A) initializer (the former "AIDRS mode") remains in
+    /// `telescope-core::emission_model` but is deferred and is NOT reachable
+    /// from any CLI subcommand — see that module's docs.
     ///
     /// `--output` is always required. The `--tx-min-reads`,
     /// `--gene-min-reads`, `--cohort-min-reads` flags configure
     /// the Universal-Mode 3-level fallback (Tx → Gene → Cohort)
     /// and only take effect when `--anchor-pool` is supplied.
     BuildEmission {
-        /// AIDRS mode: path to `aidrs.transcript_polyA_len.parquet`.
-        #[arg(long, group = "emission_input")]
-        polya_parquet: Option<PathBuf>,
-
-        /// AIDRS mode: path to `aidrs.transcript.assessment.tsv`.
-        /// Required iff `--polya-parquet` is set.
-        #[arg(long, requires = "polya_parquet")]
-        assessment_tsv: Option<PathBuf>,
-
         /// Universal mode: path to `telescope.anchor_pool.parquet`
         /// (produced by `telescope build-anchors`).
-        #[arg(long, group = "emission_input")]
-        anchor_pool: Option<PathBuf>,
+        #[arg(long)]
+        anchor_pool: PathBuf,
 
         /// Universal mode (optional): path to
         /// `telescope.transcript_evidence.parquet` (Module 0
@@ -146,8 +138,9 @@ enum Cmd {
         // The ruling specifies this spelling, and the FATAL message in
         // `evidence.rs` quotes it -- the flag and the error that names it have
         // to agree, or the error tells the user to type something that does not
-        // exist. The lowercase form is accepted as an alias because the
-        // neighbouring `--polya-parquet` sets that precedent.
+        // exist. The lowercase form is accepted as an alias for the same
+        // reason the flag itself is spelled in both cases: a quant command
+        // invoked from a shell script should not fail on letter case alone.
         #[arg(
             long = "polyA-source",
             alias = "polya-source",
@@ -182,8 +175,9 @@ enum Cmd {
         // The ruling specifies this spelling, and the FATAL message in
         // `evidence.rs` quotes it -- the flag and the error that names it have
         // to agree, or the error tells the user to type something that does not
-        // exist. The lowercase form is accepted as an alias because the
-        // neighbouring `--polya-parquet` sets that precedent.
+        // exist. The lowercase form is accepted as an alias for the same
+        // reason the flag itself is spelled in both cases: a quant command
+        // invoked from a shell script should not fail on letter case alone.
         #[arg(
             long = "polyA-source",
             alias = "polya-source",
@@ -408,8 +402,6 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::BuildEmission {
-            polya_parquet,
-            assessment_tsv,
             anchor_pool,
             transcript_evidence,
             output,
@@ -418,57 +410,30 @@ fn main() -> Result<()> {
             cohort_min_reads,
         } => {
             eprintln!("[telescope] Module 1: building emission model");
-            match (polya_parquet, anchor_pool) {
-                (Some(p), None) => {
-                    // AIDRS mode (legacy).
-                    let assess = assessment_tsv
-                        .context("--assessment-tsv is required when --polya-parquet is set")?;
-                    eprintln!("  mode:           AIDRS");
-                    eprintln!("  polya_parquet:  {}", p.display());
-                    eprintln!("  assessment_tsv: {}", assess.display());
-                    eprintln!("  output:         {}", output.display());
-                    emission_model::build_emission_parquet(p, assess, output)
-                        .context("Module 1 build_emission_parquet (AIDRS) failed")?;
-                }
-                (None, Some(a)) => {
-                    // Universal mode (Mode B).
-                    let fb = FallbackConfig {
-                        tx_min_reads,
-                        gene_min_reads,
-                        cohort_min_reads,
-                    };
-                    eprintln!("  mode:               Universal (Mode B)");
-                    eprintln!("  anchor_pool:        {}", a.display());
-                    if let Some(ref te) = transcript_evidence {
-                        eprintln!("  transcript_evidence: {}", te.display());
-                    } else {
-                        eprintln!("  transcript_evidence: (none; no em_eligible filter)");
-                    }
-                    eprintln!("  tx_min_reads:       {}", fb.tx_min_reads);
-                    eprintln!("  gene_min_reads:     {}", fb.gene_min_reads);
-                    eprintln!("  cohort_min_reads:   {}", fb.cohort_min_reads);
-                    eprintln!("  output:             {}", output.display());
-                    emission_model::build_emission_from_anchors(
-                        a,
-                        transcript_evidence,
-                        output,
-                        &fb,
-                    )
-                    .context("Module 1 build_emission_from_anchors (Universal) failed")?;
-                }
-                (Some(_), Some(_)) => {
-                    anyhow::bail!(
-                        "--polya-parquet (AIDRS mode) and --anchor-pool (Universal mode) \
-                         are mutually exclusive"
-                    );
-                }
-                (None, None) => {
-                    anyhow::bail!(
-                        "must specify either --polya-parquet (AIDRS mode) or \
-                         --anchor-pool (Universal mode)"
-                    );
-                }
+            // Universal mode is the only mode; `--anchor-pool` is required.
+            let fb = FallbackConfig {
+                tx_min_reads,
+                gene_min_reads,
+                cohort_min_reads,
+            };
+            eprintln!("  mode:               Universal");
+            eprintln!("  anchor_pool:        {}", anchor_pool.display());
+            if let Some(ref te) = transcript_evidence {
+                eprintln!("  transcript_evidence: {}", te.display());
+            } else {
+                eprintln!("  transcript_evidence: (none; no em_eligible filter)");
             }
+            eprintln!("  tx_min_reads:       {}", fb.tx_min_reads);
+            eprintln!("  gene_min_reads:     {}", fb.gene_min_reads);
+            eprintln!("  cohort_min_reads:   {}", fb.cohort_min_reads);
+            eprintln!("  output:             {}", output.display());
+            emission_model::build_emission_from_anchors(
+                anchor_pool,
+                transcript_evidence,
+                output,
+                &fb,
+            )
+            .context("Module 1 build_emission_from_anchors (Universal) failed")?;
             eprintln!("[telescope] done.");
             Ok(())
         }
@@ -785,6 +750,19 @@ fn main() -> Result<()> {
                 "[telescope]      > 0.60 nats (degenerate tie):  {} ({:.1}%)",
                 stats.n_entropy_degenerate,
                 stats.n_entropy_degenerate as f64 / n_ambig * 100.0
+            );
+            // Degradation telemetry. Denominator is the CONTESTED reads
+            // (`n_ambig`), not the read total: a single-candidate read has no
+            // pairwise odds ratio, so counting it would report ~99.7% and
+            // answer nothing. This is the share of genuinely contested reads
+            // on which the poly(A) term cancels exactly.
+            eprintln!("[telescope]    poly(A) discriminative power:");
+            eprintln!(
+                "[telescope]      zero-power reads (identical mu/sigma2 across all \
+                 candidates): {} of {} ambiguous ({:.1}%)",
+                stats.n_polya_zero_power,
+                stats.n_ambiguous,
+                stats.n_polya_zero_power as f64 / n_ambig * 100.0
             );
             if debug && !stats.em_trace.is_empty() {
                 eprintln!("[telescope]    EM trace:");

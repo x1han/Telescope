@@ -104,24 +104,24 @@ pub struct FlatEvidenceGraph {
 /// Where per-read poly(A) length comes from.
 ///
 /// `pt:i` is Dorado's native tail-length tag, so it is the default and it is
-/// what every BAM in the 10-sample cohort carries (~97% of records). But it is
-/// a basecaller-specific tag, and the other common producers -- tailfindr,
-/// nanopolish -- emit plain-text summaries instead. A BAM re-aligned from one
-/// of those has no `pt:i` at all, and before this type existed that case
-/// produced an EMPTY GRAPH and exit code 0: every record dropped at the tag
-/// read, with nothing to distinguish "this BAM has no poly(A)" from "this
-/// sample has no reads". That is the fail-quiet path the 2026-10-02 ruling
-/// ordered destroyed.
+/// what every BAM in the 10-sample cohort carries (~97% of records). It is a
+/// basecaller-specific tag, and a BAM re-aligned from a producer that does not
+/// emit it has no `pt:i` at all; before this type existed that case produced an
+/// EMPTY GRAPH and exit code 0: every record dropped at the tag read, with
+/// nothing to distinguish "this BAM has no poly(A)" from "this sample has no
+/// reads". That is the fail-quiet path the 2026-10-02 ruling ordered destroyed,
+/// and `PolyASource::None` is the only sanctioned answer to it now.
+///
+/// A third variant, `Tsv` (`read_id<TAB>poly_a_len`, the tailfindr / nanopolish
+/// side-file shape), existed until the 2026-10-03 deletion. It was removed as a
+/// physical deletion, not deprecated: `--polyA-source tsv:<path>` is now a parse
+/// error, not a warning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolyASource {
     /// Read a two-character SAM tag from each record. `None` on a record is a
     /// drop, exactly as before — that is correct when most records carry the
     /// tag, and a global absence is a hard error rather than a silent success.
     BamTag(Tag),
-    /// A `read_id <TAB> poly_a_len` TSV, as emitted by tailfindr / nanopolish.
-    /// Records absent from the table are DROPPED, and a table that matches no
-    /// record at all is a hard error for the same reason as a missing tag.
-    Tsv(std::path::PathBuf),
     /// Declared absence of poly(A). No record is dropped for want of it and
     /// `log_pal` is filled with a finite placeholder.
     ///
@@ -146,10 +146,9 @@ pub enum PolyASource {
 
 /// Parse the `--polyA-source` CLI value into a [`PolyASource`].
 ///
-/// Three forms, exactly as the expert ruling specifies them:
-///   `bam_tag:pt`     Dorado's native tail-length tag (the historical default)
-///   `tsv:<path>`     `read_id<TAB>poly_a_len`, the tailfindr / nanopolish shape
-///   `none`           declared-absent; alignment-only, `poly_a_weight` forced 0
+/// Two forms, exactly as the expert ruling specifies them:
+///   `bam_tag:<TAG>` Dorado's native tail-length tag (the historical default)
+///   `none`          declared-absent; alignment-only, `poly_a_weight` forced 0
 ///
 /// The tag is a parameter rather than the literal `pt` so a re-basecaller that
 /// emits a different tag can be used without a code change — but the ruling
@@ -160,12 +159,6 @@ pub fn parse_poly_a_source(spec: &str) -> Result<PolyASource> {
     if spec == "none" {
         return Ok(PolyASource::None);
     }
-    if let Some(path) = spec.strip_prefix("tsv:") {
-        if path.is_empty() {
-            anyhow::bail!("--polyA-source tsv: needs a path, e.g. tsv:tailfindr.tsv");
-        }
-        return Ok(PolyASource::Tsv(std::path::PathBuf::from(path)));
-    }
     if let Some(tag) = spec.strip_prefix("bam_tag:") {
         let bytes = tag.as_bytes();
         // SAM tags are exactly two alphanumeric characters. Checking here
@@ -175,9 +168,7 @@ pub fn parse_poly_a_source(spec: &str) -> Result<PolyASource> {
         }
         return Ok(PolyASource::BamTag(Tag::from([bytes[0], bytes[1]])));
     }
-    anyhow::bail!(
-        "--polyA-source must be one of `bam_tag:<TAG>`, `tsv:<path>` or `none`; got `{spec}`"
-    );
+    anyhow::bail!("--polyA-source must be one of `bam_tag:<TAG>` or `none`; got `{spec}`");
 }
 
 /// Number of records scanned before deciding a poly(A) source is globally
@@ -226,91 +217,8 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
         bail!("Transcriptome BAM header contains no reference transcripts");
     }
 
-    // poly(A) from an external table, loaded before the streaming loop so a
-    // malformed file is a startup error rather than a per-record surprise.
-    let tsv_table: Option<HashMap<String, i32>> = match poly_a {
-        PolyASource::Tsv(path) => {
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("Failed to read --polyA-source tsv:{}", path.display()))?;
-            let mut t = HashMap::new();
-            let mut n = 0usize;
-            // Data lines seen so far, excluding a skipped header. Lets the
-            // header be recognised on the first non-blank, non-comment line
-            // without mistaking a real read called `read_id` for a header.
-            let mut n_seen = 0usize;
-            // Rows carrying a non-positive length: an invalid measurement, and
-            // the read is dropped at lookup like any other uncovered read.
-            let mut n_invalid = 0usize;
-            for (i, line) in text.lines().enumerate() {
-                let trimmed = line.trim();
-                if trimmed.is_empty()
-                    || trimmed.starts_with('#') && !trimmed.starts_with("#read_id")
-                {
-                    continue;
-                }
-                let mut f = line.split('\t');
-                let rid = f.next().unwrap_or("").trim();
-                let val = f.next().unwrap_or("").trim();
-                // A header line (`read_id<TAB>poly_a_len`) is the common shape
-                // from tailfindr and nanopolish; skip it rather than making
-                // the caller pre-strip it.
-                //
-                // Keyed to the first line that SURVIVES the blank/comment skip,
-                // not to `i == 0`. A file that opens with a provenance comment
-                // -- which is what a hand-annotated table has -- put the header
-                // on line 2, and the whole run died on a valid file.
-                if n == 0
-                    && n_seen == 0
-                    && (rid.eq_ignore_ascii_case("read_id") || rid == "#read_id")
-                {
-                    n_seen += 1;
-                    continue;
-                }
-                n_seen += 1;
-                match val.parse::<i32>() {
-                    Ok(v) if v > 0 => {
-                        t.insert(rid.to_string(), v);
-                        n += 1;
-                    }
-                    // `poly_a_len <= 0` is a PHYSICALLY INVALID MEASUREMENT
-                    // (adapter read-through, or a caller that could not call a
-                    // length), not a corrupt file. A read with no usable tail
-                    // is a normal outcome and the bam_tag path already treats
-                    // it that way — it drops the read. Bailing here made one
-                    // such row kill a 27 M-record batch, and it made the two
-                    // sources disagree about the same biology. Both now drop
-                    // the read, and the count is reported at the end.
-                    Ok(_) => n_invalid += 1,
-                    // A value that is not an integer at all IS a file-format
-                    // error: it means the columns are not what the caller
-                    // thinks they are, and every subsequent lookup would be
-                    // silently wrong.
-                    Err(_) => bail!(
-                        "--polyA-source tsv:{} line {}: expected `read_id<TAB>positive_int`, \
-                         got `{rid}<TAB>{val}`. A non-positive length is skipped as an \
-                         invalid measurement; a non-integer is a column-layout error.",
-                        path.display(),
-                        i + 1
-                    ),
-                }
-            }
-            if n == 0 {
-                bail!(
-                    "--polyA-source tsv:{} contains no usable rows ({} rows had a \
-                     non-positive length)",
-                    path.display(),
-                    n_invalid
-                );
-            }
-            eprintln!(
-                "[telescope] poly(A) source: tsv:{} ({n} entries, {n_invalid} rows with \
-                 an invalid length and dropped)",
-                path.display()
-            );
-            Some(t)
-        }
-        _ => None,
-    };
+    // poly(A) comes either from a SAM tag on the record or is declared absent;
+    // there is no external-table source.
     let tag_to_read: Option<Tag> = match poly_a {
         PolyASource::BamTag(t) => Some(*t),
         _ => None,
@@ -455,16 +363,14 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
                 PolyASource::BamTag(t) => {
                     format!("bam_tag:{}", String::from_utf8_lossy(t.as_ref()))
                 }
-                PolyASource::Tsv(p) => format!("tsv:{}", p.display()),
                 PolyASource::None => "none".to_string(),
             };
             bail!(
                 "FATAL: no record among the first {POLY_A_PROBE_RECORDS} carries \
                  poly(A) from the requested source `{spec}`. \
                  If your BAM lacks Dorado poly(A) tags, specify \
-                 `--polyA-source none` for a pure-alignment run, or \
-                 `--polyA-source tsv:<path>` with a tailfindr/nanopolish \
-                 summary. Refusing to continue: returning an empty graph here \
+                 `--polyA-source none` for a pure-alignment run. \
+                 Refusing to continue: returning an empty graph here \
                  is indistinguishable downstream from a sample with no reads."
             );
         }
@@ -480,16 +386,6 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
                 },
                 _ => continue, // skip missing or unparseable tag
             },
-            PolyASource::Tsv(_) => {
-                let rid = match record.name() {
-                    Some(n) => String::from_utf8_lossy(n).to_string(),
-                    None => continue,
-                };
-                match tsv_table.as_ref().and_then(|t| t.get(&rid)) {
-                    Some(&v) => v,
-                    None => continue,
-                }
-            }
             PolyASource::None => {
                 // Declared-absent. Nothing is dropped; the placeholder is NOT
                 // a measurement and the CLI forces poly_a_weight = 0 to keep
@@ -665,16 +561,14 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
             PolyASource::BamTag(t) => {
                 format!("bam_tag:{}", String::from_utf8_lossy(t.as_ref()))
             }
-            PolyASource::Tsv(p) => format!("tsv:{}", p.display()),
             PolyASource::None => "none".to_string(),
         };
         bail!(
             "FATAL: none of the {poly_a_records_seen} scanned records carries \
              poly(A) from the requested source `{spec}`. \
              If your BAM lacks Dorado poly(A) tags, specify \
-             `--polyA-source none` for a pure-alignment run, or \
-             `--polyA-source tsv:<path>` with a tailfindr/nanopolish \
-             summary. Refusing to continue: returning an empty graph here \
+             `--polyA-source none` for a pure-alignment run. \
+             Refusing to continue: returning an empty graph here \
              is indistinguishable downstream from a sample with no reads."
         );
     }
@@ -1372,72 +1266,6 @@ mod tests {
         );
     }
 
-    /// A TSV whose first data line is preceded by a comment must still be
-    /// accepted. The header skip used to be keyed to the raw line index, so a
-    /// provenance comment -- the first line of any hand-annotated table --
-    /// pushed the header to line 2 and killed a valid file.
-    #[test]
-    fn test_a_tsv_header_behind_a_comment_line_is_still_recognised() {
-        use noodles_sam::alignment::record_buf::data::field::Value;
-
-        let mut a = synth_record_with_gap("cmt_a", 0, 0, false, Some(1000), 1, 60);
-        a.data_mut().clear();
-        a.data_mut().insert(TAG_NM, Value::from(1i32));
-        let bam_path = write_synthetic_bam("tsv_comment", vec![a]);
-
-        let tsv = bam_path.with_extension("comment.tsv");
-        std::fs::write(
-            &tsv,
-            "# tailfindr v0.3 on HC2, run 2026-10-02\n\nread_id\tpoly_a_len\ncmt_a\t48\n",
-        )
-        .unwrap();
-
-        let graph = extract_evidence_with(&bam_path, 35, &PolyASource::Tsv(tsv.clone())).unwrap();
-        let _ = std::fs::remove_file(&bam_path);
-        let _ = std::fs::remove_file(&tsv);
-
-        assert_eq!(
-            graph.molecules.len(),
-            1,
-            "the commented header must be skipped, not parsed"
-        );
-        assert!((graph.molecules[0].log_pal - (48.0_f32).log2()).abs() < 1e-6);
-    }
-
-    /// A read ABSENT from the table is DROPPED, not defaulted. This is the
-    /// contract that turns a mismatched table (wrong sample, a `/1` vs `/2`
-    /// suffix mismatch) into a loud failure rather than a full, confident-looking
-    /// graph built on placeholder values -- and it was unpinned: changing the
-    /// `None => continue` to keep the read with a fabricated poly(A) of 1 left
-    /// the whole suite green.
-    #[test]
-    fn test_a_read_absent_from_the_tsv_is_dropped_not_defaulted() {
-        use noodles_sam::alignment::record_buf::data::field::Value;
-
-        let mut in_table = synth_record_with_gap("tbl_yes", 0, 0, false, Some(1000), 1, 60);
-        in_table.data_mut().clear();
-        in_table.data_mut().insert(TAG_NM, Value::from(1i32));
-        let mut not_in_table = synth_record_with_gap("tbl_no", 1, 0, false, Some(1000), 1, 60);
-        not_in_table.data_mut().clear();
-        not_in_table.data_mut().insert(TAG_NM, Value::from(1i32));
-        let bam_path = write_synthetic_bam("tsv_partial", vec![in_table, not_in_table]);
-
-        let tsv = bam_path.with_extension("partial.tsv");
-        std::fs::write(&tsv, "read_id\tpoly_a_len\ntbl_yes\t64\n").unwrap();
-
-        let graph = extract_evidence_with(&bam_path, 35, &PolyASource::Tsv(tsv.clone())).unwrap();
-        let _ = std::fs::remove_file(&bam_path);
-        let _ = std::fs::remove_file(&tsv);
-
-        let ids: Vec<&str> = graph.molecules.iter().map(|m| m.read_id.as_str()).collect();
-        assert_eq!(
-            ids,
-            vec!["tbl_yes"],
-            "a read the table does not cover must be DROPPED; a fabricated poly(A) \
-             would let a half-matched table produce a full, plausible graph"
-        );
-    }
-
     /// The provenance flag is set by the source, not inferred from the data.
     /// `log_pal == 0.0` in a REAL graph is not evidence of a placeholder: a BAM
     /// legitimately contains reads with no usable `pt:i`, and those are dropped
@@ -1472,12 +1300,16 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The three CLI spellings, and the rejections. The spelling is load-bearing
+    /// The two CLI spellings, and the rejections. The spelling is load-bearing
     /// beyond cosmetics: the guard's FATAL message quotes `--polyA-source` to
     /// the user, so a parser that only accepted some spelling would produce an
     /// error naming a flag that cannot be typed.
+    ///
+    /// `tsv:` is in the REJECTION list, not the acceptance list. The TSV poly(A)
+    /// source was deleted outright (not deprecated), so both a well-formed TSV
+    /// spec and a bare `tsv:` prefix must now be errors naming the flag.
     #[test]
-    fn test_parse_poly_a_source_accepts_the_three_forms_and_rejects_the_rest() {
+    fn test_parse_poly_a_source_accepts_the_two_forms_and_rejects_the_rest() {
         assert_eq!(
             parse_poly_a_source("bam_tag:pt").unwrap(),
             PolyASource::BamTag(TAG_PT)
@@ -1487,10 +1319,6 @@ mod tests {
         assert_eq!(
             parse_poly_a_source("bam_tag:Zt").unwrap(),
             PolyASource::BamTag(Tag::from(*b"Zt"))
-        );
-        assert_eq!(
-            parse_poly_a_source("tsv:/tmp/tailfindr.tsv").unwrap(),
-            PolyASource::Tsv(std::path::PathBuf::from("/tmp/tailfindr.tsv"))
         );
         assert_eq!(parse_poly_a_source(" none ").unwrap(), PolyASource::None);
 
@@ -1505,6 +1333,7 @@ mod tests {
             "bam_tag:p",
             "bam_tag:pts",
             "tsv:",
+            "tsv:/tmp/tailfindr.tsv",
             "BAM_TAG:pt",
         ] {
             let err = parse_poly_a_source(bad).expect_err(&format!("{bad:?} must be rejected"));
@@ -1599,109 +1428,6 @@ mod tests {
         );
     }
 
-    /// `tsv:<path>` supplies poly(A) for a BAM that carries no `pt:i` -- the
-    /// tailfindr / nanopolish side-file shape. The header line is the common
-    /// form and is skipped rather than pushed back onto the caller.
-    #[test]
-    fn test_tsv_source_supplies_poly_a_for_a_bam_with_no_pt_tag() {
-        use noodles_sam::alignment::record_buf::data::field::Value;
-
-        let mut a = synth_record_with_gap("tsv_a", 0, 0, false, Some(1000), 1, 60);
-        a.data_mut().clear();
-        a.data_mut().insert(TAG_NM, Value::from(1i32));
-        let bam_path = write_synthetic_bam("tsv_src", vec![a]);
-
-        let tsv_path = bam_path.with_extension("polyA.tsv");
-        std::fs::write(&tsv_path, "read_id\tpoly_a_len\ntsv_a\t64\n").unwrap();
-
-        let graph =
-            extract_evidence_with(&bam_path, 35, &PolyASource::Tsv(tsv_path.clone())).unwrap();
-        let _ = std::fs::remove_file(&bam_path);
-        let _ = std::fs::remove_file(&tsv_path);
-
-        assert_eq!(
-            graph.molecules.len(),
-            1,
-            "the TSV row must resurrect the read"
-        );
-        assert_eq!(graph.molecules[0].read_id, "tsv_a");
-        let want = (64.0_f32).log2();
-        assert!(
-            (graph.molecules[0].log_pal - want).abs() < 1e-6,
-            "y_r must be log2 of the TSV value, not of any tag: want {want}"
-        );
-    }
-
-    /// INVERTED per the 2026-10-02 ruling.
-    ///
-    /// This used to assert that a `poly_a_len = 0` row is FATAL. It is not, and
-    /// should never have been: `0` is a physically invalid measurement (adapter
-    /// read-through, or a caller that could not call a length), not a corrupt
-    /// file, and killing a 27 M-record batch because one read in it has no tail
-    /// is a self-inflicted outage. The bam_tag path has always dropped such a
-    /// read; the two sources now agree, and a Fatal is reserved for the global
-    /// probe (no valid measurement in the first 10,000 records) and for a
-    /// column-layout error, where every later lookup would be silently wrong.
-    #[test]
-    fn test_a_non_positive_tsv_row_is_skipped_but_a_non_integer_row_is_fatal() {
-        use noodles_sam::alignment::record_buf::data::field::Value;
-
-        let tsv_path = std::env::temp_dir().join(format!(
-            "telescope_evidence_invalid_tsv_{}.tsv",
-            std::process::id()
-        ));
-        let mut a = synth_record_with_gap("inv_a", 0, 0, false, Some(1000), 1, 60);
-        a.data_mut().clear();
-        a.data_mut().insert(TAG_NM, Value::from(1i32));
-        let mut b = synth_record_with_gap("inv_b", 1, 0, false, Some(1000), 1, 60);
-        b.data_mut().clear();
-        b.data_mut().insert(TAG_NM, Value::from(1i32));
-        let bam_path = write_synthetic_bam("tsv_invalid", vec![a, b]);
-
-        // (1) every row invalid -> the table supplies no poly(A) at all, which
-        //     IS fatal, by the same global rule as a missing tag
-        std::fs::write(&tsv_path, "read_id\tpoly_a_len\ninv_a\t0\ninv_b\t0\n").unwrap();
-        let err = extract_evidence_with(&bam_path, 35, &PolyASource::Tsv(tsv_path.clone()))
-            .expect_err("a table whose only rows are invalid supplies no poly(A) at all");
-        assert!(
-            format!("{err:#}").contains("no usable rows"),
-            "the global `no usable rows` error is the right one here"
-        );
-
-        // (2) one invalid row beside a valid one -> the run CONTINUES, the
-        //     covered read is used, and the read with the invalid measurement
-        //     is dropped. This is the 27 M-record case the ruling is about.
-        std::fs::write(&tsv_path, "read_id\tpoly_a_len\ninv_a\t0\ninv_b\t70\n").unwrap();
-        let graph = extract_evidence_with(&bam_path, 35, &PolyASource::Tsv(tsv_path.clone()))
-            .expect("one invalid row must not kill a table that still has a valid row");
-        assert_eq!(
-            graph.molecules.len(),
-            1,
-            "only the read with a valid measurement survives"
-        );
-        assert_eq!(graph.molecules[0].read_id, "inv_b");
-        assert!((graph.molecules[0].log_pal - (70.0_f32).log2()).abs() < 1e-6);
-
-        // (3) a negative length is the same class as zero
-        std::fs::write(&tsv_path, "read_id\tpoly_a_len\ninv_a\t-5\ninv_b\t70\n").unwrap();
-        let graph = extract_evidence_with(&bam_path, 35, &PolyASource::Tsv(tsv_path.clone()))
-            .expect("a negative length is an invalid measurement, not a fatal one");
-        assert_eq!(graph.molecules.len(), 1, "inv_a drops, inv_b survives");
-
-        // (4) a NON-INTEGER stays fatal: it means the columns are not what the
-        //     caller thinks, and every later lookup would be silently wrong
-        std::fs::write(&tsv_path, "read_id\tpoly_a_len\ninv_a\tabc\n").unwrap();
-        let err = extract_evidence_with(&bam_path, 35, &PolyASource::Tsv(tsv_path.clone()))
-            .expect_err("a non-integer is a column-layout error");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("line 2") && msg.contains("inv_a"),
-            "the error must point at the offending line and read id, got: {msg}"
-        );
-
-        let _ = std::fs::remove_file(&bam_path);
-        let _ = std::fs::remove_file(&tsv_path);
-    }
     /// `none` drops nothing, and the global-absence guard must not fire on it.
     ///
     /// Note what actually makes that true: the `None` arm reports a HIT on

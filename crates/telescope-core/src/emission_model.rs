@@ -1,32 +1,73 @@
 //! Module 1: Emission Model Builder
 //!
-//! Two input modes (mutually exclusive at the CLI level):
+//! Two ways to construct the per-transcript emission model
+//! $P(L \mid T_k)$ — a Gaussian in $\log_2(\text{PAL})$
+//! space — for TEL-EM:
 //!
-//! - **AIDRS Mode (legacy)**: parses AIDRS outputs
-//!   (`aidrs.transcript_polyA_len.parquet` +
-//!   `aidrs.transcript.assessment.tsv`)
-//!   and constructs the per-transcript emission model
-//!   $P(L \mid T_k)$ — a Gaussian in $\log_2(\text{PAL})$
-//!   space — for TEL-EM.
-//! - **Universal Mode (D1 Step 3)**: parses the per-read
+//! - **Universal mode (the only one reachable from a CLI
+//!   subcommand)**: parses the per-read
 //!   `telescope.anchor_pool.parquet` (produced by
 //!   `anchor_builder::build_anchor_pool`), optionally joins
 //!   with `telescope.transcript_evidence.parquet` to apply
-//!   `em_eligible` filtering, then fits the same emission
-//!   model with a 3-level fallback cascade
-//!   (Tx → Gene → Cohort).
+//!   `em_eligible` filtering, then fits the emission model
+//!   with a 3-level fallback cascade (Tx → Gene → Cohort).
+//!   Entry point: `build_emission_from_anchors`, dispatched
+//!   from `telescope build-emission --anchor-pool`.
+//!
+//! - **External poly(A) initializer (DEFERRED, not wired to
+//!   any CLI subcommand)**: parses an AIDRS-shaped pair
+//!   (`aidrs.transcript_polyA_len.parquet` +
+//!   `aidrs.transcript.assessment.tsv`) and builds the same
+//!   emission model. The three functions
+//!   [`AssessmentQuality`], [`load_assessment_quality`] and
+//!   [`build_emission_parquet`] are RETAINED, working and
+//!   tested, but no CLI entry point currently reaches them:
+//!   the `--polya-parquet` / `--aidrs-assessment-tsv`
+//!   arguments of `telescope build-emission` were deleted on
+//!   2026-10-03, and `--anchor-pool` is now that subcommand's
+//!   sole input.
+//!
+//!   WHY IT IS DEFERRED, NOT DELETED. This was once "AIDRS
+//!   Mode", a peer of Universal mode with its own CLI surface,
+//!   and it was removed in that role because the two paths
+//!   were never actually compared. Whether AIDRS's upstream
+//!   read→transcript assignment is BETTER OR WORSE than
+//!   Universal's own is a measurement that HAS NEVER BEEN
+//!   MADE. Until it is made, the initializer design is frozen
+//!   in the 解冻区 (thaw region): keeping the code costs
+//!   nothing, but re-exposing the CLI would be a decision
+//!   dressed as a convenience. The one thing the frozen code
+//!   does establish is agreement, not superiority — see
+//!   `test_aidrs_universal_equivalence` below.
 //!
 //! Output: `telescope.emission.parquet` with the schema
 //! declared in `output_schema()`. Each row is one transcript
 //! $T_k$ with computed emission parameters
 //! $(\mu_{k,\text{cohort}}, \sigma^2_{k,\text{cohort}})$.
 //!
+//! ## The fitted object is a DISTRIBUTION, not a scalar
+//!
+//! A row of the anchor pool is one (sample, transcript, read)
+//! triple carrying one observed `poly_a_length`. A
+//! transcript's emission is therefore fitted to a
+//! **per-read observation set**, and $\mu_k$ / $\sigma^2_k$
+//! are DERIVED PARAMETERS of that fit — summary statistics,
+//! not measurements. A transcript with 1, 3 or 400 anchor
+//! reads has the same kind of row here; only the width of the
+//! observation set behind it differs. The shipped anchor
+//! pool is 90,703 rows over 15,427 transcripts, of which
+//! 49.32% carry more than one distinct observed length, so
+//! the scalar reading of a "transcript's poly(A) length" is
+//! wrong for roughly half the transcriptome and the
+//! distribution reading is the one to use.
+//!
 //! ## `polyA_frac` + `is_polyA_competent` semantics
 //!
-//! - **AIDRS Mode**: state is lifted from
-//!   `aidrs.transcript.assessment.tsv` (State 1/2/3 → 3-way
-//!   classification, see `load_assessment_quality`).
-//! - **Universal Mode**: there is no equivalent
+//! - **External poly(A) initializer (deferred)**: state is
+//!   lifted from `aidrs.transcript.assessment.tsv` (State
+//!   1/2/3 → 3-way classification, see
+//!   `load_assessment_quality`).
+//! - **Universal mode**: there is no equivalent
 //!   `assessment.tsv`. We define:
 //!   - `polyA_frac` = fraction of anchor reads for the
 //!     transcript with `poly_a_length >= 10`. Since the
@@ -159,6 +200,11 @@ impl Default for FallbackConfig {
 }
 
 /// Per-transcript poly(A) state from `aidrs.transcript.assessment.tsv`.
+///
+/// Part of the DEFERRED external poly(A) initializer; see the module
+/// docs. Retained, not deprecated: no CLI subcommand reaches it, and it
+/// is expected to be re-wired only after the read→transcript assignment
+/// comparison the module docs name has been made.
 #[derive(Debug, Clone, Copy)]
 pub struct AssessmentQuality {
     pub poly_a_frac: f64,
@@ -176,6 +222,9 @@ pub struct AssessmentQuality {
 /// `(0.0, is_poly_a_competent=false)`. Numeric non-zero values
 /// keep their original `polyA_frac` and flag the transcript as
 /// polyA-competent.
+///
+/// Part of the DEFERRED external poly(A) initializer; see the module
+/// docs. Not reachable from any CLI subcommand.
 pub fn load_assessment_quality<P: AsRef<Path>>(
     tsv_path: P,
 ) -> Result<HashMap<String, AssessmentQuality>> {
@@ -241,6 +290,25 @@ pub fn output_schema() -> Arc<Schema> {
         Field::new("gene_id", DataType::Utf8, false),
         Field::new("polyA_frac", DataType::Float64, false),
         Field::new("is_polyA_competent", DataType::Boolean, false),
+        // WHAT THIS COLUMN ACTUALLY HOLDS. Despite the name, `n_cohort_flnc`
+        // is NOT a cohort-fallback count and is not a count of distinct
+        // lengths. It is the number of anchor OBSERVATIONS for the
+        // transcript: `acc.len()`, one per (sample, transcript, read) row in
+        // the anchor pool. The anchor pool carries the same poly_a_length on
+        // two different reads as TWO rows, and this column counts 2.
+        //
+        // The L1/L2/L3 level is therefore NOT stored in the file. It is
+        // INFERRED downstream by comparing this value against the
+        // `tx_min_reads` / `gene_min_reads` thresholds that
+        // `build_emission_from_anchors` was run with: `>= tx_min_reads` is
+        // L1, and anything smaller is L2 or L3 depending on its gene's pooled
+        // count. Those thresholds are not recorded in the parquet, so this
+        // reconstruction is only exact when the reader knows them.
+        //
+        // The column is NOT renamed and the schema is NOT changed: it is part
+        // of the published contract that Module 3 and downstream consumers
+        // read. `test_n_cohort_flnc_counts_observations_not_distinct_lengths`
+        // pins the observation-counting semantics.
         Field::new("n_cohort_flnc", DataType::UInt32, false),
         Field::new("mu_logPAL", DataType::Float64, false),
         Field::new("sigma2_logPAL", DataType::Float64, false),
@@ -254,6 +322,13 @@ pub fn output_schema() -> Arc<Schema> {
 /// `polyA_frac` and `is_polyA_competent`, computes the log2(pal)
 /// mean/variance per transcript, applies `INSTRUMENTAL_PAL_NOISE_FLOOR`
 /// floor, and writes the 7-column output schema above.
+///
+/// Part of the DEFERRED external poly(A) initializer; see the module
+/// docs. No CLI subcommand reaches it as of 2026-10-03 — the
+/// `build-emission` command that used to dispatch here takes
+/// `--anchor-pool` only. Retained so the initializer stays a
+/// re-wirable option once the comparison the module docs name has been
+/// made; it is covered live by `test_aidrs_universal_equivalence`.
 pub fn build_emission_parquet<P: AsRef<Path>>(
     poly_a_parquet_path: P,
     assessment_tsv_path: P,
@@ -707,6 +782,15 @@ where
         gene_id_builder.append_value(&acc.gene_id);
         frac_builder.append_value(poly_a_frac);
         competent_builder.append_value(is_poly_a_competent);
+        // `n_cohort_flnc` := the number of anchor OBSERVATIONS for this
+        // transcript (`acc.len()`), NOT a count of distinct poly(A) lengths
+        // and NOT a cohort-fallback count. Two reads carrying the same
+        // `poly_a_length` are two anchor rows and this value is 2.
+        //
+        // Which fallback level produced the row's `(mu, sigma2)` is not
+        // recorded here; it is inferred by comparing `n` against
+        // `tx_min_reads` / `gene_min_reads`. Pinned by
+        // `test_n_cohort_flnc_counts_observations_not_distinct_lengths`.
         count_builder.append_value(n as u32);
         mu_builder.append_value(fit.mu);
         sigma2_builder.append_value(fit.sigma2);
@@ -735,14 +819,24 @@ where
     writer.write(&batch).context("Failed to write batch")?;
     writer.close().context("Failed to close writer")?;
 
+    // The L1/L2/L3 COUNTS are what the fallback cascade chose; the FRACTIONS
+    // are what it means for the run, and the two answer different questions.
+    // A run that is 80% L1 and a run that is 80% L3 both print a valid triple,
+    // but the second is a run in which most transcripts carry no
+    // transcript-specific poly(A) distribution at all — the cohort fit is
+    // standing in for them. The denominator is the number of output rows.
+    let n_tx_total = (n_l1 + n_l2 + n_l3).max(1);
     eprintln!(
         "[telescope]  Universal mode: {} transcripts, {} cohort reads, \
-         L1={} L2={} L3={}",
+         L1={} ({:.1}%) L2={} ({:.1}%) L3={} ({:.1}%)",
         tx_accums.len(),
         cohort_log2_pals.len(),
         n_l1,
+        n_l1 as f64 * 100.0 / n_tx_total as f64,
         n_l2,
+        n_l2 as f64 * 100.0 / n_tx_total as f64,
         n_l3,
+        n_l3 as f64 * 100.0 / n_tx_total as f64,
     );
 
     Ok(())
@@ -792,6 +886,12 @@ mod tests {
 
     /// Write an AIDRS-format `aidrs.transcript_polyA_len.parquet`
     /// (3-column subset) from a list of `TxFixture`.
+    ///
+    /// This is the fixture writer for the DEFERRED external poly(A)
+    /// initializer, and it is RETAINED rather than deleted: it is what
+    /// `test_aidrs_universal_equivalence` feeds `build_emission_parquet`
+    /// with, and that test is required to keep running. Deleting the
+    /// helper would delete the test with it.
     fn write_aidrs_parquet(path: &Path, fxs: &[TxFixture]) {
         let mut tx_b = StringBuilder::new();
         let mut gene_b = StringBuilder::new();
@@ -836,6 +936,10 @@ mod tests {
 
     /// Write an AIDRS-format assessment.tsv (`TrID\tpolyA_frac`).
     /// All entries get `polyA_frac = 1.0` (State 1).
+    ///
+    /// RETAINED, not deleted: fixture writer for the DEFERRED external
+    /// poly(A) initializer, used only by
+    /// `test_aidrs_universal_equivalence`. See `write_aidrs_parquet`.
     fn write_assessment_tsv(path: &Path, fxs: &[TxFixture]) {
         use std::fmt::Write as _;
         let mut s = String::from("TrID\tpolyA_frac\n");
@@ -992,16 +1096,34 @@ mod tests {
     }
 
     /// Per spec 常温区 Step 3 Part 2 + final ruling: the
-    /// statistical equivalence test between AIDRS mode and
-    /// Universal mode is the acceptance criterion for Step 3
-    /// Part 2.
+    /// statistical equivalence test between the external
+    /// poly(A) initializer and Universal mode is the acceptance
+    /// criterion for Step 3 Part 2.
+    ///
+    /// THIS TEST KEEPS RUNNING after the initializer lost its CLI
+    /// surface on 2026-10-03. It is the live proof that
+    /// `build_emission_parquet` (deferred, no CLI entry point
+    /// reaches it) and `build_emission_from_anchors` (the only
+    /// CLI-reachable path) AGREE — to <1e-9 relative on `mu_logPAL`
+    /// and `sigma2_logPAL`, and EXACTLY on `n_cohort_flnc`. Do not
+    /// convert it to prose and do not loosen its tolerances: it is
+    /// the only executable evidence that the retained initializer
+    /// is a real option rather than dead code, and the only thing
+    /// pinning the fit is format-independent.
+    ///
+    /// Note what it does NOT show: that either path assigns reads
+    /// to transcripts better than the other. Both consume the same
+    /// (tx, pal) pairs here, so upstream read→transcript
+    /// assignment — the actual open question — is held fixed and
+    /// unmeasured. See the module docs on why the initializer is
+    /// deferred.
     ///
     /// Test fixture: 3 transcripts, 100 reads each, all reads
     /// uniquely mapping to 1 transcript. Reads sampled from a
     /// log-normal in `log2(PAL)` space (synthetic, deterministic
     /// pal values). The SAME data is laid out in two formats
-    /// (AIDRS-format list-per-tx vs Universal-format per-read
-    /// rows) and processed by the two modes. Per-transcript
+    /// (initializer-format list-per-tx vs Universal-format
+    /// per-read rows) and processed by the two paths. Per-transcript
     /// `mu_logPAL`, `sigma2_logPAL`, and `n_cohort_flnc` MUST
     /// agree to machine precision. `polyA_frac` and
     /// `is_polyA_competent` are documented to differ conceptually
@@ -1288,5 +1410,56 @@ mod tests {
         let by_tx: HashMap<&str, u32> = rows.iter().map(|r| (r.0.as_str(), r.4)).collect();
         assert_eq!(by_tx["tx_keep"], 10);
         assert_eq!(by_tx["tx_keep2"], 10);
+    }
+
+    /// `n_cohort_flnc` counts OBSERVATIONS, not distinct lengths.
+    ///
+    /// The column is named as though it were a cohort-fallback count and is
+    /// easy to read as a count of distinct values; it is neither. It is
+    /// `acc.len()` — the number of anchor rows for the transcript, one per
+    /// (sample, transcript, read). A transcript whose 2 reads carry the SAME
+    /// `poly_a_length` therefore reports 2, not 1.
+    ///
+    /// This is the ONLY assertion that separates the two readings. The
+    /// distinct-values case is already pinned by
+    /// `test_universal_em_eligible_filtering` above (10 reads, 10 distinct
+    /// lengths, `n_cohort_flnc == 10`); that case is consistent with BOTH
+    /// "counts observations" and "counts distinct values", so it cannot
+    /// discriminate. Repeating it here would add no coverage. Degenerating
+    /// the two reads to one value is what makes the readings differ.
+    ///
+    /// A mutation that made this column count distinct lengths would leave
+    /// the whole suite green without this test.
+    #[test]
+    fn test_n_cohort_flnc_counts_observations_not_distinct_lengths() {
+        let tmp = std::env::temp_dir().join("telescope_test_ncohort_obs");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+
+        // Two reads, SAME poly_a_length on both. `pals` is the per-read list,
+        // and `write_anchor_pool_parquet` emits one row per element, so this
+        // is genuinely two observations of one value.
+        let fxs = vec![TxFixture {
+            gene_id: "gene_dup".into(),
+            tx_id: "tx_dup".into(),
+            pals: vec![80, 80],
+        }];
+
+        let anchor_pool = tmp.join("anchor_pool.parquet");
+        let out = tmp.join("emission.parquet");
+        write_anchor_pool_parquet(&anchor_pool, &fxs);
+        build_emission_from_anchors(&anchor_pool, None::<&str>, &out, &FallbackConfig::default())
+            .expect("Universal mode run on a duplicate-length transcript");
+
+        let rows = read_emission_parquet(&out);
+        assert_eq!(rows.len(), 1, "one transcript row expected");
+        assert_eq!(
+            rows[0].4, 2,
+            "n_cohort_flnc must be the OBSERVATION count (2 reads, both 80 nt), \
+             not a count of distinct poly(A) lengths (which would be 1) and not a \
+             cohort-fallback count"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

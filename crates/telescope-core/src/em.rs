@@ -238,7 +238,7 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
              --polyA-source none. Every molecule's log_pal is the placeholder, \
              not an observed tail length, so the Gaussian would score a constant \
              emission and distort every posterior. Re-run with \
-             --polyA-source bam_tag:pt / tsv:<path>, or set --poly-a-weight 0."
+             --polyA-source bam_tag:<TAG>, or set --poly-a-weight 0."
         );
     }
 
@@ -351,11 +351,12 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
             "ID-SPACE MISMATCH: none of the {num_transcripts} transcripts in the BAM are \
              present among the {n_emission} rows of the emission parquet (BAM id e.g. \
              {bam_sample:?}, emission id e.g. {em_sample:?}). Every read would be \
-             silently dropped and an EMPTY profile written. In AIDRS Mode the BAM is \
-             keyed `AIDRS_tx_N` and the AIDRS polyA/assessment tables are keyed \
-             `ENST`/`ENSG_NovelTr`; pass `--tx-id-mapping <bam_id<TAB>original_id tsv>` \
-             to bridge them, or use Universal Mode (`build-anchors`), whose ids come \
-             from the BAM itself."
+             silently dropped and an EMPTY profile written. The retired AIDRS \
+             quant path was the one configuration that produced this: its BAM was \
+             keyed `AIDRS_tx_N` while the AIDRS polyA/assessment tables were keyed \
+             `ENST`/`ENSG_NovelTr`; it was bridged with `--tx-id-mapping <bam_id<TAB> \
+             original_id tsv>`. Universal Mode (`build-anchors`) needs no bridge, \
+             because its ids come from the BAM itself."
         );
     }
 
@@ -729,6 +730,7 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
     let mut n_entropy_clean = 0_u64;
     let mut n_entropy_partial = 0_u64;
     let mut n_entropy_degenerate = 0_u64;
+    let mut n_polya_zero_power = 0_u64;
 
     // Per-read assignments are filled into a molecule-indexed slot vector and
     // flattened at the end, so the emitted table is in MOLECULE order and
@@ -824,6 +826,15 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         let ncand = mol.candidate_count;
         let as_ratio = read_max_as_ratio(&graph, mol);
 
+        // DEGRADATION TELEMETRY — how often poly(A) had no say at all.
+        // One per-read compare against the first candidate's fit; no
+        // allocation and no new per-read structure. See
+        // `polya_has_no_discriminative_power` for the definition and for
+        // why the comparison is exact rather than tolerance-based.
+        if polya_has_no_discriminative_power(&graph, mol, &params) {
+            n_polya_zero_power += 1;
+        }
+
         // Phase A entropy 3-tier + ghost-drop telemetry.
         if weights.is_empty() {
             n_dropped_no_competent_candidates += 1;
@@ -842,21 +853,47 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
             }
         }
 
-        if want_read_assignments {
-            // `weights` is already empty for a ghost read (no competent
-            // candidate), and that case must NOT fall through to an argmax:
-            // over an empty vector that is either a panic or, via a default,
-            // transcript 0 -- a real transcript this read was never assigned
-            // to. `None` is the honest answer, and the profile parquet has no
-            // row for such a read either.
-            //
+        // THE INVARIANT this table has to keep is NOT "assignments is a subset
+        // of the profile's reads". It is the one-directional form:
+        //
+        //     top_tx_id == Some(..)  IMPLIES  that read has a profile row.
+        //
+        // The subset claim was the wrong invariant and cost a real bug: a read
+        // whose every candidate fell below `min_weight` was assigned anyway
+        // while emitting zero profile rows, putting a read in the cross-run
+        // join's numerator that no profile row could put in its denominator.
+        // Three cases, and the middle one is the only silent one:
+        //
+        //   (1) GHOST -- `weights` is empty (every candidate pushed `-inf`:
+        //       pruned, incompetent, or `alpha <= 0`). No profile row, and
+        //       that is legitimate: there is nothing to emit. It IS recorded
+        //       here with `top_tx_id: None`, because "the solver looked at this
+        //       read and could not assign it" and "this read was never in this
+        //       run" are different facts and a cross-run comparison needs to
+        //       tell them apart. An argmax over the empty vector would either
+        //       panic or, worse, yield transcript 0.
+        //   (2) `min_weight` culled everything. The read HAS a real argmax, and
+        //       it is NOT recorded: the implication above would be violated and
+        //       the join denominator would not be auditable. Absent from BOTH
+        //       tables. A 0.5/0.5 pair under `--min-weight 0.9` is reachable
+        //       directly; at the shipped 0.01 it needs a read spread over
+        //       enough survivors that all of them sit under the cutoff.
+        //   (3) At least one candidate survives -- recorded, with a real
+        //       `top_tx_id`.
+        if want_read_assignments
+            && (weights.is_empty() || weights.iter().any(|&(_, w)| w >= min_weight))
+        {
             // `weights` is pre-truncation and pre-renormalisation (it is what
             // the M-step consumed), so `top_weight` here is the RAW E-step
             // weight. The `posterior_weight` column in the profile is
             // `w / retained_sum` after the `min_weight` cutoff. Different
             // quantities on purpose; do not treat them as interchangeable.
             let (top, top_w) = weights.iter().fold((None, 0.0f64), |acc, &(tx, w)| {
-                // Strict `>` => first-in-pool-order wins a tie, deterministically.
+                // Strict `>` (not `>=`) => on an exact tie the FIRST candidate
+                // in pool order wins, deterministically. No fixture in this
+                // file has a tie -- every ambiguous read's candidates carry
+                // `ΔAS > 0` -- so this rule is stated here, not pinned by a
+                // test. Do not read it as verified.
                 if w > acc.1 {
                     (Some(tx), w)
                 } else {
@@ -866,6 +903,12 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
             read_assign[mol_idx] = Some(ReadAssignment {
                 read_id: mol.read_id.clone(),
                 n_candidates_before_cutoff: ncand as usize,
+                // `None` only on the ghost path: the fold never ran, so there
+                // is no candidate to name. The `params` lookup cannot fail for
+                // a tx that is in `weights` -- the E-step's `if let Some` never
+                // pushed it in -- but it is kept as a `get`/`and_then` so a
+                // future change that does push such an entry degrades to
+                // `None` rather than panicking.
                 top_tx_id: top.and_then(|tx| {
                     params
                         .get(tx)
@@ -1026,12 +1069,21 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
 
     if let Some(out) = output_read_assignments {
         // `flatten()` drops the `None` slots. Every molecule is visited by
-        // exactly one of the two loops above, so the only `None`s left are
-        // reads that produced no profile row at all (transcript absent from
-        // the emission parquet). Those are genuinely unassignable, and dropping
-        // them keeps this table a strict subset of the profile's reads -- which
-        // is what makes the cross-run join denominator auditable rather than
-        // assumed.
+        // exactly one of the two loops above, and what survives is NOT a
+        // subset of the profile's reads -- it obeys the weaker, one-directional
+        // invariant the cross-run join actually needs:
+        //
+        //     every emitted assignment either HAS a profile row, or is a ghost
+        //     with `top_tx_id = None`.
+        //
+        // The `None`s left are exactly the reads with no profile row AND no
+        // reason to be counted: transcripts absent from the emission parquet,
+        // and `min_weight`-culled reads. The second group is the one that used
+        // to slip through, carrying a real `top_tx_id` into a table whose
+        // denominator could not account for it. Ghosts are deliberately NOT in
+        // this list -- they are recorded, because "unassignable" and "never
+        // seen" must not collapse into the same absence when two runs are
+        // compared.
         *out = read_assign.into_iter().flatten().collect();
     }
 
@@ -1044,6 +1096,7 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         n_entropy_clean,
         n_entropy_partial,
         n_entropy_degenerate,
+        n_polya_zero_power,
         em_trace: output_em_trace.map(|t| t.clone()).unwrap_or_default(),
     })
 }
@@ -1051,6 +1104,59 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
 /// Round-trip polyA length through log2.
 fn poly_a_length_from_log2(log_pal: f32) -> i32 {
     log_pal.exp2().round() as i32
+}
+
+/// DEGRADATION TELEMETRY. True iff the read's candidate set has ZERO
+/// poly(A) discriminative power: every candidate that carries an emission
+/// row shares one identical `(mu, sigma2)` pair, so
+///
+/// ```text
+///   ln [ N(y; mu_a, s2_a) / N(y; mu_b, s2_b) ] = 0   for every a, b
+/// ```
+///
+/// and the read is decided entirely by the alignment (`A_rk`), 5'-anchoring
+/// and abundance terms.
+///
+/// WHY THE COMPARISON IS EXACT (`==`), NOT A TOLERANCE. The fits are shared
+/// by CONSTRUCTION when Module 1's fallback cascade fires: every
+/// underpowered transcript in one gene is handed the *same* `LogNormalFit`
+/// value, and every transcript with no usable gene pool is handed the same
+/// cohort fit. Those are bit-identical copies, so `==` fires on exactly the
+/// rows the fallback actually produced. An approximate test would also fire
+/// on two independently-fitted transcripts that merely happen to agree to a
+/// few ULPs, which is not the property being measured — and, because the
+/// metric is a degradation headline, a false positive there is the
+/// expensive direction.
+///
+/// A candidate with NO emission row is skipped rather than treated as a
+/// mismatch: a ghost transcript has no `(mu, sigma2)` to disagree with, and
+/// it is already counted by `n_dropped_no_competent_candidates`. A read
+/// with no candidate that has an emission row at all returns `false` —
+/// there is nothing to compare, so claiming "zero discriminative power"
+/// would be vacuous rather than measured.
+///
+/// The read's FULL candidate range is used, not the post-prune /
+/// post-truncation set: the question is what evidence the read HAD, not
+/// what survived.
+fn polya_has_no_discriminative_power(
+    graph: &FlatEvidenceGraph,
+    mol: &MoleculeEvidence,
+    params: &[Option<TranscriptParam>],
+) -> bool {
+    let off = mol.candidate_offset as usize;
+    let end = off + mol.candidate_count as usize;
+    let mut first: Option<(f64, f64)> = None;
+    for &tx in &graph.candidate_pool[off..end] {
+        let Some(p) = params.get(tx as usize).and_then(|o| o.as_ref()) else {
+            continue;
+        };
+        match first {
+            None => first = Some((p.mu, p.sigma2)),
+            Some((mu0, s20)) if mu0 == p.mu && s20 == p.sigma2 => {}
+            Some(_) => return false,
+        }
+    }
+    first.is_some()
 }
 
 /// Per-read observational statistic: `second_largest_AS / largest_AS` over the
@@ -1139,14 +1245,31 @@ fn posterior_entropy(weights: &[(usize, f64)]) -> f64 {
 ///   `prune_max_delta_as = 50`, would select a different and much smaller
 ///   population for any "fan-out >= N" question. It matches the
 ///   `n_candidates_before_cutoff` column the profile parquet already emits.
-/// - `top_tx_id` is `None` for a read with no competent candidate (a ghost
-///   drop). An argmax over an empty vector would either panic or, worse, yield
-///   transcript 0 -- a real transcript the read was never assigned to.
+/// - `top_tx_id` is `None` for a GHOST read -- no competent candidate, empty
+///   `weights`. An argmax over an empty vector would either panic or, worse,
+///   yield transcript 0: a real transcript the read was never assigned to.
+///   The ghost has no row in the profile either, so this table is deliberately
+///   NOT a subset of the profile's reads. It obeys the weaker one-directional
+///   invariant the cross-run join needs, and `None` is what makes the two
+///   distinguishable:
+///
+///   ```text
+///   top_tx_id == Some(..)  IMPLIES  that read has a profile row.
+///   ```
+///
+///   So a `Some` always has a denominator, and a `None` means "the solver
+///   looked and could not assign", which is not the same as "this read was
+///   absent from the run". A read whose candidates ALL fell below
+///   `min_weight` has a real argmax but no profile row, so it is recorded in
+///   NEITHER table -- that is the one shape that would break the implication.
 #[derive(Debug, Clone)]
 pub struct ReadAssignment {
     pub read_id: String,
     pub n_candidates_before_cutoff: usize,
-    /// `None` when every candidate was dropped (ghost read).
+    /// `None` for a ghost read (every candidate dropped before the softmax).
+    /// This is why the parquet column is nullable: the cross-run join needs
+    /// "unassignable" to be a value it can see, not an absence it has to
+    /// infer.
     pub top_tx_id: Option<String>,
     /// Raw E-step weight of the top candidate: PRE `min_weight` truncation and
     /// PRE renormalisation. It is therefore NOT equal to the `posterior_weight`
@@ -1245,6 +1368,26 @@ pub struct TelEmStats {
     /// re-derives these tiers from the doc comment rather than from the
     /// comparison in the E-step will bin the wrong reads.
     pub n_entropy_degenerate: u64,
+    /// DEGRADATION TELEMETRY. Contested reads (≥ 2 candidates) whose
+    /// candidate set carries ZERO poly(A) discriminative power: every
+    /// candidate that has an emission row shares one identical
+    /// `(mu, sigma2)` pair, so the poly(A) term cancels EXACTLY in every
+    /// pairwise odds ratio and the read is decided entirely by the
+    /// alignment and abundance terms.
+    ///
+    /// Read `n_polya_zero_power / n_ambiguous` for the fraction. The
+    /// denominator is deliberately `n_ambiguous` and not `n_total`: a
+    /// single-candidate read has no pairwise odds ratio at all, so counting
+    /// it would make this number ≈ 0.997 and say nothing.
+    ///
+    /// The mechanism is the L1 → L2 → L3 fallback: two underpowered
+    /// transcripts in one gene both take the SAME shared gene fit, and two
+    /// transcripts with no usable gene pool both take the SAME cohort fit.
+    /// Identical fits are the fallback working as designed, not a fault —
+    /// but the fraction of contested reads on which poly(A) contributes
+    /// literally zero is the honest headline for how much of the
+    /// assignment the tail-length evidence is actually carrying.
+    pub n_polya_zero_power: u64,
     /// EM trace: per-iter `(iter_index, log_likelihood, mean_entropy)`.
     pub em_trace: Vec<(usize, f64, f64)>,
 }
@@ -1255,7 +1398,7 @@ mod tests {
 
     use std::path::PathBuf;
 
-    use arrow::array::BooleanBuilder;
+    use arrow::array::{Array, BooleanBuilder, Int64Array};
 
     use crate::evidence::MoleculeEvidence;
 
@@ -2369,9 +2512,14 @@ mod tests {
 
     /// Disjoint id spaces must be REFUSED, not silently absorbed.
     ///
-    /// This is the shipped AIDRS Mode default, measured on HC3: the BAM is keyed
-    /// `AIDRS_tx_N`, `build-emission` is keyed `ENST`/`ENSG_NovelTr`, and the
-    /// intersection is 0. Before this guard the run behaved like a success —
+    /// This WAS the shipped AIDRS Mode default, measured on HC3: the BAM was keyed
+    /// `AIDRS_tx_N`, `build-emission` was keyed `ENST`/`ENSG_NovelTr`, and the
+    /// intersection was 0. AIDRS Mode is no longer a CLI-reachable path (the
+    /// initializer it depended on is deferred — see `emission_model`'s module
+    /// docs), but the guard it motivated is generic and still needed: any caller
+    /// can hand `solve_and_write_profile` an emission parquet built on a different
+    /// ID space, and the failure below is what it looks like. Before this guard
+    /// the run behaved like a success —
     /// 1637 molecules extracted, EM converged in 2 iterations, 1637 dropped
     /// (502 "incompetent" + 1135 "no_competent"), zero rows emitted, exit 0.
     ///
@@ -3037,16 +3185,25 @@ mod tests {
             },
         ];
         molecules.shrink_to_fit();
-        // AMB_TX0 sees [tx0@900, tx1@800] and AMB_TX1 sees [tx1@900, tx0@800]
+        // AMB_TX0 sees [tx0@900, tx1@870] and AMB_TX1 sees [tx1@900, tx0@860]
         // -- MIRRORED, so each resolves to a DIFFERENT transcript. An earlier
         // draft gave both reads the same pair in the same order, which made
         // both resolve to tx0 and would have let an off-by-one join pass.
         let mut candidate_pool = vec![2, 0, 1, 1, 0];
-        // Each ambiguous read's own two candidates get the SAME AS, so the
-        // winner is decided by the alignment term, not by pool order or a
-        // prior -- this keeps the assertion about join identity.
+        // The `ΔAS` of each ambiguous read is STRICTLY POSITIVE and STRICTLY
+        // BELOW `PRUNE_MAX_DELTA_AS` (50): 30 for AMB_TX0 and 40 for AMB_TX1.
+        //
+        // Both bounds are load-bearing, and an earlier draft violated the
+        // upper one at ΔAS = 100. The prune then dropped the runner-up before
+        // the softmax ever saw it, so every ambiguous read collapsed to a
+        // ONE-element posterior with `top_weight == 1.0` and `entropy == 0.0`
+        // -- and because those two numbers are forced by the arithmetic of a
+        // one-element vector rather than measured, mutating either field to a
+        // constant left every test green. The two `ΔAS` values are also
+        // deliberately UNEQUAL, so the two reads' posteriors differ and a
+        // join that swapped them cannot pass by coincidence.
         candidate_pool.shrink_to_fit();
-        let candidate_as = vec![1000, 900, 800, 900, 800];
+        let candidate_as = vec![1000, 900, 870, 900, 860];
         let n = candidate_pool.len();
         FlatEvidenceGraph {
             molecules,
@@ -3055,6 +3212,90 @@ mod tests {
             candidate_5p_gap: vec![0; n],
             candidate_pool,
             candidate_as,
+            transcript_names: vec!["tx0".to_string(), "tx1".to_string(), "tx2".to_string()],
+            poly_a_is_placeholder: false,
+        }
+    }
+
+    /// A two-molecule graph: `PLAIN` has one candidate, `CULLED` has two at
+    /// EQUAL `AS` — so its posterior is exactly 0.5 / 0.5.
+    ///
+    /// The tie is exact and stays exact under the M-step, which is what makes
+    /// this fixture usable: `CULLED` splits its weight 50/50 between tx1 and
+    /// tx2, so the two receive identical emission-parameter updates and
+    /// identical abundances, and the only term left to separate them is the
+    /// one that is zero for both. Re-running at `min_weight = 0.9` then culls
+    /// the read outright: both weights are below the cutoff, the emit loop
+    /// drops both, and the read produces no profile row.
+    ///
+    /// `PLAIN` is in the same graph so "CULLED emitted no row" is not
+    /// vacuously true of a profile that is empty for unrelated reasons.
+    fn plain_and_min_weight_culled(log_pal: f32) -> FlatEvidenceGraph {
+        let mut molecules = vec![
+            MoleculeEvidence {
+                read_id: "PLAIN".to_string(),
+                log_pal,
+                candidate_offset: 0,
+                candidate_count: 1,
+            },
+            MoleculeEvidence {
+                read_id: "CULLED".to_string(),
+                log_pal,
+                candidate_offset: 1,
+                candidate_count: 2,
+            },
+        ];
+        molecules.shrink_to_fit();
+        let mut candidate_pool = vec![0, 1, 2];
+        candidate_pool.shrink_to_fit();
+        let n = candidate_pool.len();
+        FlatEvidenceGraph {
+            molecules,
+            candidate_nm: vec![0; n],
+            candidate_mapq: vec![60; n],
+            candidate_5p_gap: vec![0; n],
+            candidate_pool,
+            // ALL EQUAL: `PLAIN` on tx0, `CULLED` on tx1 and tx2 at the same
+            // score, which is what pins `CULLED`'s posterior at 0.5 / 0.5.
+            candidate_as: vec![900, 900, 900],
+            transcript_names: vec!["tx0".to_string(), "tx1".to_string(), "tx2".to_string()],
+            poly_a_is_placeholder: false,
+        }
+    }
+
+    /// A two-molecule graph in which `GHOST` has two candidates that are BOTH
+    /// poly(A)-incompetent. The E-step pushes `-inf` for each, `max_ll` is
+    /// `-inf`, and the read comes back with an EMPTY weight vector: a ghost
+    /// drop, counted in `n_dropped_no_competent_candidates`.
+    ///
+    /// `LIVE` sits beside it so the assertions that `GHOST` is absent from
+    /// both tables are not vacuously true of an empty graph.
+    fn ghost_read_beside_a_live_one(log_pal: f32) -> FlatEvidenceGraph {
+        let mut molecules = vec![
+            MoleculeEvidence {
+                read_id: "LIVE".to_string(),
+                log_pal,
+                candidate_offset: 0,
+                candidate_count: 1,
+            },
+            MoleculeEvidence {
+                read_id: "GHOST".to_string(),
+                log_pal,
+                candidate_offset: 1,
+                candidate_count: 2,
+            },
+        ];
+        molecules.shrink_to_fit();
+        let mut candidate_pool = vec![0, 1, 2];
+        candidate_pool.shrink_to_fit();
+        let n = candidate_pool.len();
+        FlatEvidenceGraph {
+            molecules,
+            candidate_nm: vec![0; n],
+            candidate_mapq: vec![60; n],
+            candidate_5p_gap: vec![0; n],
+            candidate_pool,
+            candidate_as: vec![900, 900, 900],
             transcript_names: vec!["tx0".to_string(), "tx1".to_string(), "tx2".to_string()],
             poly_a_is_placeholder: false,
         }
@@ -3129,9 +3370,11 @@ mod tests {
         );
         assert_eq!(u.n_candidates_before_cutoff, 1);
 
-        // The two ambiguous reads point at different transcripts. Their AS
-        // values are equal within each read, so the winner is decided by pool
-        // order: AMB_TX0 sees tx0 first, AMB_TX1 sees tx1 first.
+        // The two ambiguous reads point at different transcripts: each sees its
+        // own winner FIRST, and the winner is decided by the alignment term
+        // (ΔAS = 30 for AMB_TX0, 40 for AMB_TX1 -- strictly positive, so never
+        // a tie, and strictly inside `prune_max_delta_as = 50`, so the
+        // runner-up is never pruned away).
         let a0 = by_id.get("AMB_TX0").expect("AMB_TX0 must be present");
         let a1 = by_id.get("AMB_TX1").expect("AMB_TX1 must be present");
         assert_eq!(
@@ -3148,6 +3391,41 @@ mod tests {
             a0.top_tx_id, a1.top_tx_id,
             "fixture is broken: the two reads must resolve differently, otherwise \
              a mis-attributed join would still pass"
+        );
+
+        // The posteriors must be genuinely NON-degenerate. These are the two
+        // fields the whole cross-run comparison rests on, and on a
+        // one-element weight vector both are pinned by arithmetic rather than
+        // measured: `posterior_entropy` returns 0.0 for a one-element vector
+        // and the lone weight is 1.0. Asserting only the top-1 above left
+        // `top_weight: top_w -> 0.5` and `entropy: ... -> 0.0` both GREEN.
+        for (label, a) in [("AMB_TX0", a0), ("AMB_TX1", a1)] {
+            assert!(
+                a.top_weight < 1.0,
+                "{label}'s posterior must retain the runner-up: top_weight is {}",
+                a.top_weight
+            );
+            assert!(
+                a.entropy > 0.0,
+                "{label}'s posterior must be spread over two candidates: entropy is {}",
+                a.entropy
+            );
+        }
+        // Deliberately UNEQUAL ΔAS (30 vs 40) must show up as unequal
+        // posteriors. Without this, two identical posteriors would satisfy the
+        // assertions above while leaving the join untestable: swapping the two
+        // rows would then be invisible.
+        assert!(
+            (a0.top_weight - a1.top_weight).abs() > 1e-9,
+            "the two ambiguous reads must have DIFFERENT top_weight, got {} and {}",
+            a0.top_weight,
+            a1.top_weight
+        );
+        assert!(
+            (a0.entropy - a1.entropy).abs() > 1e-9,
+            "the two ambiguous reads must have DIFFERENT entropy, got {} and {}",
+            a0.entropy,
+            a1.entropy
         );
 
         // `n_candidates_before_cutoff` is the PRE-prune fan-out, matching the
@@ -3185,7 +3463,17 @@ mod tests {
         );
         let graph = || mixed_unambiguous_then_ambiguous(log_pal);
 
-        let mut assigns: Vec<ReadAssignment> = Vec::new();
+        // Pre-seeded with a sentinel so the two things the out-param's name
+        // promises are both observable: `Some` REPLACES (the sentinel is gone
+        // afterwards) and `None` does not touch the caller's Vec at all (the
+        // rows from the `Some` run survive the `None` run intact).
+        let mut assigns: Vec<ReadAssignment> = vec![ReadAssignment {
+            read_id: "SENTINEL".to_string(),
+            n_candidates_before_cutoff: 999,
+            top_tx_id: Some("SENTINEL_TX".to_string()),
+            top_weight: -1.0,
+            entropy: -1.0,
+        }];
         solve_and_write_profile(
             graph(),
             &emission,
@@ -3205,6 +3493,21 @@ mod tests {
         )
         .unwrap();
         assert!(!assigns.is_empty());
+        assert!(
+            !assigns.iter().any(|a| a.read_id == "SENTINEL"),
+            "the out-param must be REPLACED, not appended to: {assigns:#?}"
+        );
+        let after_requested: Vec<(String, Option<String>, f64, f64)> = assigns
+            .iter()
+            .map(|a| {
+                (
+                    a.read_id.clone(),
+                    a.top_tx_id.clone(),
+                    a.top_weight,
+                    a.entropy,
+                )
+            })
+            .collect();
 
         solve_and_write_profile(
             graph(),
@@ -3224,17 +3527,351 @@ mod tests {
             None,
         )
         .unwrap();
+        let after_not_requested: Vec<(String, Option<String>, f64, f64)> = assigns
+            .iter()
+            .map(|a| {
+                (
+                    a.read_id.clone(),
+                    a.top_tx_id.clone(),
+                    a.top_weight,
+                    a.entropy,
+                )
+            })
+            .collect();
+        assert_eq!(
+            after_not_requested, after_requested,
+            "passing `None` must leave the caller's Vec untouched"
+        );
 
+        // BYTE-IDENTICAL, not merely equal-length. The previous assertion was
+        // `a.len() == b.len()`, which a profile differing only in VALUES also
+        // satisfies -- parquet encodes a weight of 0.765 and one of 0.910 in
+        // the same eight bytes. The docstring promised byte-identity; this is
+        // the assertion that delivers it.
         let a = std::fs::read(&with_p).expect("profile with assignments must exist");
         let b = std::fs::read(&without_p).expect("profile without must exist");
         assert_eq!(
-            a.len(),
-            b.len(),
-            "requesting per-read assignments must not change the profile"
+            a, b,
+            "requesting per-read assignments must not change the profile by so \
+             much as one byte"
         );
 
         for f in [&emission, &with_p, &without_p] {
             let _ = std::fs::remove_file(f);
         }
+    }
+
+    /// `top_tx_id == Some(..)` must IMPLY that the read has a profile row, and
+    /// nothing pinned that before: `read_assign[mol_idx]` was written in the
+    /// ambiguous branch, which runs BEFORE the emit loop's `if w < min_weight {
+    /// continue }`. A read whose every candidate fell below the cutoff
+    /// therefore carried a real `top_tx_id` while emitting ZERO profile rows —
+    /// a numerator entry with no denominator, in a table whose whole purpose is
+    /// a cross-run join.
+    ///
+    /// This is the ONE shape that is absent from both tables. A ghost read
+    /// (empty `weights`) is also absent from the profile but is deliberately
+    /// recorded with `top_tx_id = None` — see
+    /// `test_ghost_read_is_recorded_as_unassignable_and_absent_from_the_profile`.
+    /// So the claim is one-directional and the converse is not claimed.
+    ///
+    /// Reachable with `--min-weight 0.9` on the 0.5 / 0.5 read below. At the
+    /// shipped 0.01 it needs a read spread over enough survivors that all of
+    /// them sit under the cutoff, which a high-fan-out repeat region supplies
+    /// (`candidate_count` is `u16`).
+    ///
+    /// Mutation target: dropping the `any(w >= min_weight)` half of the
+    /// assignment's `if` makes this test red.
+    #[test]
+    fn test_read_assignment_is_omitted_when_min_weight_drops_every_candidate() {
+        let log_pal = (100.0_f32).log2();
+        let emission = scratch("culled_emission.parquet");
+        let profile = scratch("culled_profile.parquet");
+        write_test_emission(
+            &emission,
+            &[
+                ("tx0", "gene0", log_pal as f64, 0.04),
+                ("tx1", "gene1", log_pal as f64, 0.04),
+                ("tx2", "gene2", log_pal as f64, 0.04),
+            ],
+        );
+
+        let mut assigns: Vec<ReadAssignment> = Vec::new();
+        let stats = solve_and_write_profile(
+            plain_and_min_weight_culled(log_pal),
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            5,
+            20.0,
+            FIVE_PRIME_OFF,
+            POLY_A_ON,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            0.9,
+            None,
+            None,
+            Some(&mut assigns),
+        )
+        .unwrap();
+
+        let rows = read_profile_by_read(&profile);
+        let _ = std::fs::remove_file(&emission);
+        let _ = std::fs::remove_file(&profile);
+
+        // The read WAS ambiguous and WAS E-stepped — it is not absent from the
+        // graph, it was culled at the output stage. Without this the profile
+        // assertions below would also hold for a graph that never had it.
+        assert_eq!(
+            stats.n_ambiguous, 1,
+            "CULLED must have been E-stepped as an ambiguous read"
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "only PLAIN (w = 1.0) clears min_weight = 0.9; the 0.5/0.5 read must \
+             emit no profile row at all: {rows:?}"
+        );
+        assert_eq!(rows[0].0, "PLAIN", "the surviving row must be PLAIN's");
+
+        // The actual invariant, asserted on the data rather than argued from
+        // the code: every read in the assignments table has a profile row.
+        assert!(
+            !assigns.iter().any(|a| a.read_id == "CULLED"),
+            "a read with no profile row must not appear in the read-assignments \
+             table — the join numerator would exceed its denominator: {assigns:#?}"
+        );
+        assert_eq!(
+            assigns.len(),
+            1,
+            "only PLAIN belongs in the table: {assigns:#?}"
+        );
+        for a in &assigns {
+            assert!(
+                rows.iter().any(|&(ref r, ..)| r == &a.read_id),
+                "assignment for {} carries a top_tx_id but has no profile row; \
+                 the implication `top_tx_id == Some(..) => profile row` is what \
+                 keeps the cross-run join denominator auditable: {rows:?}",
+                a.read_id
+            );
+        }
+    }
+
+    /// A GHOST read -- both candidates poly(A)-incompetent, so the E-step
+    /// returns an EMPTY weight vector -- has no competent candidate, so the
+    /// profile legitimately has no row for it. It IS still recorded in the
+    /// assignments table, with `top_tx_id = None`.
+    ///
+    /// That is the distinction a cross-run comparison needs: "the solver
+    /// looked at this read and could not assign it" versus "this read was not
+    /// in this run at all". Dropping the row would make the two identical, and
+    /// `top_tx_id: None` is the only place the difference is visible.
+    ///
+    /// Nothing covered this before. It is the `None` arm of the invariant
+    /// `top_tx_id == Some(..) IMPLIES that read has a profile row` -- the
+    /// converse is deliberately NOT claimed, and this test pins both halves of
+    /// that: `GHOST` is present-and-`None` in the assignments table and absent
+    /// from the profile.
+    #[test]
+    fn test_ghost_read_is_recorded_as_unassignable_and_absent_from_the_profile() {
+        let log_pal = (100.0_f32).log2();
+        let emission = scratch("ghost_emission.parquet");
+        let profile = scratch("ghost_profile.parquet");
+        write_test_emission_with_competence(
+            &emission,
+            &[
+                ("tx0", "gene0", log_pal as f64, 0.04, true),
+                // Both of GHOST's candidates are incompetent: no `ll` is ever
+                // pushed for either, so `max_ll == -inf` and `weights` is
+                // empty.
+                ("tx1", "gene1", log_pal as f64, 0.04, false),
+                ("tx2", "gene2", log_pal as f64, 0.04, false),
+            ],
+        );
+
+        let mut assigns: Vec<ReadAssignment> = Vec::new();
+        let stats = solve_and_write_profile(
+            ghost_read_beside_a_live_one(log_pal),
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            5,
+            20.0,
+            FIVE_PRIME_OFF,
+            POLY_A_ON,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
+            None,
+            None,
+            Some(&mut assigns),
+        )
+        .unwrap();
+
+        let rows = read_profile_by_read(&profile);
+        let _ = std::fs::remove_file(&emission);
+        let _ = std::fs::remove_file(&profile);
+
+        // HALF ONE: no profile row. There is no competent candidate, so there
+        // is nothing to emit — the ghost is absent, not emitted with weight 0.
+        assert_eq!(
+            rows.len(),
+            1,
+            "the ghost read has no competent candidate, so it emits no profile \
+             row and LIVE is all that is left: {rows:?}"
+        );
+        assert_eq!(rows[0].0, "LIVE");
+
+        // HALF TWO: the assignment table still records it, as unassignable.
+        assert_eq!(
+            assigns.len(),
+            2,
+            "the ghost must be recorded, not dropped: {assigns:#?}"
+        );
+        let ghost = assigns
+            .iter()
+            .find(|a| a.read_id == "GHOST")
+            .expect("GHOST must be present in the assignments table");
+        assert_eq!(
+            ghost.top_tx_id, None,
+            "an argmax over an empty weight vector must not fall back to \
+             transcript 0 — a real transcript this read was never assigned to"
+        );
+        assert_eq!(ghost.top_weight, 0.0);
+        assert_eq!(ghost.entropy, 0.0);
+        // Pre-prune fan-out, matching the profile's column of the same name:
+        // 2 even though nothing was scored.
+        assert_eq!(ghost.n_candidates_before_cutoff, 2);
+        assert_eq!(
+            stats.n_dropped_no_competent_candidates, 1,
+            "GHOST must also be counted as a ghost drop in the stats"
+        );
+
+        // The invariant itself, asserted on the data: every `Some` has a
+        // profile row. The ghost is the case that makes the converse FALSE.
+        let live = assigns
+            .iter()
+            .find(|a| a.read_id == "LIVE")
+            .expect("LIVE must be present");
+        assert_eq!(live.top_tx_id.as_deref(), Some("tx0"));
+        for a in &assigns {
+            if a.top_tx_id.is_some() {
+                assert!(
+                    rows.iter().any(|&(ref r, ..)| r == &a.read_id),
+                    "top_tx_id == Some(..) for {} but it has no profile row; the \
+                     implication the cross-run join depends on is broken: {rows:?}",
+                    a.read_id
+                );
+            }
+        }
+    }
+
+    /// `write_read_assignments_parquet` is a `pub fn` whose one distinguishing
+    /// behaviour is `top_b.append_option(...)`. The output stage reaches that
+    /// NULL on every ghost read, so this is not a corner case — but the writer
+    /// itself was never called by a test, so a change to `append_option` or to
+    /// the column's nullability would have gone unnoticed.
+    ///
+    /// The three things a NULL can be confused with, all checked: an empty
+    /// string (a transcript that does not exist), the index-0 transcript (a
+    /// real transcript the read was never assigned to), and a dropped row.
+    #[test]
+    fn test_write_read_assignments_parquet_round_trips_a_null_top_tx_id() {
+        let path = scratch("readassign_null.parquet");
+        let rows = vec![
+            ReadAssignment {
+                read_id: "NAMED".to_string(),
+                n_candidates_before_cutoff: 3,
+                top_tx_id: Some("tx7".to_string()),
+                top_weight: 0.75,
+                entropy: 0.55,
+            },
+            ReadAssignment {
+                read_id: "NULL_TOP".to_string(),
+                n_candidates_before_cutoff: 2,
+                top_tx_id: None,
+                top_weight: 0.5,
+                entropy: 0.69,
+            },
+        ];
+        write_read_assignments_parquet(&rows, &path).unwrap();
+
+        let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(&path).unwrap())
+            .unwrap()
+            .with_batch_size(1024)
+            .build()
+            .unwrap();
+        let mut seen: Vec<(String, i64, Option<String>, f64, f64)> = Vec::new();
+        for batch in reader {
+            let batch = batch.unwrap();
+            let read = batch
+                .column_by_name("read_id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let ncand = batch
+                .column_by_name("n_candidates_before_cutoff")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let top = batch
+                .column_by_name("top_tx_id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let w = batch
+                .column_by_name("top_weight")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            let h = batch
+                .column_by_name("entropy")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                seen.push((
+                    read.value(i).to_string(),
+                    ncand.value(i),
+                    if top.is_valid(i) {
+                        Some(top.value(i).to_string())
+                    } else {
+                        None
+                    },
+                    w.value(i),
+                    h.value(i),
+                ));
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(seen.len(), 2, "a null must not drop the row: {seen:?}");
+        assert_eq!(seen[0].0, "NAMED");
+        assert_eq!(seen[0].1, 3);
+        assert_eq!(
+            seen[0].2.as_deref(),
+            Some("tx7"),
+            "a present top_tx_id must round-trip verbatim"
+        );
+        assert_eq!(seen[1].0, "NULL_TOP");
+        assert_eq!(seen[1].1, 2);
+        assert_eq!(
+            seen[1].2, None,
+            "`top_tx_id: None` must read back as a genuine NULL — not \"\", not \
+             the index-0 transcript, not a dropped row"
+        );
+        // The null is in the `top_tx_id` column ONLY. A writer that lost the
+        // null mask would still round-trip these two floats, so they are what
+        // distinguishes "wrote a null" from "dropped the row and shifted the
+        // rest up".
+        assert!((seen[1].3 - 0.5).abs() < 1e-12, "got {}", seen[1].3);
+        assert!((seen[1].4 - 0.69).abs() < 1e-12, "got {}", seen[1].4);
     }
 }
