@@ -1332,38 +1332,56 @@ mod tests {
     /// of 689,052 top-1 assignments flipped.
     ///
     /// This asserts the INVARIANT rather than re-measuring the symptom, because
-    /// the symptom is cross-process: within a single test the HashMap order is
-    /// fixed, so a test that ran the extraction twice would compare a thing
-    /// against itself and pass with the sort deleted. Sortedness is checkable
-    /// in-process, and deleting the sort makes it false.
+    /// the symptom is cross-process.
     ///
-    /// The read_ids are deliberately NOT in input order (`r3`, `r1`, `r2`), so
-    /// a graph that simply preserved BAM order would also fail — the property
-    /// under test is sortedness, not "unchanged".
+    /// WHY THIS EXTRACTS EIGHT TIMES, NOT ONCE. The first version of this test
+    /// used 3 read_ids and called the extractor once, and the mutation battery
+    /// then reported M8 GREEN — deleting the sort did not reliably fail it. A
+    /// 3-key `HashMap` iterates in sorted order by chance 1 time in 3! = 6, so
+    /// the "red" I had demonstrated by hand was luck, and a battery run that
+    /// drew the other 5 faces would have certified an unpinned fix. Each
+    /// `extract_evidence` call builds a FRESH `HashMap` with a fresh random
+    /// seed, so repeating the extraction samples the real distribution: with 8
+    /// keys and 8 draws, an unsorted drain passes by chance (1/8!)^8, i.e.
+    /// never in practice.
+    ///
+    /// The read_ids are also given out of order, so a graph that merely
+    /// preserved BAM order fails too — the property is sortedness, not
+    /// "unchanged".
     #[test]
     fn test_molecules_are_emitted_in_read_id_order() {
         use noodles_sam::alignment::record_buf::data::field::Value;
-        let mut r3 = synth_record_with_gap("r3", 0, 0, false, Some(1000), 1, 60);
-        r3.data_mut().clear();
-        r3.data_mut().insert(TAG_PT, Value::from(90i32));
-        let mut r1 = synth_record_with_gap("r1", 1, 0, false, Some(1000), 1, 60);
-        r1.data_mut().clear();
-        r1.data_mut().insert(TAG_PT, Value::from(90i32));
-        let mut r2 = synth_record_with_gap("r2", 2, 0, false, Some(1000), 1, 60);
-        r2.data_mut().clear();
-        r2.data_mut().insert(TAG_PT, Value::from(90i32));
-        let path = write_synthetic_bam("sorted_molecules", vec![r3, r1, r2]);
+        // Deliberately scrambled relative to both the sort order and the
+        // numeric order of the names.
+        let names = ["r7", "r2", "r5", "r1", "r8", "r3", "r6", "r4"];
+        let recs: Vec<_> = names
+            .iter()
+            .map(|n| {
+                // ref_id stays 0: it indexes the header's reference list, which
+                // this fixture declares with a single sequence. Varying it makes
+                // `write_alignment_record` reject the record outright.
+                let mut r = synth_record_with_gap(n, 0, 0, false, Some(1000), 1, 60);
+                r.data_mut().clear();
+                r.data_mut().insert(TAG_PT, Value::from(90i32));
+                r
+            })
+            .collect();
+        let path = write_synthetic_bam("sorted_molecules", recs);
 
-        let g = extract_evidence_with(&path, 35, &PolyASource::BamTag(TAG_PT)).unwrap();
-        let ids: Vec<&str> = g.molecules.iter().map(|m| m.read_id.as_str()).collect();
-        let mut want = ids.clone();
-        want.sort_unstable();
-        assert_eq!(
-            ids, want,
-            "molecules must be emitted sorted by read_id. If this fails, the \
-             `read_map` drain is unordered again and the emitted parquet stops \
-             being bit-reproducible — see the determinism note at the drain site."
-        );
+        for draw in 0..8 {
+            let g = extract_evidence_with(&path, 35, &PolyASource::BamTag(TAG_PT)).unwrap();
+            let ids: Vec<&str> = g.molecules.iter().map(|m| m.read_id.as_str()).collect();
+            let mut want = ids.clone();
+            want.sort_unstable();
+            assert_eq!(
+                ids, want,
+                "molecules must be emitted sorted by read_id (draw {} of 8). If this \
+                 fails, the `read_map` drain is unordered again and the emitted \
+                 parquet stops being bit-reproducible — see the determinism note \
+                 at the drain site.",
+                draw
+            );
+        }
         let _ = std::fs::remove_file(&path);
     }
 
