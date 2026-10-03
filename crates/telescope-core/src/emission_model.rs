@@ -642,8 +642,29 @@ fn read_anchor_pool_parquet<P: AsRef<Path>>(
     Ok(())
 }
 
+/// How many transcripts each level of the Tx → Gene → Cohort fallback
+/// supplied a fit for.
+///
+/// This exists because the split is a RESULT, not a log line. It was computed
+/// correctly all along and printed to stderr, but nothing outside
+/// `build_emission_from_anchors` could read it, so `n_l1 += 1` -> `n_l1 += 0`
+/// left the whole test suite green while changing the number a reader of the
+/// run compares across arms. The counters are returned so that both the CLI and
+/// a test read the same value from the same place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FallbackTierCounts {
+    /// L1: `n_reads_tx >= fallback.tx_min_reads` — per-transcript fit.
+    pub l1: usize,
+    /// L2: pooled gene reads `>= fallback.gene_min_reads` — the shared gene fit.
+    pub l2: usize,
+    /// L3: cohort-level fit (always available when ≥1 read).
+    pub l3: usize,
+}
+
 /// Build `telescope.emission.parquet` from a Universal Mode
 /// `anchor_pool.parquet` (per-read rows).
+///
+/// Returns the L1/L2/L3 split — see [`FallbackTierCounts`].
 ///
 /// Algorithm (per spec 常温区 Step 3 Part 2):
 /// 1. Read `anchor_pool.parquet` (per-read `poly_a_length`,
@@ -667,7 +688,7 @@ pub fn build_emission_from_anchors<P, Q>(
     transcript_evidence_path: Option<Q>,
     output_path: P,
     fallback: &FallbackConfig,
-) -> Result<()>
+) -> Result<FallbackTierCounts>
 where
     P: AsRef<Path>,
     Q: AsRef<Path>,
@@ -824,22 +845,24 @@ where
     // A run that is 80% L1 and a run that is 80% L3 both print a valid triple,
     // but the second is a run in which most transcripts carry no
     // transcript-specific poly(A) distribution at all — the cohort fit is
-    // standing in for them. The denominator is the number of output rows.
-    let n_tx_total = (n_l1 + n_l2 + n_l3).max(1);
+    // standing in for them. The denominator is the number of output rows, and
+    // the caller formats it: the split is RETURNED (see `FallbackTierCounts`)
+    // rather than formatted here, because a number that only reaches stderr is
+    // a number no test can read.
+    //
+    // The run header stays here because only this function knows how many
+    // cohort reads survived the `em_eligible` filter.
     eprintln!(
-        "[telescope]  Universal mode: {} transcripts, {} cohort reads, \
-         L1={} ({:.1}%) L2={} ({:.1}%) L3={} ({:.1}%)",
+        "[telescope]  Universal mode: {} transcripts, {} cohort reads",
         tx_accums.len(),
         cohort_log2_pals.len(),
-        n_l1,
-        n_l1 as f64 * 100.0 / n_tx_total as f64,
-        n_l2,
-        n_l2 as f64 * 100.0 / n_tx_total as f64,
-        n_l3,
-        n_l3 as f64 * 100.0 / n_tx_total as f64,
     );
 
-    Ok(())
+    Ok(FallbackTierCounts {
+        l1: n_l1,
+        l2: n_l2,
+        l3: n_l3,
+    })
 }
 
 #[cfg(test)]
@@ -1459,6 +1482,267 @@ mod tests {
              not a count of distinct poly(A) lengths (which would be 1) and not a \
              cohort-fallback count"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// L1 / L2 / L3 TIER ATTRIBUTION and SPLIT, with all three tiers non-empty.
+    ///
+    /// TWO THINGS ARE ASSERTED, and they fail independently.
+    ///
+    /// (1) THE SPLIT, read off `build_emission_from_anchors`'s return value:
+    /// `(l1, l2, l3) == (1, 4, 1)`. This is the assertion that pins the
+    /// counters themselves. `n_l1 += 1` -> `n_l1 += 0` used to leave the whole
+    /// suite green, because the counters were function-local and reached only
+    /// an `eprintln!`; they are now returned as [`FallbackTierCounts`] and read
+    /// from here and from the CLI. The counters sum to the number of emitted
+    /// rows, which is asserted too — a cascade that counted a transcript twice
+    /// or dropped one would break it.
+    ///
+    /// (2) THE ATTRIBUTION: which fit each transcript was actually given.
+    /// `test_3level_fallback_thresholds` above already pins the `(mu, sigma2)`
+    /// each level produces, but it does not pin WHICH transcripts sit in each
+    /// level, nor that all four L2 transcripts share one bit-identical fit.
+    /// Collapsing the L2 branch into L3 turns (2) red.
+    ///
+    /// THE FIXTURE. L2 is the tier that a naive fixture cannot reach, because
+    /// it needs a gene pool strictly larger than any single transcript's pool.
+    /// `write_anchor_pool_parquet` DOES take a `gene_id` per `TxFixture` and
+    /// emits it verbatim on every row, so several DISTINCT transcripts can be
+    /// given one SHARED `gene_id` — which is what `test_3level_fallback_thresholds`
+    /// already relies on, and it is unrelated to the `anchor_builder.rs`
+    /// `gene_id := transcript_id` fallback (that is about the production
+    /// anchor builder, not about this fixture writer). Here `tx_min_reads = 10`
+    /// and `gene_min_reads = 30`: each L2 transcript is capped at 9 reads, so
+    /// four of them are needed to clear 30 in the pool.
+    #[test]
+    fn test_l1_l2_l3_tier_attribution_and_split() {
+        let fxs = vec![
+            // L1: 12 >= tx_min_reads -> its OWN reads. gene_l1's pool is 12,
+            // below gene_min_reads, which is irrelevant: L1 is decided first.
+            TxFixture {
+                gene_id: "gene_l1".into(),
+                tx_id: "tx_l1".into(),
+                pals: (100..112).collect::<Vec<i32>>(), // 12 reads
+            },
+            // L2: each of these is 9 < 10, but they SHARE gene_l2, whose pool
+            // is 4 x 9 = 36 >= 30. One transcript alone could never do this.
+            TxFixture {
+                gene_id: "gene_l2".into(),
+                tx_id: "tx_l2_a".into(),
+                pals: (300..309).collect::<Vec<i32>>(), // 9 reads
+            },
+            TxFixture {
+                gene_id: "gene_l2".into(),
+                tx_id: "tx_l2_b".into(),
+                pals: (400..409).collect::<Vec<i32>>(), // 9 reads
+            },
+            TxFixture {
+                gene_id: "gene_l2".into(),
+                tx_id: "tx_l2_c".into(),
+                pals: (500..509).collect::<Vec<i32>>(), // 9 reads
+            },
+            TxFixture {
+                gene_id: "gene_l2".into(),
+                tx_id: "tx_l2_d".into(),
+                pals: (600..609).collect::<Vec<i32>>(), // 9 reads
+            },
+            // L3: 3 < 10 and gene_l3's pool is 3 < 30 -> cohort fit.
+            TxFixture {
+                gene_id: "gene_l3".into(),
+                tx_id: "tx_l3".into(),
+                pals: (900..903).collect::<Vec<i32>>(), // 3 reads
+            },
+        ];
+
+        let tmp = std::env::temp_dir().join("telescope_test_l123_tiers");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+
+        let anchor_pool = tmp.join("anchor_pool.parquet");
+        let out = tmp.join("emission.parquet");
+        write_anchor_pool_parquet(&anchor_pool, &fxs);
+
+        let fb = FallbackConfig {
+            tx_min_reads: 10,
+            gene_min_reads: 30,
+            cohort_min_reads: 50,
+        };
+        let tiers = build_emission_from_anchors(&anchor_pool, None::<&str>, &out, &fb)
+            .expect("Universal mode run");
+
+        // (1) THE SPLIT — read off the return value. This is the assertion
+        // that makes `n_l1 += 1` -> `n_l1 += 0` a red test, which it was not
+        // while the counters reached nothing but an `eprintln!`.
+        assert_eq!(
+            tiers,
+            FallbackTierCounts {
+                l1: 1,
+                l2: 4,
+                l3: 1
+            },
+            "the L1/L2/L3 split: 1 transcript at/above tx_min_reads, 4 sharing a \
+             qualifying gene pool, 1 in neither"
+        );
+
+        let rows = read_emission_parquet(&out);
+        assert_eq!(rows.len(), 6, "one output row per transcript: {rows:?}");
+        assert_eq!(
+            tiers.l1 + tiers.l2 + tiers.l3,
+            rows.len(),
+            "the three tiers must partition the output rows: a transcript counted \
+             twice, or not at all, is not a partition"
+        );
+
+        // The three reference fits, computed here by calling the SAME private
+        // helpers the cascade calls, so the expectations cannot drift from the
+        // implementation on a detail like Bessel correction or the noise floor.
+        let logs = |tx: &str| -> Vec<f64> {
+            fxs.iter()
+                .find(|f| f.tx_id == tx)
+                .expect("fixture transcript")
+                .pals
+                .iter()
+                .map(|&p| (p as f64).log2())
+                .collect()
+        };
+        let l1_fit = fit_log_normal(&logs("tx_l1")).expect("L1 fit is non-empty");
+        let l2_fit = fit_log_normal(
+            &["tx_l2_a", "tx_l2_b", "tx_l2_c", "tx_l2_d"]
+                .iter()
+                .flat_map(|t| logs(t))
+                .collect::<Vec<f64>>(),
+        )
+        .expect("gene_l2 pool is non-empty");
+        let l3_fit = cohort_log_normal_fit(
+            &fxs.iter()
+                .flat_map(|f| f.pals.iter().map(|&p| (p as f64).log2()))
+                .collect::<Vec<f64>>(),
+        )
+        .expect("cohort is non-empty");
+
+        // The fixture is only a tier test if the three fits are actually
+        // distinguishable. Asserted up front so a fixture edit that collapses
+        // two of them fails HERE, with a clear message, instead of silently
+        // making the per-transcript comparisons below vacuous.
+        assert!(
+            (l1_fit.mu - l2_fit.mu).abs() > 1e-6
+                && (l1_fit.mu - l3_fit.mu).abs() > 1e-6
+                && (l2_fit.mu - l3_fit.mu).abs() > 1e-6
+                && (l1_fit.sigma2 - l2_fit.sigma2).abs() > 1e-6
+                && (l1_fit.sigma2 - l3_fit.sigma2).abs() > 1e-6
+                && (l2_fit.sigma2 - l3_fit.sigma2).abs() > 1e-6,
+            "the three tiers must be distinguishable in BOTH components, so the \
+             1e-9 match tolerance below cannot overlap two of them: \
+             L1={l1_fit:?} L2={l2_fit:?} L3={l3_fit:?}"
+        );
+
+        // Classify each emitted row by the fit it carries.
+        //
+        // The match tolerance is 1e-9, not exact, because of the L2
+        // HashMap-ordering effect described further down: a re-derived gene
+        // fit can differ from the stored one by a few ULPs. 1e-9 sits ~6
+        // orders of magnitude below the smallest gap between two tiers, which
+        // the assertion above pins.
+        let tier_of = |tx: &str| -> &'static str {
+            let (_, _, _, _, _, mu, sigma2) = rows
+                .iter()
+                .find(|r| r.0 == tx)
+                .unwrap_or_else(|| panic!("{tx} missing from the emission table: {rows:?}"));
+            let same =
+                |f: &LogNormalFit| (mu - f.mu).abs() < 1e-9 && (sigma2 - f.sigma2).abs() < 1e-9;
+            match (same(&l1_fit), same(&l2_fit), same(&l3_fit)) {
+                (true, false, false) => "L1",
+                (false, true, false) => "L2",
+                (false, false, true) => "L3",
+                // Two or zero matches: either a tier produced an unexpected fit
+                // or the levels are indistinguishable. Both are failures.
+                m => panic!(
+                    "{tx} does not match exactly one tier's fit: \
+                     (l1,l2,l3) matched = {m:?}; row = ({mu}, {sigma2}); \
+                     L1={l1_fit:?} L2={l2_fit:?} L3={l3_fit:?}"
+                ),
+            }
+        };
+
+        assert_eq!(tier_of("tx_l1"), "L1", "12 >= tx_min_reads is tx-level");
+        for tx in ["tx_l2_a", "tx_l2_b", "tx_l2_c", "tx_l2_d"] {
+            assert_eq!(
+                tier_of(tx),
+                "L2",
+                "{tx}: 9 < tx_min_reads but gene_l2 pools 36 >= 30, so it must take \
+                 the SHARED gene fit, not the cohort fit"
+            );
+        }
+        assert_eq!(
+            tier_of("tx_l3"),
+            "L3",
+            "3 < tx_min_reads and gene_l3 pools only 3 < 30, so it must fall to the cohort"
+        );
+
+        // The four L2 transcripts must share ONE fit, bit for bit — that
+        // sharing is the mechanism behind `n_polya_zero_power` in Module 3, and
+        // an L2 that recomputed per transcript would break that metric.
+        //
+        // BIT-IDENTICAL TO EACH OTHER, but only CLOSE to `l2_fit` as recomputed
+        // here. The gene pool is assembled by iterating `tx_accums`, a
+        // `HashMap`, so the order the 36 values are summed in is not fixed, and
+        // `fit_log_normal`'s `sum::<f64>()` is not associative. The observed
+        // spread is a few ULPs (~4e-15 on mu here); asserting exact equality
+        // against a re-derived value would be asserting the HashMap's
+        // iteration order, which is not a property this code owns.
+        let l2_rows: Vec<&(String, String, f64, bool, u32, f64, f64)> =
+            rows.iter().filter(|r| r.0.starts_with("tx_l2_")).collect();
+        assert_eq!(l2_rows.len(), 4);
+        let l2_shared = (l2_rows[0].5, l2_rows[0].6);
+        for r in &l2_rows {
+            assert_eq!(
+                (r.5, r.6),
+                l2_shared,
+                "{} must carry the IDENTICAL shared gene fit, not a per-transcript one",
+                r.0
+            );
+            assert!(
+                (r.5 - l2_fit.mu).abs() < 1e-9 && (r.6 - l2_fit.sigma2).abs() < 1e-9,
+                "{} must carry the GENE-POOL fit, not its own: got ({}, {}), \
+                 gene fit ({}, {})",
+                r.0,
+                r.5,
+                r.6,
+                l2_fit.mu,
+                l2_fit.sigma2
+            );
+        }
+
+        // (2) CROSS-CHECK: the triple the cascade RETURNED must agree with the
+        // triple recovered independently from the per-transcript attribution
+        // above. The returned value and the emitted fits are produced by two
+        // different branches of the same loop; a cascade that incremented the
+        // wrong counter would pass a test that only read the return value, and
+        // one that fitted the wrong tier would pass a test that only counted.
+        let (mut n_l1, mut n_l2, mut n_l3) = (0usize, 0usize, 0usize);
+        for r in &rows {
+            match tier_of(&r.0) {
+                "L1" => n_l1 += 1,
+                "L2" => n_l2 += 1,
+                _ => n_l3 += 1,
+            }
+        }
+        assert_eq!(
+            (n_l1, n_l2, n_l3),
+            (tiers.l1, tiers.l2, tiers.l3),
+            "the returned split must match the split implied by the fits each \
+             transcript was actually given"
+        );
+
+        // The `.max(1)` zero guard the CLI applies to the printed denominator:
+        // it only bites when there are no rows at all, and it must not change
+        // these.
+        let total = (tiers.l1 + tiers.l2 + tiers.l3).max(1);
+        assert_eq!(total, 6, "one denominator row per emitted transcript");
+        assert!((tiers.l1 as f64 * 100.0 / total as f64 - 100.0 / 6.0).abs() < 1e-12);
+        assert!((tiers.l2 as f64 * 100.0 / total as f64 - 400.0 / 6.0).abs() < 1e-12);
+        assert!((tiers.l3 as f64 * 100.0 / total as f64 - 100.0 / 6.0).abs() < 1e-12);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

@@ -427,13 +427,26 @@ fn main() -> Result<()> {
             eprintln!("  gene_min_reads:     {}", fb.gene_min_reads);
             eprintln!("  cohort_min_reads:   {}", fb.cohort_min_reads);
             eprintln!("  output:             {}", output.display());
-            emission_model::build_emission_from_anchors(
+            let tiers = emission_model::build_emission_from_anchors(
                 anchor_pool,
                 transcript_evidence,
                 output,
                 &fb,
             )
             .context("Module 1 build_emission_from_anchors (Universal) failed")?;
+            // L1/L2/L3 split, read off the RETURN VALUE rather than scraped
+            // from the library's stderr. The denominator is the number of
+            // emitted rows, guarded against the zero-transcript case.
+            let n_tx_total = (tiers.l1 + tiers.l2 + tiers.l3).max(1) as f64;
+            eprintln!(
+                "[telescope]  fallback tiers: L1={} ({:.1}%) L2={} ({:.1}%) L3={} ({:.1}%)",
+                tiers.l1,
+                tiers.l1 as f64 * 100.0 / n_tx_total,
+                tiers.l2,
+                tiers.l2 as f64 * 100.0 / n_tx_total,
+                tiers.l3,
+                tiers.l3 as f64 * 100.0 / n_tx_total,
+            );
             eprintln!("[telescope] done.");
             Ok(())
         }
