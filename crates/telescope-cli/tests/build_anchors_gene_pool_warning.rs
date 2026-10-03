@@ -81,8 +81,14 @@ fn build_anchors_warns_that_l2_is_unreachable_without_a_gene_map() {
     for (what, needle) in [
         ("the [telescope] prefix", "[telescope][WARN]"),
         ("the degenerate state itself", "NO gene structure"),
-        ("L2 being unreachable", "STRUCTURALLY UNREACHABLE"),
-        ("the 2-level-not-3-level consequence", "2-LEVEL"),
+        (
+            "the consequence for the L2 tier",
+            "no two transcripts ever share",
+        ),
+        (
+            "the default thresholds the claim is scoped to",
+            "tx_min_reads=10",
+        ),
         ("the remedy", "--tx-to-gene"),
     ] {
         assert!(
@@ -90,6 +96,16 @@ fn build_anchors_warns_that_l2_is_unreachable_without_a_gene_map() {
             "stderr must name {what}; got:\n{stderr}"
         );
     }
+
+    // The thresholds live on `build-emission`, which this function cannot see,
+    // so the warning must NOT assert reachability unconditionally: at
+    // `--gene-min-reads 3` the same degenerate pool does fire L2. A message
+    // claiming otherwise would be false for a real, reachable configuration.
+    assert!(
+        !stderr.contains("STRUCTURALLY UNREACHABLE"),
+        "the warning must not claim L2 is unconditionally unreachable; the \
+         thresholds are build-emission flags and can make it fire. got:\n{stderr}"
+    );
 }
 
 /// NEGATIVE. The same BAM and the same command, given a gene map that puts all

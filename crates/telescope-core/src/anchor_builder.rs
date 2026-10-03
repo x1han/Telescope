@@ -146,11 +146,22 @@ fn pool_gene_tx_cardinality(anchors: &[AnchorRecord]) -> (usize, usize) {
 /// real gene structure.
 ///
 /// WHY THIS IS EXACT, NOT A HEURISTIC. The degenerate state is precisely
-/// `distinct gene_id == distinct transcript_id`, and the downstream arithmetic
-/// follows from it alone: a gene's pool IS its own transcript's pool, so the
-/// L2 gene-level fallback needs `gene_min_reads = 30` reads drawn from what is,
-/// by the time L1 has just failed, fewer than `tx_min_reads = 10` reads. L2 is
-/// therefore structurally unreachable, with no error and no other trace.
+/// `distinct gene_id == distinct transcript_id`, and the consequence follows
+/// from that alone: a gene's pool IS its own transcript's pool, so no two
+/// transcripts ever share fitted poly(A) parameters through the L2 tier.
+///
+/// The thresholds are `build-emission` flags that this function cannot see, so
+/// the message must not state an unconditional claim about them. At the
+/// DEFAULTS (`tx_min_reads = 10`, `gene_min_reads = 30`) L2 is unreachable —
+/// reaching it already requires `n < 10`, and the gate then demands 30 values
+/// from a pool of at most 9 — and the warning says exactly that, scoped to the
+/// defaults. It does not say "always", because `--gene-min-reads 3` does make
+/// L2 fire on this pool. Measured on HC2: the same degenerate anchor pool
+/// yields L2=0 at the default threshold and L2=3424 at `--gene-min-reads 3`.
+/// That configuration is not a repair, though — the pooled set is the
+/// transcript's own reads, so L2 there is L1 at a different threshold, and the
+/// warning says so rather than inviting the reader to think a threshold tweak
+/// substitutes for a gene map.
 ///
 /// It is NOT enough to branch on "no `--tx-to-gene` was passed": a TSV that
 /// genuinely maps one transcript to one gene is equally degenerate, and that
@@ -171,17 +182,23 @@ pub fn degenerate_gene_pool_warning(
         "[telescope][WARN] anchor pool has NO gene structure: {} distinct \
          transcript_id == {} distinct gene_id (gene_id was set equal to \
          transcript_id on every row).\n\
-         [telescope][WARN]   Consequence: the L2 gene-level fallback is \
-         STRUCTURALLY UNREACHABLE. A gene's pool IS its own transcript's pool, \
-         which holds fewer than tx_min_reads=10 reads by the time L1 has been \
-         tried, so the L2 gene_min_reads=30 gate can never fire.\n\
-         [telescope][WARN]   The poly(A) cascade is therefore running as \
-         2-LEVEL (L1 per-transcript, L3 cohort), not 3-LEVEL. An `L2=0` in the \
-         downstream emission stats is THIS, not a fit failure -- do not read it \
-         as evidence that the gene fit did not converge.\n\
+         [telescope][WARN]   Consequence: every gene's pool IS its own \
+         transcript's pool, so no two transcripts ever share fitted poly(A) \
+         parameters through the L2 gene-level tier. At the DEFAULT thresholds \
+         (tx_min_reads=10, gene_min_reads=30) this makes L2 unreachable: \
+         reaching L2 already requires n < 10, and the gate then demands 30 \
+         values from a pool of at most 9.\n\
+         [telescope][WARN]   Those thresholds are build-emission flags and are \
+         NOT visible here. Lowering --gene-min-reads below --tx-min-reads \
+         (e.g. --gene-min-reads 3) DOES make L2 fire on this pool, but it is \
+         then pooling a transcript with itself, which is the same fit as L1 at \
+         a different threshold -- not gene-level borrowing. An `L2=0` in the \
+         downstream stats at the default thresholds is THIS, not a fit \
+         failure; do not read it as evidence that the gene fit did not \
+         converge.\n\
          [telescope][WARN]   Remedy: pass --tx-to-gene <TSV> \
          (transcript_id<TAB>gene_id) to build-anchors, so that transcripts \
-         sharing a gene share a pool.",
+         sharing a gene genuinely share a pool.",
         distinct_transcripts, distinct_genes,
     ))
 }
@@ -528,14 +545,25 @@ mod tests {
         let msg = degenerate_gene_pool_warning(stats.distinct_genes, stats.distinct_transcripts)
             .expect("a pool with gene_id == transcript_id on every row MUST warn");
         for (what, needle) in [
-            ("the L2 fallback being unreachable", "L2"),
+            ("the L2 tier's consequence", "L2"),
             ("gene-level wording", "gene-level"),
-            ("structurally unreachable", "STRUCTURALLY UNREACHABLE"),
-            ("the 2-level consequence", "2-LEVEL"),
+            (
+                "the consequence for shared parameters",
+                "no two transcripts ever share",
+            ),
+            ("the default thresholds it is scoped to", "tx_min_reads=10"),
             ("the remedy", "--tx-to-gene"),
         ] {
             assert!(msg.contains(needle), "warning must name {what}; got: {msg}");
         }
+        // Scoped, not absolute. `--gene-min-reads 3` makes L2 fire on this very
+        // pool (measured: L2=3424 on HC2 vs L2=0 at the default), so a message
+        // asserting unconditional unreachability would be false.
+        assert!(
+            !msg.contains("STRUCTURALLY UNREACHABLE"),
+            "must not claim L2 is unconditionally unreachable; the thresholds \
+             are build-emission flags and can make it fire; got: {msg}"
+        );
     }
 
     /// NEGATIVE — the one that stops the warning becoming noise. The SAME BAM
