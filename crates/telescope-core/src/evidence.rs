@@ -628,7 +628,28 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
     let mut candidate_mapq: Vec<u8> = Vec::with_capacity(total_candidates);
     let mut candidate_5p_gap: Vec<u32> = Vec::with_capacity(total_candidates);
 
-    for (read_id, entry) in read_map {
+    // DETERMINISM: `read_map` is a `HashMap`, so iterating it yields entries in
+    // an order that depends on a per-process random hash seed. That order
+    // decides the order of `molecules`, which decides the order of the
+    // `init_counts[tx_id] += share` accumulation in the E-step's alpha
+    // initialisation, which is a FLOAT sum. Different addition order is a
+    // different rounding, so `alpha` came out ~6 ULP apart between two runs of
+    // the same command on the same input, which propagated into every posterior
+    // (538,127 of 1,347,285 weights differed, max 1.39e-15) and flipped the
+    // top-1 assignment of 10 reads in 689,052.
+    //
+    // Sorting by `read_id` removes the randomness. This changes the MODEL not
+    // at all — it fixes the order of an existing sum, so every value is one of
+    // the values the unordered version could already produce.
+    //
+    // Do not "optimise" this away. Nothing downstream is order-sensitive by
+    // design, and this is the only thing making the emitted parquet
+    // bit-reproducible, which is what makes a regression gate able to compare
+    // md5s at all.
+    let mut entries: Vec<(String, TempReadEntry)> = read_map.into_iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (read_id, entry) in entries {
         if entry.candidates.is_empty() {
             continue;
         }
@@ -1296,6 +1317,52 @@ mod tests {
         assert!(
             none_src.poly_a_is_placeholder,
             "a PolyASource::None graph must be flagged, or the em.rs guard cannot fire"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The graph's molecules come out in `read_id` order, and that order is the
+    /// whole reason the emitted parquet is bit-reproducible.
+    ///
+    /// `read_map` is a `HashMap`, so an unsorted drain yields a per-process
+    /// random order. That order propagates: molecules -> the `init_counts`
+    /// float accumulation -> `alpha` -> every posterior. Measured before the
+    /// sort was added, two runs of one command on one input gave two different
+    /// profile md5s, 538,127 of 1,347,285 posterior weights differing, and 10
+    /// of 689,052 top-1 assignments flipped.
+    ///
+    /// This asserts the INVARIANT rather than re-measuring the symptom, because
+    /// the symptom is cross-process: within a single test the HashMap order is
+    /// fixed, so a test that ran the extraction twice would compare a thing
+    /// against itself and pass with the sort deleted. Sortedness is checkable
+    /// in-process, and deleting the sort makes it false.
+    ///
+    /// The read_ids are deliberately NOT in input order (`r3`, `r1`, `r2`), so
+    /// a graph that simply preserved BAM order would also fail — the property
+    /// under test is sortedness, not "unchanged".
+    #[test]
+    fn test_molecules_are_emitted_in_read_id_order() {
+        use noodles_sam::alignment::record_buf::data::field::Value;
+        let mut r3 = synth_record_with_gap("r3", 0, 0, false, Some(1000), 1, 60);
+        r3.data_mut().clear();
+        r3.data_mut().insert(TAG_PT, Value::from(90i32));
+        let mut r1 = synth_record_with_gap("r1", 1, 0, false, Some(1000), 1, 60);
+        r1.data_mut().clear();
+        r1.data_mut().insert(TAG_PT, Value::from(90i32));
+        let mut r2 = synth_record_with_gap("r2", 2, 0, false, Some(1000), 1, 60);
+        r2.data_mut().clear();
+        r2.data_mut().insert(TAG_PT, Value::from(90i32));
+        let path = write_synthetic_bam("sorted_molecules", vec![r3, r1, r2]);
+
+        let g = extract_evidence_with(&path, 35, &PolyASource::BamTag(TAG_PT)).unwrap();
+        let ids: Vec<&str> = g.molecules.iter().map(|m| m.read_id.as_str()).collect();
+        let mut want = ids.clone();
+        want.sort_unstable();
+        assert_eq!(
+            ids, want,
+            "molecules must be emitted sorted by read_id. If this fails, the \
+             `read_map` drain is unordered again and the emitted parquet stops \
+             being bit-reproducible — see the determinism note at the drain site."
         );
         let _ = std::fs::remove_file(&path);
     }
