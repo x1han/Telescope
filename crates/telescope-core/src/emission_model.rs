@@ -22,7 +22,7 @@
 //!   [`AssessmentQuality`], [`load_assessment_quality`] and
 //!   [`build_emission_parquet`] are RETAINED, working and
 //!   tested, but no CLI entry point currently reaches them:
-//!   the `--polya-parquet` / `--aidrs-assessment-tsv`
+//!   the `--polya-parquet` / `--assessment-tsv`
 //!   arguments of `telescope build-emission` were deleted on
 //!   2026-10-03, and `--anchor-pool` is now that subcommand's
 //!   sole input.
@@ -56,10 +56,15 @@
 //! reads has the same kind of row here; only the width of the
 //! observation set behind it differs. The shipped anchor
 //! pool is 90,703 rows over 15,427 transcripts, of which
-//! 49.32% carry more than one distinct observed length, so
-//! the scalar reading of a "transcript's poly(A) length" is
-//! wrong for roughly half the transcriptome and the
-//! distribution reading is the one to use.
+//! 49.32% (7,609) carry more than one distinct observed
+//! length, so the scalar reading of a "transcript's
+//! poly(A) length" is wrong for roughly half the
+//! transcriptome and the distribution reading is the one
+//! to use. Both figures, and the command that produces
+//! them, are in `workspace/notes/EXPERIMENT.md` under
+//! "2026-10-03 (measurement provenance)"; the row and
+//! transcript counts also appear in the 2026-10-02
+//! anchor-pool fan-out entry.
 //!
 //! ## `polyA_frac` + `is_polyA_competent` semantics
 //!
@@ -1641,9 +1646,9 @@ mod tests {
         //
         // The match tolerance is 1e-9, not exact, because of the L2
         // HashMap-ordering effect described further down: a re-derived gene
-        // fit can differ from the stored one by a few ULPs. 1e-9 sits ~6
-        // orders of magnitude below the smallest gap between two tiers, which
-        // the assertion above pins.
+        // fit can differ from the stored one by a few ULPs. 1e-9 sits ~8
+        // orders of magnitude below the smallest gap between two tiers (~0.12
+        // on this fixture), which the assertion above pins.
         let tier_of = |tx: &str| -> &'static str {
             let (_, _, _, _, _, mu, sigma2) = rows
                 .iter()

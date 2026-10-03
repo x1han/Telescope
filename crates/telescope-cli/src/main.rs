@@ -91,8 +91,10 @@ enum Cmd {
     ///
     /// `--output` is always required. The `--tx-min-reads`,
     /// `--gene-min-reads`, `--cohort-min-reads` flags configure
-    /// the Universal-Mode 3-level fallback (Tx → Gene → Cohort)
-    /// and only take effect when `--anchor-pool` is supplied.
+    /// the Universal-Mode 3-level fallback (Tx → Gene → Cohort).
+    /// They used to be conditional on `--anchor-pool`; that is now this
+    /// subcommand's only input, so there is nothing left to condition on
+    /// and no `requires = "anchor_pool"` is attached to them.
     BuildEmission {
         /// Universal mode: path to `telescope.anchor_pool.parquet`
         /// (produced by `telescope build-anchors`).
@@ -104,7 +106,7 @@ enum Cmd {
         /// output). When provided, reads whose transcript_id has
         /// `em_eligible == false` are dropped before emission
         /// fitting.
-        #[arg(long, requires = "anchor_pool")]
+        #[arg(long)]
         transcript_evidence: Option<PathBuf>,
 
         /// Output path for `telescope.emission.parquet`.
@@ -112,16 +114,16 @@ enum Cmd {
         output: PathBuf,
 
         /// Universal mode: L1 Tx-level minimum reads (default 10).
-        #[arg(long, default_value_t = 10, requires = "anchor_pool")]
+        #[arg(long, default_value_t = 10)]
         tx_min_reads: usize,
 
         /// Universal mode: L2 Gene-level minimum reads (default 30).
-        #[arg(long, default_value_t = 30, requires = "anchor_pool")]
+        #[arg(long, default_value_t = 30)]
         gene_min_reads: usize,
 
         /// Universal mode: L3 Cohort-level minimum reads
         /// (informational; L3 is always applied when L1/L2 fail).
-        #[arg(long, default_value_t = 50, requires = "anchor_pool")]
+        #[arg(long, default_value_t = 50)]
         cohort_min_reads: usize,
     },
 
@@ -772,7 +774,7 @@ fn main() -> Result<()> {
             eprintln!("[telescope]    poly(A) discriminative power:");
             eprintln!(
                 "[telescope]      zero-power reads (identical mu/sigma2 across all \
-                 candidates): {} of {} ambiguous ({:.1}%)",
+                 candidates that have an emission row): {} of {} ambiguous ({:.1}%)",
                 stats.n_polya_zero_power,
                 stats.n_ambiguous,
                 stats.n_polya_zero_power as f64 / n_ambig * 100.0

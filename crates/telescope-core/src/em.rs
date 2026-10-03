@@ -890,10 +890,13 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
             // quantities on purpose; do not treat them as interchangeable.
             let (top, top_w) = weights.iter().fold((None, 0.0f64), |acc, &(tx, w)| {
                 // Strict `>` (not `>=`) => on an exact tie the FIRST candidate
-                // in pool order wins, deterministically. No fixture in this
-                // file has a tie -- every ambiguous read's candidates carry
-                // `ΔAS > 0` -- so this rule is stated here, not pinned by a
-                // test. Do not read it as verified.
+                // in pool order wins, deterministically. Several fixtures in
+                // this file feed the E-step an all-equal `candidate_as`
+                // (`zero_power_probe`, the ghost fixture, ...), so ΔAS == 0
+                // ties are certainly REACHABLE; what no test pins is that the
+                // resulting posterior weights actually come out equal. Flipping
+                // this to `>=` leaves the suite green, which is how we know.
+                // Read the rule as stated, not as verified.
                 if w > acc.1 {
                     (Some(tx), w)
                 } else {
@@ -904,11 +907,23 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
                 read_id: mol.read_id.clone(),
                 n_candidates_before_cutoff: ncand as usize,
                 // `None` only on the ghost path: the fold never ran, so there
-                // is no candidate to name. The `params` lookup cannot fail for
-                // a tx that is in `weights` -- the E-step's `if let Some` never
-                // pushed it in -- but it is kept as a `get`/`and_then` so a
-                // future change that does push such an entry degrades to
-                // `None` rather than panicking.
+                // is no candidate to name.
+                //
+                // The `params` lookup below cannot fail for a tx that is in
+                // `weights` -- the E-step only ever pushes a tx for which
+                // `params[tx_id]` is `Some`, and nothing after that step adds
+                // to or removes from `weights`. So the `get`/`and_then` is
+                // defensive plumbing against a panic, NOT the reason the
+                // `top_tx_id == Some(..) => profile row` implication holds.
+                // That implication rests on a different and separate
+                // precondition: the E-step pushes `-inf` for any candidate with
+                // `!p.is_competent || p.alpha <= 0.0`, so `weights` can contain
+                // competent candidates ONLY, and the output stage filters the
+                // same way. Neither the fold nor this lookup re-checks
+                // competence; if the E-step's filter is ever neutralised, a
+                // transcript can be named here with no profile row behind it
+                // rather than degrading to `None`. That filter is pinned by
+                // `test_incompetent_but_present_transcript_is_never_a_reads_top1`.
                 top_tx_id: top.and_then(|tx| {
                     params
                         .get(tx)
@@ -3678,7 +3693,7 @@ mod tests {
         );
         for a in &assigns {
             assert!(
-                rows.iter().any(|&(ref r, ..)| r == &a.read_id),
+                rows.iter().any(|(r, ..)| r == &a.read_id),
                 "assignment for {} carries a top_tx_id but has no profile row; \
                  the implication `top_tx_id == Some(..) => profile row` is what \
                  keeps the cross-run join denominator auditable: {rows:?}",
@@ -3788,7 +3803,7 @@ mod tests {
         for a in &assigns {
             if a.top_tx_id.is_some() {
                 assert!(
-                    rows.iter().any(|&(ref r, ..)| r == &a.read_id),
+                    rows.iter().any(|(r, ..)| r == &a.read_id),
                     "top_tx_id == Some(..) for {} but it has no profile row; the \
                      implication the cross-run join depends on is broken: {rows:?}",
                     a.read_id
@@ -3797,7 +3812,94 @@ mod tests {
         }
     }
 
-    /// `write_read_assignments_parquet` is a `pub fn` whose one distinguishing
+    /// The E-step's competence filter is the ONLY thing keeping an incompetent
+    /// transcript out of a read's `top_tx_id`. Neither the argmax fold nor the
+    /// `params` lookup that turns the winner into a `transcript_id` re-checks
+    /// `is_competent`, so the named transcript's profile row exists only
+    /// because the E-step pushed `-inf` instead of a real log-likelihood for
+    /// it. That is one predicate -- `if !p.is_competent || p.alpha <= 0.0` in
+    /// the E-step -- and nothing pinned it.
+    ///
+    /// The fixture makes the failure observable rather than hypothetical. `BAD`
+    /// is present in the graph and has an emission row, so nothing about it is
+    /// missing; it is simply marked not poly(A)-competent. Its `mu` is the
+    /// read's EXACT observed length, so if the filter stops firing it wins the
+    /// argmax outright -- `GOOD` is a poor fit and loses on the numbers alone.
+    /// The output stage's own `!p.is_competent` check then keeps `BAD` out of
+    /// the profile, so the read ends up naming, as its top-1, a transcript it
+    /// has no profile row for.
+    ///
+    /// This is the per-TRANSCRIPT half of the invariant the per-read checks
+    /// above cover only from the outside: those ask "does the named read have
+    /// some profile row", which stays satisfied here because `GOOD` supplies
+    /// one. The claim that actually matters for the cross-run join is that the
+    /// named transcript is the one the read was assigned to, so that is what is
+    /// asserted.
+    #[test]
+    fn test_incompetent_but_present_transcript_is_never_a_reads_top1() {
+        let log_pal = (100.0_f32).log2();
+        let emission = scratch("incompetent_emission.parquet");
+        let profile = scratch("incompetent_profile.parquet");
+        write_test_emission_with_competence(
+            &emission,
+            &[
+                // Competent, but its mu is a 1.5-bit miss: `GOOD` wins this
+                // fixture ONLY because `BAD` is filtered out.
+                ("GOOD", "gene0", log_pal as f64 - 1.5, 0.04, true),
+                // Present in the graph, has a row, marked not competent, and an
+                // exact fit for the read.
+                ("BAD", "gene1", log_pal as f64, 0.04, false),
+            ],
+        );
+
+        let mut assigns: Vec<ReadAssignment> = Vec::new();
+        let _ = solve_and_write_profile(
+            synth_graph(log_pal, &[("GOOD", 900), ("BAD", 900)]),
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            5,
+            20.0,
+            FIVE_PRIME_OFF,
+            POLY_A_ON,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
+            None,
+            None,
+            Some(&mut assigns),
+        )
+        .unwrap();
+
+        let rows = read_profile_by_read(&profile);
+        let _ = std::fs::remove_file(&emission);
+        let _ = std::fs::remove_file(&profile);
+
+        assert_eq!(
+            assigns.len(),
+            1,
+            "the read has a competent candidate, so it is not a ghost and must be \
+             recorded: {assigns:#?}"
+        );
+        let a = &assigns[0];
+        assert_eq!(a.read_id, "r1");
+        assert_eq!(
+            a.top_tx_id.as_deref(),
+            Some("GOOD"),
+            "an incompetent transcript must never be a read's top-1; it is present \
+             in the graph and its mu is an exact fit, so it wins the argmax the \
+             moment the E-step stops pushing -inf for it, and neither the fold nor \
+             the `params` lookup re-checks competence"
+        );
+        assert!(
+            rows.iter()
+                .any(|(rd, tx, _)| rd == "r1" && tx == a.top_tx_id.as_deref().unwrap()),
+            "the transcript named as top-1 must itself have a profile row for \
+             this read, not merely have SOME row: {rows:?}"
+        );
+    }
+
     /// behaviour is `top_b.append_option(...)`. The output stage reaches that
     /// NULL on every ghost read, so this is not a corner case — but the writer
     /// itself was never called by a test, so a change to `append_option` or to
