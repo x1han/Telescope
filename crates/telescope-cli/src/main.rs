@@ -318,6 +318,34 @@ enum Cmd {
         /// is post-truncation and renormalised).
         #[arg(long)]
         read_assignments: Option<PathBuf>,
+
+        /// Also write the `(mu, sigma2)` the FINAL E-step consumed
+        /// (`--dump-emission-params <path>.parquet`).
+        ///
+        /// WHY. There are two different μ in this program and nothing on disk
+        /// distinguished them: the one LOADED from `--emission`, and the one the
+        /// M-step FITTED. The posterior is computed from whichever the last
+        /// E-step saw, so an analysis that bins reads by Δμ must bin by that
+        /// one. Before this flag the only μ on disk was the loaded one, which is
+        /// the right value only when the last E-step is the FIRST one — i.e. at
+        /// `--max-iter 1`, or on a graph with no contested reads. On any longer
+        /// run the M-step has moved μ and the loaded value is wrong, whether or
+        /// not the run converged.
+        ///
+        /// The file is loader-compatible with `--emission` (`transcript_id`,
+        /// `gene_id`, `is_polyA_competent`, `mu_logPAL`, `sigma2_logPAL`), so a
+        /// converged fit can be fed back in to measure the converged state
+        /// without re-deriving it. `mu_cohort` is carried as its own column so
+        /// the shrinkage prior stays auditable: re-loading this file re-anchors
+        /// BOTH priors to the fitted values (`load_emission_parameters` sets
+        /// `mu_cohort = mu_logPAL` and `sigma2_cohort = sigma2_logPAL`), so a
+        /// second pass applies τ₀=2 and 2β₀ a second time. Compare those columns
+        /// before trusting a re-loaded fit.
+        ///
+        /// This is a DIAGNOSTIC sidecar. The published profile and
+        /// read-assignments schemas are unchanged.
+        #[arg(long)]
+        dump_emission_params: Option<PathBuf>,
     },
 
     /// Profile Summary Engine: aggregate profile.parquet → sample_summary.parquet.
@@ -505,6 +533,7 @@ fn main() -> Result<()> {
             poly_a_source,
             debug,
             read_assignments,
+            dump_emission_params,
         } => {
             let poly_a = evidence::parse_poly_a_source(&poly_a_source)?;
             // `--polyA-source none` fills `log_pal` with a placeholder, not a
@@ -697,6 +726,10 @@ fn main() -> Result<()> {
             // filled), which keeps the borrow a plain `&mut` for the duration
             // of the call rather than a borrow of a temporary.
             let mut read_sink: Vec<em::ReadAssignment> = Vec::new();
+            // Same idiom as `read_sink`: declared unconditionally so the borrow
+            // is a plain `&mut` for the call rather than a borrow of a
+            // temporary, and filled only when the flag asked for it.
+            let mut params_sink: Vec<Option<em::TranscriptParam>> = Vec::new();
             let stats = em::solve_and_write_profile(
                 graph,
                 &emission,
@@ -711,7 +744,11 @@ fn main() -> Result<()> {
                 prune_max_delta_as,
                 min_weight,
                 trace_sink,
-                None,
+                if dump_emission_params.is_some() {
+                    Some(&mut params_sink)
+                } else {
+                    None
+                },
                 if read_assignments.is_some() {
                     Some(&mut read_sink)
                 } else {
@@ -719,6 +756,19 @@ fn main() -> Result<()> {
                 },
             )
             .context("Module 3 solve_and_write_profile failed")?;
+            if let Some(path) = dump_emission_params {
+                let rows = std::mem::take(&mut params_sink);
+                anyhow::ensure!(
+                    !rows.is_empty(),
+                    "--dump-emission-params was set but the solve produced no params"
+                );
+                em::write_emission_params_parquet(&rows, &path)?;
+                eprintln!(
+                    "[telescope]    E-step emission params:  {} rows -> {}",
+                    rows.iter().filter(|r| r.is_some()).count(),
+                    path.display()
+                );
+            }
             if let Some(path) = read_assignments {
                 let rows = std::mem::take(&mut read_sink);
                 anyhow::ensure!(

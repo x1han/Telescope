@@ -405,6 +405,33 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
     let mut final_weights: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n_ambiguous];
     let mut n_em_iter = 0_usize;
 
+    // The `(mu, sigma2)` the LAST E-step actually consumed.
+    //
+    // WHY THIS EXISTS. "Did poly(A) have any say on this read?" is a property of
+    // the evidence THE POSTERIOR WAS BUILT FROM, not of wherever the parameters
+    // happen to sit when the output stage runs. The M-step rewrites `p.mu` at
+    // :690 and `p.sigma2` at :698, but only under `poly_a_weight > 0.0`, so the
+    // two arms of a `--poly-a-weight` A/B read DIFFERENT states at the output
+    // stage while having consumed the SAME state in their E-step. Reading
+    // `params` there made one shared emission parquet report two different
+    // zero-power rates for the same reads.
+    //
+    // The exit path decides whether that was visible:
+    //   - CONVERGENCE (`break` at the `delta_avg_ll < tol` check) happens BEFORE
+    //     the M-step, so `params` still equals the snapshot — correct by luck.
+    //   - `max_iter` EXHAUSTION runs the M-step last, so `params` is one
+    //     M-step NEWER than the posterior. Wrong, and always so at
+    //     `--max-iter 1`.
+    // So the bug was invisible on converged runs and maximal on the
+    // `--max-iter 1` ablations. A measurement that is only wrong on some exit
+    // paths is worse than one that is always wrong: the converged number looked
+    // fine and was quoted for several rounds.
+    //
+    // ONE snapshot, TWO consumers — the telemetry below and the
+    // `output_emission_params` sidecar — so both describe the same state by
+    // construction rather than by two independent correct-looking reads.
+    let mut last_estep_params: Vec<Option<TranscriptParam>> = Vec::new();
+
     for iter in 0..max_iter {
         // E-step: parallel over ambiguous reads. Compute log-sum-exp normalized weights,
         // per-read log-likelihood, and per-read posterior entropy.
@@ -575,6 +602,12 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
                 (log_z, weights, entropy)
             })
             .collect();
+
+        // SNAPSHOT THE E-STEP'S VIEW OF THE MODEL — see `last_estep_params`.
+        // Taken HERE, after the E-step consumed `params` and before the M-step
+        // rewrites them, so this is exactly the state that produced
+        // `final_weights` below.
+        last_estep_params = params.clone();
 
         let current_ll: f64 = e_results.iter().map(|&(ll, _, _)| ll).sum();
         n_em_iter = iter + 1;
@@ -831,7 +864,12 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         // allocation and no new per-read structure. See
         // `polya_has_no_discriminative_power` for the definition and for
         // why the comparison is exact rather than tolerance-based.
-        if polya_has_no_discriminative_power(&graph, mol, &params) {
+        //
+        // `last_estep_params`, NOT `params`: this must answer "did poly(A)
+        // cancel in the posterior we are emitting?", and the posterior came from
+        // the last E-step. `params` has since been through one more M-step on
+        // the `max_iter`-exhaustion path, which is the whole defect.
+        if polya_has_no_discriminative_power(&graph, mol, &last_estep_params) {
             n_polya_zero_power += 1;
         }
 
@@ -1079,7 +1117,16 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
     writer.close().context("Failed to close writer")?;
 
     if let Some(out) = output_emission_params.as_deref_mut() {
-        *out = params.clone();
+        // `last_estep_params`, NOT `params` — see the declaration. On the
+        // `max_iter`-exhaustion path `params` is one M-step past the state that
+        // produced `final_weights`, so exporting it would hand a downstream
+        // analysis the same stale μ this snapshot was introduced to eliminate.
+        //
+        // `take`, not `clone`: the telemetry above has already run, so nothing
+        // reads the snapshot again. Cloning a 400k-element
+        // `Vec<Option<TranscriptParam>>` here would be ~800k String
+        // allocations for a value that is about to be dropped anyway.
+        *out = std::mem::take(&mut last_estep_params);
     }
 
     if let Some(out) = output_read_assignments {
@@ -1378,6 +1425,91 @@ pub fn write_read_assignments_parquet(
         .context("Failed to write read-assignments batch")?;
     w.close()
         .context("Failed to close read-assignments writer")?;
+    Ok(())
+}
+
+/// Write the `(mu, sigma2)` the last E-step consumed, as a DIAGNOSTIC sidecar.
+///
+/// The first five columns are named and typed to match the emission parquet, so
+/// the result loads back through `load_emission_parameters` unchanged and a
+/// converged fit can be re-measured without re-deriving it. `load_emission`
+/// `column_by_name`s exactly those five and ignores the rest.
+///
+/// The remaining columns exist because the file's whole purpose is to be
+/// auditable against the stale-μ defect it was added to fix:
+///
+/// - `mu_cohort` — the shrinkage prior, so a reader can see that re-loading
+///   this file RE-ANCHORS the prior. The loader sets `mu_cohort = mu_logPAL`
+///   *and* `sigma2_cohort = sigma2_logPAL`, so BOTH priors move to the fitted
+///   values and τ₀=2 / 2β₀ are applied a second time — the σ² half is as real
+///   as the μ half and is the one a reader is likelier to miss. Without this
+///   column neither is visible.
+/// - `alpha` — the mixture weight the last E-step used.
+/// - `state` — which iterate this row holds, `e_step_final`. A file that cannot
+///   say which state it carries cannot be checked against the defect.
+pub fn write_emission_params_parquet(
+    params: &[Option<TranscriptParam>],
+    path: &std::path::Path,
+) -> Result<()> {
+    // `BooleanBuilder` is NOT at module level (unlike the others), so it is
+    // imported here. Verified by compiling, not by reading the import list.
+    use arrow::array::BooleanBuilder;
+
+    let mut tr_b = StringBuilder::new();
+    let mut gene_b = StringBuilder::new();
+    let mut comp_b = BooleanBuilder::new();
+    let mut mu_b = Float64Builder::new();
+    let mut s2_b = Float64Builder::new();
+    let mut cohort_b = Float64Builder::new();
+    let mut alpha_b = Float64Builder::new();
+    let mut state_b = StringBuilder::new();
+
+    // A transcript with NO emission row is `None` and gets NO row here, exactly
+    // as in the emission parquet. Writing a placeholder `mu` would invent a
+    // parameter for a transcript the model never scored.
+    for p in params.iter().flatten() {
+        tr_b.append_value(&p.transcript_id);
+        gene_b.append_value(&p.gene_id);
+        comp_b.append_value(p.is_competent);
+        mu_b.append_value(p.mu);
+        s2_b.append_value(p.sigma2);
+        cohort_b.append_value(p.mu_cohort);
+        alpha_b.append_value(p.alpha);
+        state_b.append_value("e_step_final");
+    }
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("transcript_id", DataType::Utf8, false),
+        Field::new("gene_id", DataType::Utf8, false),
+        Field::new("is_polyA_competent", DataType::Boolean, false),
+        Field::new("mu_logPAL", DataType::Float64, false),
+        Field::new("sigma2_logPAL", DataType::Float64, false),
+        Field::new("mu_cohort", DataType::Float64, false),
+        Field::new("alpha", DataType::Float64, false),
+        Field::new("state", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(tr_b.finish()),
+            Arc::new(gene_b.finish()),
+            Arc::new(comp_b.finish()),
+            Arc::new(mu_b.finish()),
+            Arc::new(s2_b.finish()),
+            Arc::new(cohort_b.finish()),
+            Arc::new(alpha_b.finish()),
+            Arc::new(state_b.finish()),
+        ],
+    )
+    .context("Failed to build emission-params RecordBatch")?;
+
+    let f = std::fs::File::create(path).with_context(|| format!("Failed to create {:?}", path))?;
+    let mut w = ArrowWriter::try_new(f, schema, Some(WriterProperties::builder().build()))
+        .context("Failed to create ArrowWriter for emission params")?;
+    w.write(&batch)
+        .context("Failed to write emission-params batch")?;
+    w.close()
+        .context("Failed to close emission-params writer")?;
     Ok(())
 }
 
@@ -4497,14 +4629,20 @@ mod tests {
     ///
     /// The unit test above pins the predicate; this pins the four links around
     /// it — the counter is incremented from the AMBIGUOUS loop, it reads the
-    /// POST-EM `params`, it lands in the struct, and unambiguous reads are
-    /// excluded from it. `poly_a_weight = 0` is deliberate: that arm FREEZES
-    /// `mu`/`sigma2` at their loaded values (see
+    /// LAST E-STEP's `last_estep_params`, it lands in the struct, and
+    /// unambiguous reads are excluded from it.
+    ///
+    /// It previously read the POST-EM `params`, and said so here. That was the
+    /// stale-μ defect: on the `max_iter`-exhaustion path those are one M-step
+    /// past the state that produced the posterior. This fixture still passes
+    /// either way — `poly_a_weight = 0` freezes `mu`/`sigma2` (see
     /// `test_poly_a_weight_zero_freezes_mu_and_sigma2_instead_of_dragging_them`),
-    /// so the verdict is decided by the fixture's `(mu, sigma2)` rather than by
-    /// whatever the M-step drifted them to. `max_iter = 1` is the same
-    /// isolation — the count is read at the output stage, and with the
-    /// parameters pinned that stage is deterministic.
+    /// and the predicate reads ONLY `mu`/`sigma2`, so pre- and post-M-step are
+    /// identical for the fields it looks at. That is exactly why this test
+    /// could never have caught the defect, and why the positive arm in
+    /// `test_zero_power_telemetry_reads_the_e_step_state_not_the_post_m_step`
+    /// exists: it runs at `poly_a_weight > 0`, where the M-step DOES move the
+    /// fields the predicate reads.
     #[test]
     fn test_n_polya_zero_power_reaches_stats_with_the_known_mix() {
         let log_pal = (100.0_f32).log2();
@@ -4617,6 +4755,153 @@ mod tests {
             "exactly ZERO_2WAY and ZERO_3WAY share one (mu, sigma2); MU_SPLIT and \
              SIGMA_SPLIT each disagree in one component and must NOT be counted, \
              and UNAMBIGUOUS is out of scope for the counter entirely"
+        );
+    }
+
+    /// The stale-μ defect, as a test.
+    ///
+    /// Two arms, ONE shared emission parquet, ONE shared graph, differing ONLY
+    /// in `poly_a_weight`. Both arms' E-steps therefore consume the IDENTICAL
+    /// `(mu, sigma2)` — the loaded values, before any M-step has run. So the
+    /// zero-power verdict is a property of the data, and the two arms MUST
+    /// report the same count. The M-step cannot change that: it runs after the
+    /// E-step that produced the posterior, and the telemetry is about the
+    /// posterior.
+    ///
+    /// Pre-fix this fails, and with a SIGN rather than merely "not equal":
+    /// reading post-M-step `params` lets the M-step's τ₀=2 shrinkage pull the
+    /// tied fits apart (they share a loaded `mu_cohort`, but their accumulated
+    /// `S1` differ), so the ON arm counts STRICTLY FEWER than the OFF arm. An
+    /// assertion of the form `assert_ne!` would also have passed on a fixture
+    /// that broke for an unrelated reason; `assert_eq!` on a known value pins
+    /// the direction, so a future change that makes the arms differ the other
+    /// way is also caught.
+    ///
+    /// `max_iter = 1` is REQUIRED, and is the whole point: it is the
+    /// `max_iter`-exhaustion exit path, the one where the M-step runs last and
+    /// leaves `params` a full M-step ahead of the posterior. On a converged run
+    /// the loop `break`s BEFORE the M-step and this defect is invisible — which
+    /// is why it survived several rounds of converged-run reporting.
+    #[test]
+    fn test_zero_power_telemetry_reads_the_e_step_state_not_the_post_m_step() {
+        let log_pal = (100.0_f32).log2();
+        let emission = scratch("estep_state_emission.parquet");
+        // tx0 and tx1 share ONE loaded fit — the L3-fallback shape, where two
+        // underpowered transcripts in a gene both take the same cohort value.
+        // That shared fit is what makes the reads below zero-power.
+        write_test_emission(
+            &emission,
+            &[("tx0", "gene0", 7.0, 0.5), ("tx1", "gene0", 7.0, 0.5)],
+        );
+        let molecules = vec![
+            MoleculeEvidence {
+                read_id: "TIED_A".into(),
+                log_pal,
+                candidate_offset: 0,
+                candidate_count: 2,
+            },
+            MoleculeEvidence {
+                read_id: "TIED_B".into(),
+                log_pal,
+                candidate_offset: 2,
+                candidate_count: 2,
+            },
+        ];
+        // ASYMMETRIC on purpose. The alignment term `ln A_rk = -ΔAS/λ` gives
+        // tx0 strictly more posterior mass than tx1 on every read, so their
+        // accumulated S1 DIFFER and one M-step pulls their mu apart. A fixture
+        // with equal AS gives both candidates identical accumulators, the
+        // shrinkage moves them to the identical place, and the M-step cannot
+        // separate the tie — which is why the first draft of this test passed
+        // against the unfixed code.
+        let candidate_pool: Vec<u32> = vec![0, 1, 0, 1];
+        let n = candidate_pool.len();
+        let mut candidate_as = vec![900; n];
+        candidate_as[1] = 850;
+        candidate_as[3] = 850;
+        let graph = FlatEvidenceGraph {
+            molecules,
+            candidate_nm: vec![0; n],
+            candidate_mapq: vec![60; n],
+            candidate_as,
+            candidate_5p_gap: vec![0; n],
+            candidate_pool,
+            transcript_names: (0..2).map(|i| format!("tx{i}")).collect(),
+            poly_a_is_placeholder: false,
+        };
+
+        let run = |w: f64, tag: &str| {
+            let profile = scratch(&format!("estep_state_profile_{tag}.parquet"));
+            let mut out: Vec<Option<TranscriptParam>> = Vec::new();
+            let stats = solve_and_write_profile(
+                FlatEvidenceGraph {
+                    molecules: graph.molecules.clone(),
+                    candidate_nm: graph.candidate_nm.clone(),
+                    candidate_mapq: graph.candidate_mapq.clone(),
+                    candidate_as: graph.candidate_as.clone(),
+                    candidate_5p_gap: graph.candidate_5p_gap.clone(),
+                    candidate_pool: graph.candidate_pool.clone(),
+                    transcript_names: graph.transcript_names.clone(),
+                    poly_a_is_placeholder: false,
+                },
+                &emission,
+                "TEST",
+                &profile,
+                1e-6,
+                1, // max_iter: EXHAUSTION, the path where the bug lives
+                20.0,
+                FIVE_PRIME_OFF,
+                w,
+                FIVE_PRIME_WINDOW,
+                PRUNE_MAX_DELTA_AS,
+                MIN_WEIGHT,
+                None,
+                Some(&mut out),
+                None,
+            )
+            .unwrap();
+            let _ = std::fs::remove_file(&profile);
+            (stats, out)
+        };
+
+        let (off, _) = run(0.0, "off");
+        let (on, on_params) = run(1.0, "on");
+
+        let _ = std::fs::remove_file(&emission);
+
+        assert_eq!(off.n_ambiguous, 2, "both reads are contested");
+        assert_eq!(
+            off.n_polya_zero_power, 2,
+            "the OFF arm freezes mu/sigma2, so both reads keep the shared loaded \
+             fit and both are zero-power"
+        );
+        assert_eq!(
+            on.n_polya_zero_power, off.n_polya_zero_power,
+            "the ON arm ran an M-step, but the telemetry must describe the \
+             POSTERIOR, which was built BEFORE that M-step from the same loaded \
+             fit the OFF arm saw. Pre-fix this reads post-M-step params, where \
+             the shrinkage has pulled the tied fits apart, and reports {} — \
+             strictly fewer, because a genuine tie got scored as a difference.",
+            on.n_polya_zero_power
+        );
+
+        // The SECOND consumer of the snapshot, pinned separately.
+        //
+        // The assertion above went red when the TELEMETRY read `params`, but
+        // reverting the `output_emission_params` half of the same fix turned
+        // ZERO tests red — the pre-existing tests on that out-param all straddle
+        // the difference, so the suite could not tell the two states apart. That
+        // left the "one snapshot, two consumers ... by construction" comment an
+        // unbacked claim, which is the failure mode this repo has been bitten by
+        // repeatedly. This is the mutation that makes it true.
+        let p0 = on_params[0].as_ref().expect("tx0 has an emission row");
+        assert_eq!(
+            (p0.mu, p0.sigma2),
+            (7.0, 0.5),
+            "the sidecar must carry the params the LAST E-step CONSUMED, which at \
+             max_iter=1 is the loaded fit verbatim. Reverting this half of the \
+             fix hands back the post-M-step values instead (~6.83 / ~0.42 here), \
+             which is the same stale-mu defect the telemetry half had."
         );
     }
 }
