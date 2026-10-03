@@ -14,3 +14,11 @@ path = "src/main.rs"
 telescope-core = { path = "../telescope-core" }
 anyhow = { workspace = true }
 clap = { workspace = true }
+
+[dev-dependencies]
+# Self dev-dependency, same pattern as in crates/telescope-core/Cargo.toml and
+# for the same reason: `tests/` is a separate crate and cannot see the
+# `#[cfg(any(test, feature = "test-support"))]` synthetic-BAM builders without
+# the feature. `build-anchors` takes a BAM, so an end-to-end test of its
+# warning has no other way to get one. A plain `cargo build` leaves it out.
+telescope-core = { path = "../telescope-core", features = ["test-support"] }

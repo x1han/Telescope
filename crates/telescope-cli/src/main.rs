@@ -895,6 +895,15 @@ fn main() -> Result<()> {
             )
             .context("anchor_builder::build_anchor_pool failed")?;
             eprintln!("[telescope]  {}", stats.report());
+            // The `tx_to_gene entries: 0` line above and this one are far apart,
+            // and neither of them, alone, says what L2=0 downstream will mean.
+            // Say it here, where the pool that caused it was just written.
+            if let Some(warning) = anchor_builder::degenerate_gene_pool_warning(
+                stats.distinct_genes,
+                stats.distinct_transcripts,
+            ) {
+                eprintln!("{}", warning);
+            }
             eprintln!("[telescope] done.");
             Ok(())
         }

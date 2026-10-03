@@ -19,7 +19,7 @@
 //!   sample_id (utf8), read_id (utf8), gene_id (utf8), transcript_id (utf8),
 //!   poly_a_length (int32), posterior_weight (float64 = 1.0 for anchors)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
@@ -118,10 +118,72 @@ where
         all_anchors.extend(anchors);
     }
 
+    // Pool-level, from the records already in hand: NOT the per-sample
+    // accumulation `add` does. Distinct gene/transcript counts cannot be
+    // summed across samples, so they are assigned once, over the whole pool,
+    // after the loop.
+    let (distinct_genes, distinct_transcripts) = pool_gene_tx_cardinality(&all_anchors);
+    stats.distinct_genes = distinct_genes;
+    stats.distinct_transcripts = distinct_transcripts;
+
     write_anchor_parquet(&all_anchors, &output)
         .with_context(|| format!("Failed to write anchor pool parquet: {:?}", output.as_ref()))?;
 
     Ok(stats)
+}
+
+/// Distinct `(gene_id, transcript_id)` counts over a built pool. Used to detect
+/// the degenerate state in which `gene_id` was set equal to `transcript_id` on
+/// every row (see [`degenerate_gene_pool_warning`]).
+fn pool_gene_tx_cardinality(anchors: &[AnchorRecord]) -> (usize, usize) {
+    let genes: HashSet<&str> = anchors.iter().map(|a| a.gene_id.as_str()).collect();
+    let transcripts: HashSet<&str> = anchors.iter().map(|a| a.transcript_id.as_str()).collect();
+    (genes.len(), transcripts.len())
+}
+
+/// The `[telescope][WARN]` line for a pool in the degenerate state — every row's
+/// `gene_id` equal to its own `transcript_id` — or `None` when the pool carries
+/// real gene structure.
+///
+/// WHY THIS IS EXACT, NOT A HEURISTIC. The degenerate state is precisely
+/// `distinct gene_id == distinct transcript_id`, and the downstream arithmetic
+/// follows from it alone: a gene's pool IS its own transcript's pool, so the
+/// L2 gene-level fallback needs `gene_min_reads = 30` reads drawn from what is,
+/// by the time L1 has just failed, fewer than `tx_min_reads = 10` reads. L2 is
+/// therefore structurally unreachable, with no error and no other trace.
+///
+/// It is NOT enough to branch on "no `--tx-to-gene` was passed": a TSV that
+/// genuinely maps one transcript to one gene is equally degenerate, and that
+/// run needs the warning just as much. A TSV that maps several transcripts onto
+/// a shared gene does not, and must stay silent.
+///
+/// An empty pool is exempt (`None`): the counts are vacuously equal there, but
+/// the consequence that matters is that no anchors passed at all, and a message
+/// about the fallback cascade would point at the wrong problem.
+pub fn degenerate_gene_pool_warning(
+    distinct_genes: usize,
+    distinct_transcripts: usize,
+) -> Option<String> {
+    if distinct_transcripts == 0 || distinct_genes != distinct_transcripts {
+        return None;
+    }
+    Some(format!(
+        "[telescope][WARN] anchor pool has NO gene structure: {} distinct \
+         transcript_id == {} distinct gene_id (gene_id was set equal to \
+         transcript_id on every row).\n\
+         [telescope][WARN]   Consequence: the L2 gene-level fallback is \
+         STRUCTURALLY UNREACHABLE. A gene's pool IS its own transcript's pool, \
+         which holds fewer than tx_min_reads=10 reads by the time L1 has been \
+         tried, so the L2 gene_min_reads=30 gate can never fire.\n\
+         [telescope][WARN]   The poly(A) cascade is therefore running as \
+         2-LEVEL (L1 per-transcript, L3 cohort), not 3-LEVEL. An `L2=0` in the \
+         downstream emission stats is THIS, not a fit failure -- do not read it \
+         as evidence that the gene fit did not converge.\n\
+         [telescope][WARN]   Remedy: pass --tx-to-gene <TSV> \
+         (transcript_id<TAB>gene_id) to build-anchors, so that transcripts \
+         sharing a gene share a pool.",
+        distinct_transcripts, distinct_genes,
+    ))
 }
 
 /// Extract anchors from a single BAM. Returns the filtered records plus
@@ -342,9 +404,19 @@ pub struct AnchorStats {
     pub filtered_polya_invalid: u64,
     pub filtered_cap: u64,
     pub passed: u64,
+    /// Distinct `gene_id` values in the emitted pool. POOL-LEVEL: assigned by
+    /// `build_anchor_pool` from the built records, never summed by `add`
+    /// (distinctness does not survive summation across samples). Read with
+    /// `distinct_transcripts` via [`degenerate_gene_pool_warning`].
+    pub distinct_genes: usize,
+    /// Distinct `transcript_id` values in the emitted pool. See `distinct_genes`.
+    pub distinct_transcripts: usize,
 }
 
 impl AnchorStats {
+    /// Accumulate one sample's counts. Deliberately leaves `distinct_genes` /
+    /// `distinct_transcripts` untouched: those are pool-level, not per-sample,
+    /// and are assigned once by `build_anchor_pool` after every sample is in.
     fn add(&mut self, s: &SampleStats) {
         self.samples += 1;
         self.total_records += s.total_records;
@@ -372,6 +444,7 @@ impl AnchorStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::evidence::test_support::{synth_record, write_synthetic_bam};
 
     #[test]
     fn test_anchor_stats_aggregation() {
@@ -391,5 +464,169 @@ mod tests {
         assert_eq!(agg.samples, 2);
         assert_eq!(agg.total_records, 150);
         assert_eq!(agg.passed, 42);
+        // `add` is per-sample; the pool-level distinctness fields are assigned
+        // by `build_anchor_pool` and must not be summed here.
+        assert_eq!(agg.distinct_genes, 0);
+        assert_eq!(agg.distinct_transcripts, 0);
+    }
+
+    // --- The degenerate gene pool -------------------------------------------
+    //
+    // The failure these pin: with no `--tx-to-gene`, `gene_id := transcript_id`
+    // (see `extract_anchors_from_bam`), so the L2 gene-level fallback can never
+    // fire — a gene's pool IS its transcript's pool, and L1 is only tried below
+    // `tx_min_reads = 10`. It used to be silent, and `L2=0` sat in run logs
+    // unannotated. These go red if the warning stops being emitted.
+
+    /// A three-transcript synthetic BAM whose reads all clear the anchor
+    /// criteria (MAPQ 60, full-length so 3'-anchored and coverage 1.0,
+    /// `pt:i = 100`). Returns its path; the caller removes it.
+    fn three_tx_anchor_bam(tag: &str) -> std::path::PathBuf {
+        let recs = vec![
+            synth_record("a0", 0, None, 0, 60),
+            synth_record("a1", 0, None, 0, 60),
+            synth_record("b0", 1, None, 0, 60),
+            synth_record("c0", 2, None, 0, 60),
+        ];
+        write_synthetic_bam(tag, recs)
+    }
+
+    /// POSITIVE. No gene map: the pool IS degenerate, and the warning must say
+    /// the three things a user cannot currently work out for themselves — L2 is
+    /// unreachable, the cascade is 2-level not 3-level, and `--tx-to-gene` is
+    /// the remedy.
+    #[test]
+    fn test_degenerate_gene_pool_without_tx_to_gene_warns_and_names_the_consequence() {
+        let bam = three_tx_anchor_bam("degen_pos");
+        let out = std::env::temp_dir().join(format!(
+            "telescope_anchor_degen_pos_{}.parquet",
+            std::process::id()
+        ));
+        let stats = build_anchor_pool(
+            &[(bam.clone(), "S1")],
+            &TxToGene::new(),
+            &out,
+            35,
+            0.80,
+            200,
+        )
+        .expect("build_anchor_pool");
+        let _ = std::fs::remove_file(&bam);
+        let _ = std::fs::remove_file(&out);
+
+        assert_eq!(
+            stats.passed, 4,
+            "the fixture must actually pass the anchor filters, or this test \
+             would be asserting on an empty pool"
+        );
+        assert_eq!(stats.distinct_transcripts, 3, "tx0/tx1/tx2");
+        assert_eq!(
+            stats.distinct_genes, 3,
+            "gene_id falls back to transcript_id, so the counts are equal"
+        );
+
+        let msg = degenerate_gene_pool_warning(stats.distinct_genes, stats.distinct_transcripts)
+            .expect("a pool with gene_id == transcript_id on every row MUST warn");
+        for (what, needle) in [
+            ("the L2 fallback being unreachable", "L2"),
+            ("gene-level wording", "gene-level"),
+            ("structurally unreachable", "STRUCTURALLY UNREACHABLE"),
+            ("the 2-level consequence", "2-LEVEL"),
+            ("the remedy", "--tx-to-gene"),
+        ] {
+            assert!(msg.contains(needle), "warning must name {what}; got: {msg}");
+        }
+    }
+
+    /// NEGATIVE — the one that stops the warning becoming noise. The SAME BAM
+    /// and the SAME command, given a gene map that puts all three transcripts
+    /// on one shared gene. Real structure, so silence is the only correct
+    /// output. A warning here would fire on every legitimate run.
+    #[test]
+    fn test_pool_with_real_gene_structure_does_not_warn() {
+        let bam = three_tx_anchor_bam("degen_neg");
+        let out = std::env::temp_dir().join(format!(
+            "telescope_anchor_degen_neg_{}.parquet",
+            std::process::id()
+        ));
+        let tsv =
+            std::env::temp_dir().join(format!("telescope_tx2gene_neg_{}.tsv", std::process::id()));
+        std::fs::write(
+            &tsv,
+            "transcript_id\tgene_id\ntx0\tGENE_A\ntx1\tGENE_A\ntx2\tGENE_A\n",
+        )
+        .unwrap();
+        let map = TxToGene::from_tsv(&tsv).unwrap();
+        assert_eq!(map.len(), 3);
+
+        let stats = build_anchor_pool(&[(bam.clone(), "S1")], &map, &out, 35, 0.80, 200)
+            .expect("build_anchor_pool");
+        let _ = std::fs::remove_file(&bam);
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&tsv);
+
+        assert_eq!(stats.passed, 4);
+        assert_eq!(stats.distinct_transcripts, 3);
+        assert_eq!(
+            stats.distinct_genes, 1,
+            "three transcripts on one gene: the counts differ, so L2 is reachable"
+        );
+        assert!(
+            degenerate_gene_pool_warning(stats.distinct_genes, stats.distinct_transcripts)
+                .is_none(),
+            "a pool with real gene structure must NOT warn"
+        );
+    }
+
+    /// The unit test behind the end-to-end pair above: the detector is the
+    /// equality of the two distinct counts, and nothing else. Note what that
+    /// means for a legitimately single-transcript-per-gene dataset: it too
+    /// yields equal counts, and it too warns. That is the honest reading — the
+    /// cascade really is 2-level there — not a false positive.
+    #[test]
+    fn test_detector_is_exactly_equality_of_the_two_distinct_counts() {
+        let row = |gene: &str, tx: &str| AnchorRecord {
+            sample_id: "S1".into(),
+            read_id: "r".into(),
+            gene_id: gene.into(),
+            transcript_id: tx.into(),
+            poly_a_length: 100,
+        };
+        // 4 rows, 2 genes, 2 transcripts. Real structure in the pool, and yet
+        // the COUNTS are equal: the pair (2, 2) carries no more information
+        // than (3, 3) does about whether gene_id was assigned per transcript.
+        // The count is the exact detector of the STATE, and the state is what
+        // the warning is about. What distinguishes this from a false positive
+        // is the negative case above: with a real gene map, three transcripts
+        // land on (1, 3), and (1, 3) is silent.
+        let one_tx_per_gene = vec![row("G1", "T1"), row("G1", "T1"), row("G2", "T2")];
+        assert_eq!(pool_gene_tx_cardinality(&one_tx_per_gene), (2, 2));
+        assert!(
+            degenerate_gene_pool_warning(2, 2).is_some(),
+            "one-transcript-per-gene is genuinely degenerate and must warn"
+        );
+
+        // The no-gene-map pool: gene_id == transcript_id on every row.
+        let degenerate = vec![
+            row("T1", "T1"),
+            row("T1", "T1"),
+            row("T2", "T2"),
+            row("T3", "T3"),
+        ];
+        assert_eq!(pool_gene_tx_cardinality(&degenerate), (3, 3));
+        assert!(degenerate_gene_pool_warning(3, 3).is_some());
+
+        // Strict inequality, either direction, is the only silence: more genes
+        // than transcripts is impossible from `build_anchor_pool` (each row
+        // carries one of each), but the detector is stated without relying on
+        // that and is pinned here so it stays that way.
+        assert!(degenerate_gene_pool_warning(1, 3).is_none());
+        assert!(degenerate_gene_pool_warning(2, 3).is_none());
+
+        // The exemption, pinned so it cannot be widened by accident: an empty
+        // pool is vacuously "equal", and the honest complaint about it is that
+        // no anchors passed — not that L2 was skipped.
+        assert_eq!(pool_gene_tx_cardinality(&[]), (0, 0));
+        assert!(degenerate_gene_pool_warning(0, 0).is_none());
     }
 }
