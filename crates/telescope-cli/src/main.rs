@@ -807,27 +807,55 @@ fn main() -> Result<()> {
                 stats.n_entropy_clean as f64 / n_ambig * 100.0
             );
             eprintln!(
-                "[telescope]      0.20–0.60 nats (partial):     {} ({:.1}%)",
+                "[telescope]      0.20–0.70 nats (partial):     {} ({:.1}%)",
                 stats.n_entropy_partial,
                 stats.n_entropy_partial as f64 / n_ambig * 100.0
             );
             eprintln!(
-                "[telescope]      > 0.60 nats (degenerate tie):  {} ({:.1}%)",
+                "[telescope]      > 0.70 nats (degenerate tie):  {} ({:.1}%)",
                 stats.n_entropy_degenerate,
                 stats.n_entropy_degenerate as f64 / n_ambig * 100.0
             );
-            // Degradation telemetry. Denominator is the CONTESTED reads
-            // (`n_ambig`), not the read total: a single-candidate read has no
-            // pairwise odds ratio, so counting it would report ~99.7% and
-            // answer nothing. This is the share of genuinely contested reads
-            // on which the poly(A) term cancels exactly.
+            // Degradation telemetry. TWO zero-power metrics, because at less
+            // than full model coverage the old one is largely vacuous -- a read
+            // with one emission candidate satisfies "all candidates share one
+            // mu" without comparing anything. The old one is kept (renamed
+            // `_all`) so runs stay comparable; the new one excludes those reads
+            // from BOTH numerator and denominator.
+            //
+            // Every denominator below is `.max(1)`-guarded. `n_reads_multi_...`
+            // in particular is 0 on a sparse model -- which is exactly the
+            // regime this metric exists for -- and `0.0 / 0.0` in Rust is NaN,
+            // so an unguarded line prints "NaN%" and exits 0.
+            let n_with_cand = (stats.n_unambiguous + stats.n_ambiguous).max(1) as f64;
+            let n_multi = stats.n_reads_multi_emission_candidate.max(1) as f64;
+            eprintln!("[telescope]    emission model coverage (reads with >=1 candidate):");
+            eprintln!(
+                "[telescope]      reads with >=1 emission candidate : {} of {} ({:.1}%)",
+                stats.n_reads_any_emission_candidate,
+                n_with_cand as usize,
+                stats.n_reads_any_emission_candidate as f64 / n_with_cand * 100.0
+            );
+            eprintln!(
+                "[telescope]      single-candidate reads           : {} of {} ({:.1}%)",
+                stats.n_reads_single_emission_candidate,
+                n_with_cand as usize,
+                stats.n_reads_single_emission_candidate as f64 / n_with_cand * 100.0
+            );
             eprintln!("[telescope]    poly(A) discriminative power:");
             eprintln!(
-                "[telescope]      zero-power reads (identical mu/sigma2 across all \
+                "[telescope]      zero-power_all     (identical mu/sigma2 across all \
                  candidates that have an emission row): {} of {} ambiguous ({:.1}%)",
                 stats.n_polya_zero_power,
                 stats.n_ambiguous,
                 stats.n_polya_zero_power as f64 / n_ambig * 100.0
+            );
+            eprintln!(
+                "[telescope]      zero-power_resolved (same, but only over reads with \
+                 >=2 emission candidates): {} of {} ({:.1}%)",
+                stats.n_polya_zero_power_resolved,
+                stats.n_reads_multi_emission_candidate,
+                stats.n_polya_zero_power_resolved as f64 / n_multi * 100.0
             );
             if debug && !stats.em_trace.is_empty() {
                 eprintln!("[telescope]    EM trace:");

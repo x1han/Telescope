@@ -760,6 +760,21 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
     let mut as_ratio_b = Float32Builder::new();
     let mut n_dropped_incompetent = 0_u64;
     let mut n_dropped_no_competent_candidates = 0_u64;
+    // EMISSION COVERAGE. Denominator for the two read-weighted numbers the CLI
+    // prints: `n_unambiguous + n_ambiguous`, i.e. reads with at least one
+    // candidate. Molecules with `candidate_count == 0` are dropped by the split
+    // above and are NOT in any denominator here -- the CLI labels the
+    // denominator "reads with >=1 candidate" rather than "all reads" so the
+    // two populations are never conflated.
+    let mut n_reads_any_emission_candidate = 0_u64;
+    let mut n_reads_single_emission_candidate = 0_u64;
+    // DENOMINATOR for `zero-power_resolved`, and the numerator for nothing.
+    // Read-level, not candidate-weighted: a candidate-weighted "coverage" over
+    // this slice comes out near 100% by construction, because a read is only
+    // in the slice once it has at least one present candidate. The read-level
+    // ratio is the one that can disagree with the expert-facing number.
+    let mut n_reads_multi_emission_candidate = 0_u64;
+    let mut n_polya_zero_power_resolved = 0_u64;
     let mut n_entropy_clean = 0_u64;
     let mut n_entropy_partial = 0_u64;
     let mut n_entropy_degenerate = 0_u64;
@@ -799,6 +814,16 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         // ambiguous branch below can drop rows.
         let ncand = mol.candidate_count;
         let as_ratio = read_max_as_ratio(&graph, mol);
+        // EMISSION COVERAGE, counted over ALL reads. An unambiguous read has
+        // exactly one candidate, so its `n_with_emission` is 0 or 1 and is
+        // readable straight off the lookup below -- no loop needed. These two
+        // counters are deliberately NOT scoped to the ambiguous branch: the
+        // motivating 31.6% was measured over profile rows, which include
+        // unambiguous reads, and scoping to the contested reads would silently
+        // report a different number than the one that motivated the change.
+        let un_with_emission = params[tx_id].is_some();
+        n_reads_any_emission_candidate += u64::from(un_with_emission);
+        n_reads_single_emission_candidate += u64::from(un_with_emission);
         if let Some(ref p) = params[tx_id] {
             if !p.is_competent {
                 n_dropped_incompetent += 1;
@@ -860,16 +885,31 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         let as_ratio = read_max_as_ratio(&graph, mol);
 
         // DEGRADATION TELEMETRY — how often poly(A) had no say at all.
-        // One per-read compare against the first candidate's fit; no
-        // allocation and no new per-read structure. See
-        // `polya_has_no_discriminative_power` for the definition and for
-        // why the comparison is exact rather than tolerance-based.
+        // One per-read pass over the candidate slice; no allocation and no new
+        // per-read structure. See `polya_emission_count_and_identity` for the
+        // definition and for why the comparison is exact rather than
+        // tolerance-based.
         //
         // `last_estep_params`, NOT `params`: this must answer "did poly(A)
         // cancel in the posterior we are emitting?", and the posterior came from
         // the last E-step. `params` has since been through one more M-step on
         // the `max_iter`-exhaustion path, which is the whole defect.
-        if polya_has_no_discriminative_power(&graph, mol, &last_estep_params) {
+        let (n_with_emission, all_identical) =
+            polya_emission_count_and_identity(&graph, mol, &last_estep_params);
+        n_reads_any_emission_candidate += u64::from(n_with_emission > 0);
+        n_reads_single_emission_candidate += u64::from(n_with_emission == 1);
+        if n_with_emission >= ZERO_POWER_MIN_EMISSION_CANDIDATES {
+            n_reads_multi_emission_candidate += 1;
+            if all_identical {
+                n_polya_zero_power_resolved += 1;
+            }
+        }
+        // `zero-power_all` keeps its original meaning, which is the pair
+        // `n_with_emission > 0 && all_identical` -- i.e. the pre-change
+        // `bool`. It is retained so HC2's 16.3% and every earlier number stay
+        // comparable, and it is RENAMED rather than deleted because a run that
+        // stops printing it cannot be compared with a run that never did.
+        if n_with_emission > 0 && all_identical {
             n_polya_zero_power += 1;
         }
 
@@ -1159,6 +1199,10 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         n_entropy_partial,
         n_entropy_degenerate,
         n_polya_zero_power,
+        n_polya_zero_power_resolved,
+        n_reads_multi_emission_candidate,
+        n_reads_any_emission_candidate,
+        n_reads_single_emission_candidate,
         em_trace: output_em_trace.map(|t| t.clone()).unwrap_or_default(),
     })
 }
@@ -1168,16 +1212,18 @@ fn poly_a_length_from_log2(log_pal: f32) -> i32 {
     log_pal.exp2().round() as i32
 }
 
-/// DEGRADATION TELEMETRY. True iff the read's candidate set has ZERO
-/// poly(A) discriminative power: every candidate that carries an emission
-/// row shares one identical `(mu, sigma2)` pair, so
+/// DEGRADATION TELEMETRY. Returns `(n_with_emission, all_identical)` for the
+/// read's candidate set. `all_identical` is true iff every candidate that
+/// carries an emission row shares one identical `(mu, sigma2)` pair, so
 ///
 /// ```text
 ///   ln [ N(y; mu_a, s2_a) / N(y; mu_b, s2_b) ] = 0   for every a, b
 /// ```
 ///
 /// and the read is decided entirely by the alignment (`A_rk`), 5'-anchoring
-/// and abundance terms.
+/// and abundance terms. The COUNT is returned with it because `all_identical`
+/// alone cannot distinguish "compared and found equal" from "had nothing to
+/// compare against" — see [`ZERO_POWER_MIN_EMISSION_CANDIDATES`].
 ///
 /// WHY THE COMPARISON IS EXACT (`==`), NOT A TOLERANCE. The fits are shared
 /// by CONSTRUCTION when Module 1's fallback cascade fires: every
@@ -1206,39 +1252,82 @@ fn poly_a_length_from_log2(log_pal: f32) -> i32 {
 /// it was not provably identical on. Do not "fix" this by loosening the
 /// comparison to a tolerance — that would move the metric toward
 /// over-reporting, which is the expensive direction for a degradation
-/// headline. Pinned by `test_polya_has_no_discriminative_power_cases` (cases 5
+/// headline. Pinned by `test_polya_emission_count_and_identity_cases` (cases 5
 /// and 5-control): swapping `==` for a `1e-12` tolerance turns it red.
 ///
 /// A candidate with NO emission row is skipped rather than treated as a
 /// mismatch: a ghost transcript has no `(mu, sigma2)` to disagree with, and
 /// it is already counted by `n_dropped_no_competent_candidates`. A read
-/// with no candidate that has an emission row at all returns `false` —
+/// with no candidate that has an emission row at all returns `(0, false)` —
 /// there is nothing to compare, so claiming "zero discriminative power"
 /// would be vacuous rather than measured.
+///
+/// ⚠️ THAT LAST CLAUSE IS ABOUT THE `bool`, AND IT WAS NOT ENOUGH. A read
+/// with exactly ONE candidate carrying an emission row returns `(1, true)`:
+/// the loop finds no disagreement because there is nothing to disagree with
+/// the first candidate. That is the vacuity this change exists to measure, and
+/// it is why the count travels with the flag. `zero-power_all` keeps counting
+/// those reads (it did before, and continuity is the point of keeping it);
+/// `zero-power_resolved` excludes them.
 ///
 /// The read's FULL candidate range is used, not the post-prune /
 /// post-truncation set: the question is what evidence the read HAD, not
 /// what survived.
-fn polya_has_no_discriminative_power(
+///
+/// # Returns `(n_with_emission, all_identical)`
+///
+/// - `n_with_emission` — how many of the read's candidates carry an emission
+///   row. **`0` is possible and is not the same as `1`.**
+/// - `all_identical` — whether every one of those candidates shares the first
+///   one's exact `(mu, sigma2)`. Vacuously `true` when `n_with_emission < 2`,
+///   which is precisely why the count is returned alongside it: a caller that
+///   reports "poly(A) had no say" without also reporting the count is reporting
+///   a coincidence of an empty comparison.
+///
+/// THE LOOP NEVER EARLY-RETURNS. An earlier version of this function returned
+/// `false` the moment two candidates disagreed, which is correct for the
+/// `bool` it used to answer and WRONG for the count: a read whose candidates
+/// are `[same, same, different]` would report `2` present instead of `3`. That
+/// undercount lands only on DISAGREEING reads — the ones where poly(A) actually
+/// did something — so it silently biases `emission coverage` downward while
+/// leaving the zero-power headline untouched. `disagrees` is a flag for that
+/// reason; see case 3b in `test_polya_emission_count_and_identity_cases`, which
+/// fails if anyone restores the early return.
+fn polya_emission_count_and_identity(
     graph: &FlatEvidenceGraph,
     mol: &MoleculeEvidence,
     params: &[Option<TranscriptParam>],
-) -> bool {
+) -> (usize, bool) {
     let off = mol.candidate_offset as usize;
     let end = off + mol.candidate_count as usize;
     let mut first: Option<(f64, f64)> = None;
+    let mut n_with_emission = 0usize;
+    let mut disagrees = false;
     for &tx in &graph.candidate_pool[off..end] {
         let Some(p) = params.get(tx as usize).and_then(|o| o.as_ref()) else {
             continue;
         };
+        n_with_emission += 1;
         match first {
             None => first = Some((p.mu, p.sigma2)),
             Some((mu0, s20)) if mu0 == p.mu && s20 == p.sigma2 => {}
-            Some(_) => return false,
+            Some(_) => disagrees = true,
         }
     }
-    first.is_some()
+    (n_with_emission, first.is_some() && !disagrees)
 }
+
+/// How many candidates must carry an emission row before "they all share one
+/// `mu`" is a MEASURED statement rather than a comparison that never happened.
+///
+/// With one candidate there is no pairwise odds ratio to cancel, so
+/// `zero-power_all` counts such reads even though poly(A) was never given a
+/// chance to disagree with anything. This is the threshold that separates
+/// `zero-power_all` (kept, for continuity) from `zero-power_resolved`.
+///
+/// Mutation M10 changes the `2` to a `3`; the resolved count must change with
+/// it. Do not inline this literal.
+const ZERO_POWER_MIN_EMISSION_CANDIDATES: usize = 2;
 
 /// Per-read observational statistic: `second_largest_AS / largest_AS` over the
 /// read's FULL candidate range `candidate_as[offset .. offset+candidate_count]`,
@@ -1561,9 +1650,37 @@ pub struct TelEmStats {
     /// the read is not counted here. The number therefore UNDER-reports zero
     /// poly(A) power and never over-reports it, which is the conservative
     /// direction for a degradation headline. See
-    /// `polya_has_no_discriminative_power` for why a tolerance would move it
+    /// `polya_emission_count_and_identity` for why a tolerance would move it
     /// the wrong way.
     pub n_polya_zero_power: u64,
+    /// DEGRADATION TELEMETRY, second metric. Contested reads carrying at least
+    /// `ZERO_POWER_MIN_EMISSION_CANDIDATES` emission rows in which all of them
+    /// share one identical `(mu, sigma2)`. Unlike `n_polya_zero_power` this
+    /// cannot be satisfied by a read that had nothing to compare, which is the
+    /// whole point: at less-than-full model coverage, most of `n_polya_zero_power`
+    /// is that.
+    ///
+    /// Read `n_polya_zero_power_resolved / n_reads_multi_emission_candidate`.
+    /// Do NOT divide by `n_ambiguous` -- that denominator contains the reads
+    /// this metric deliberately excludes, and the ratio would silently
+    /// reproduce the vacuous number.
+    pub n_polya_zero_power_resolved: u64,
+    /// DENOMINATOR for `n_polya_zero_power_resolved`: contested reads with at
+    /// least `ZERO_POWER_MIN_EMISSION_CANDIDATES` candidates carrying an
+    /// emission row. Can legitimately be 0 on a sparse model; the CLI guards.
+    pub n_reads_multi_emission_candidate: u64,
+    /// NUMERATOR for emission coverage. Counts over ALL reads with at least one
+    /// candidate, not just contested ones: coverage is a property of the model's
+    /// completeness, and scoping it to the contested reads would report a
+    /// different number than the 31.6% that motivated the metric. Divide by
+    /// `n_unambiguous + n_ambiguous` and label the denominator "reads with
+    /// >=1 candidate" -- molecules with zero candidates are dropped earlier.
+    pub n_reads_any_emission_candidate: u64,
+    /// NUMERATOR for the single-candidate share: reads with exactly ONE
+    /// candidate carrying an emission row. These are the reads on which
+    /// `n_polya_zero_power` is most vacuous. Same denominator as
+    /// `n_reads_any_emission_candidate`.
+    pub n_reads_single_emission_candidate: u64,
     /// EM trace: per-iter `(iter_index, log_likelihood, mean_entropy)`.
     pub em_trace: Vec<(usize, f64, f64)>,
 }
@@ -4603,7 +4720,7 @@ mod tests {
     /// poly(A) does discriminate. `sigma2` is asserted separately below for
     /// exactly that reason.
     #[test]
-    fn test_polya_has_no_discriminative_power_cases() {
+    fn test_polya_emission_count_and_identity_cases() {
         const MU: f64 = 7.0;
         const S2: f64 = 0.5;
 
@@ -4612,26 +4729,36 @@ mod tests {
         {
             let (g, p) = zero_power_probe(&[Some((MU, S2)), Some((MU, S2)), Some((MU, S2))]);
             assert!(
-                polya_has_no_discriminative_power(&g, &g.molecules[0], &p),
+                polya_emission_count_and_identity(&g, &g.molecules[0], &p).1,
                 "candidates sharing (mu, sigma2) cancel the poly(A) term exactly"
             );
         }
 
         // 1b. A SINGLE candidate is trivially "all candidates agree" and is
-        //     also `true` here. The metric never sees such a read (the counter
-        //     only runs on the ambiguous loop), which is why the denominator is
-        //     `n_ambiguous`; pinned here so the helper's own answer is not
-        //     mistaken for a claim about the reported fraction.
+        //     also `true` here. This is the VACUOUS case the whole change
+        //     exists to make visible: nothing was compared, so the flag is
+        //     true for want of a counterexample. The COUNT is what
+        //     distinguishes it, and it is asserted here so no future caller can
+        //     read `true` as "poly(A) was measured and cancelled".
         {
             let (g, p) = zero_power_probe(&[Some((MU, S2))]);
-            assert!(polya_has_no_discriminative_power(&g, &g.molecules[0], &p));
+            assert_eq!(
+                polya_emission_count_and_identity(&g, &g.molecules[0], &p),
+                (1, true),
+                "one emission candidate: flag is vacuously true, count says so"
+            );
+            assert!(
+                1 < ZERO_POWER_MIN_EMISSION_CANDIDATES,
+                "if this ever holds, the single-candidate reads are NOT excluded \
+                 from zero-power_resolved and the metric stops meaning anything"
+            );
         }
 
         // 2. Candidates differ in mu. FALSE.
         {
             let (g, p) = zero_power_probe(&[Some((MU, S2)), Some((MU + 0.5, S2))]);
             assert!(
-                !polya_has_no_discriminative_power(&g, &g.molecules[0], &p),
+                !polya_emission_count_and_identity(&g, &g.molecules[0], &p).1,
                 "a mu difference is a non-constant log-ratio — poly(A) has say"
             );
         }
@@ -4643,7 +4770,7 @@ mod tests {
         {
             let (g, p) = zero_power_probe(&[Some((MU, S2)), Some((MU, S2 + 0.4))]);
             assert!(
-                !polya_has_no_discriminative_power(&g, &g.molecules[0], &p),
+                !polya_emission_count_and_identity(&g, &g.molecules[0], &p).1,
                 "sigma2 alone decides the log-ratio; sharing mu is not enough"
             );
         }
@@ -4651,11 +4778,21 @@ mod tests {
         // 3b. A disagreement in the THIRD candidate must not be masked by the
         //     first two agreeing — the comparison is against the first
         //     candidate, not against the immediately preceding one.
+        //
+        //     THE COUNT IS 3, NOT 2, AND THAT IS THE POINT. An earlier version
+        //     of this function returned `false` on the first disagreement, so a
+        //     loop that counted as it went would report 2 here. That
+        //     undercount lands only on DISAGREEING reads — the ones where
+        //     poly(A) did something — which would bias `emission coverage`
+        //     downward while leaving the zero-power headline untouched. Anyone
+        //     who restores the early return fails this line and nothing else.
         {
             let (g, p) = zero_power_probe(&[Some((MU, S2)), Some((MU, S2)), Some((MU, S2 + 0.4))]);
-            assert!(
-                !polya_has_no_discriminative_power(&g, &g.molecules[0], &p),
-                "every candidate must be compared to the first, not just its neighbour"
+            assert_eq!(
+                polya_emission_count_and_identity(&g, &g.molecules[0], &p),
+                (3, false),
+                "the count must cover the WHOLE candidate range even after a \
+                 disagreement; 2 here means the early return is back"
             );
         }
 
@@ -4666,8 +4803,9 @@ mod tests {
         //    headline fraction on reads the model never even looked at.
         {
             let (g, p) = zero_power_probe(&[]);
-            assert!(
-                !polya_has_no_discriminative_power(&g, &g.molecules[0], &p),
+            assert_eq!(
+                polya_emission_count_and_identity(&g, &g.molecules[0], &p),
+                (0, false),
                 "an empty candidate set must NOT claim zero discriminative power"
             );
         }
@@ -4679,18 +4817,21 @@ mod tests {
         //     `n_dropped_no_competent_candidates`.
         {
             let (g, p) = zero_power_probe(&[Some((MU, S2)), None, Some((MU, S2))]);
-            assert!(
-                polya_has_no_discriminative_power(&g, &g.molecules[0], &p),
-                "a missing emission row is a skip, not a (mu, sigma2) mismatch"
+            assert_eq!(
+                polya_emission_count_and_identity(&g, &g.molecules[0], &p),
+                (2, true),
+                "a missing emission row is a skip, not a (mu, sigma2) mismatch — \
+                 and it is not counted either"
             );
         }
         // ...and a read whose ONLY candidate is a ghost is the "nothing to
         // compare" case of clause 4, reached through a non-empty candidate
-        // range: false, not true.
+        // range: false, not true, and a count of ZERO.
         {
             let (g, p) = zero_power_probe(&[None, None]);
-            assert!(
-                !polya_has_no_discriminative_power(&g, &g.molecules[0], &p),
+            assert_eq!(
+                polya_emission_count_and_identity(&g, &g.molecules[0], &p),
+                (0, false),
                 "no candidate with an emission row means nothing was measured"
             );
         }
@@ -4706,14 +4847,14 @@ mod tests {
             let (g, p) = zero_power_probe(&[Some((MU, S2)), Some((MU + 1e-13, S2))]);
             assert_ne!(MU, MU + 1e-13, "1e-13 at mu = 7.0 must be representable");
             assert!(
-                !polya_has_no_discriminative_power(&g, &g.molecules[0], &p),
+                !polya_emission_count_and_identity(&g, &g.molecules[0], &p).1,
                 "a 1e-13 mu gap is a DIFFERENT fit under the exact comparison"
             );
         }
         {
             let (g, p) = zero_power_probe(&[Some((MU, S2)), Some((MU + 1e-9, S2))]);
             assert!(
-                !polya_has_no_discriminative_power(&g, &g.molecules[0], &p),
+                !polya_emission_count_and_identity(&g, &g.molecules[0], &p).1,
                 "a 1e-9 mu gap is a DIFFERENT fit under the exact comparison"
             );
         }
@@ -4726,7 +4867,7 @@ mod tests {
             let (g, p) =
                 zero_power_probe(&[Some((shared_mu, shared_s2)), Some((shared_mu, shared_s2))]);
             assert!(
-                polya_has_no_discriminative_power(&g, &g.molecules[0], &p),
+                polya_emission_count_and_identity(&g, &g.molecules[0], &p).1,
                 "a bit-identical copy is zero power — the control for case 5"
             );
         }
@@ -4863,6 +5004,156 @@ mod tests {
             "exactly ZERO_2WAY and ZERO_3WAY share one (mu, sigma2); MU_SPLIT and \
              SIGMA_SPLIT each disagree in one component and must NOT be counted, \
              and UNAMBIGUOUS is out of scope for the counter entirely"
+        );
+    }
+
+    /// THE VACUITY SPLIT, end to end, on a model that is NOT 100% covered.
+    ///
+    /// The unit test above pins the predicate and the test above it pins that
+    /// the counter reaches `TelEmStats`. Neither can see the difference the
+    /// whole change is about, because both fixtures give every candidate an
+    /// emission row. This one does not: `tx6` is deliberately absent from the
+    /// emission parquet, so reads can have fewer present candidates than they
+    /// have candidates — which is the condition that makes `zero-power_all`
+    /// report a cancellation that never happened.
+    ///
+    /// The fixture's whole job is one number pair:
+    ///
+    /// ```text
+    ///   n_polya_zero_power          == 2   (ZERO_2WAY and SINGLE_THEN_GHOST)
+    ///   n_polya_zero_power_resolved == 1   (ZERO_2WAY only)
+    /// ```
+    ///
+    /// `SINGLE_THEN_GHOST` is the read the split exists for: two candidates,
+    /// one of them has no emission row, so nothing was ever compared, and
+    /// `zero-power_all` counts it anyway because that is what it has always
+    /// done. If the two counters ever agree on this fixture, the exclusion is
+    /// not happening.
+    #[test]
+    fn test_zero_power_resolved_excludes_reads_with_fewer_than_two_emission_candidates() {
+        let log_pal = (100.0_f32).log2();
+        let emission = scratch("zero_power_split_emission.parquet");
+        let profile = scratch("zero_power_split_profile.parquet");
+        // tx6 is INTENTIONALLY ABSENT. It is a transcript in the graph that the
+        // emission model never fitted -- the shape of the 37,081 rows missing
+        // from the HC2 model, reduced to one transcript.
+        write_test_emission(
+            &emission,
+            &[
+                ("tx0", "gene0", 7.0, 0.5),
+                ("tx1", "gene1", 7.0, 0.5),
+                ("tx2", "gene2", 7.0, 0.5),
+                ("tx3", "gene3", 7.0, 0.5),
+                ("tx4", "gene4", 7.5, 0.5),
+                ("tx5", "gene5", 7.0, 0.9),
+            ],
+        );
+
+        //   UNAMBIGUOUS      [0]     -> tx0            1 present
+        //   GHOST_ONLY       [1]     -> tx6            0 present
+        //   ZERO_2WAY        [2..4)  -> tx0, tx1       2 present, IDENTICAL
+        //   SINGLE_THEN_GHOST[4..6)  -> tx0, tx6       1 present  <- vacuous
+        //   MU_SPLIT         [6..8)  -> tx0, tx4       2 present, mu differs
+        let molecules = vec![
+            MoleculeEvidence {
+                read_id: "UNAMBIGUOUS".into(),
+                log_pal,
+                candidate_offset: 0,
+                candidate_count: 1,
+            },
+            MoleculeEvidence {
+                read_id: "GHOST_ONLY".into(),
+                log_pal,
+                candidate_offset: 1,
+                candidate_count: 1,
+            },
+            MoleculeEvidence {
+                read_id: "ZERO_2WAY".into(),
+                log_pal,
+                candidate_offset: 2,
+                candidate_count: 2,
+            },
+            MoleculeEvidence {
+                read_id: "SINGLE_THEN_GHOST".into(),
+                log_pal,
+                candidate_offset: 4,
+                candidate_count: 2,
+            },
+            MoleculeEvidence {
+                read_id: "MU_SPLIT".into(),
+                log_pal,
+                candidate_offset: 6,
+                candidate_count: 2,
+            },
+        ];
+        let candidate_pool: Vec<u32> = vec![0, 6, 0, 1, 0, 6, 0, 4];
+        let n = candidate_pool.len();
+        let graph = FlatEvidenceGraph {
+            molecules,
+            candidate_nm: vec![0; n],
+            candidate_mapq: vec![60; n],
+            candidate_as: vec![900; n],
+            candidate_5p_gap: vec![0; n],
+            candidate_pool,
+            transcript_names: (0..7).map(|i| format!("tx{i}")).collect(),
+            poly_a_is_placeholder: false,
+        };
+
+        let stats = solve_and_write_profile(
+            graph,
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            1,
+            20.0,
+            FIVE_PRIME_OFF,
+            0.0,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let _ = std::fs::remove_file(&emission);
+        let _ = std::fs::remove_file(&profile);
+
+        assert_eq!(stats.n_unambiguous, 2, "UNAMBIGUOUS and GHOST_ONLY");
+        assert_eq!(stats.n_ambiguous, 3, "the other three are contested");
+
+        // Emission coverage, over ALL reads with >=1 candidate. Four of the
+        // five have at least one present candidate; GHOST_ONLY is the only one
+        // whose every candidate is missing from the model.
+        assert_eq!(
+            stats.n_reads_any_emission_candidate, 4,
+            "UNAMBIGUOUS, ZERO_2WAY, SINGLE_THEN_GHOST and MU_SPLIT have a row; \
+             GHOST_ONLY does not"
+        );
+        assert_eq!(
+            stats.n_reads_single_emission_candidate, 2,
+            "UNAMBIGUOUS (one candidate, present) and SINGLE_THEN_GHOST (two \
+             candidates, one present). SINGLE_THEN_GHOST is the read on which \
+             zero-power_all is vacuous."
+        );
+
+        assert_eq!(
+            stats.n_reads_multi_emission_candidate, 2,
+            "ZERO_2WAY and MU_SPLIT only; SINGLE_THEN_GHOST has ONE present \
+             candidate and must be outside this denominator, or \
+             zero-power_resolved would silently reproduce the vacuous number"
+        );
+
+        assert_eq!(
+            stats.n_polya_zero_power, 2,
+            "unchanged semantics: ZERO_2WAY and the vacuous SINGLE_THEN_GHOST"
+        );
+        assert_eq!(
+            stats.n_polya_zero_power_resolved, 1,
+            "ZERO_2WAY only. If this is 2 the exclusion is not happening; if it \
+             is 0 the >= 2 gate rejected a read that had two present candidates."
         );
     }
 
