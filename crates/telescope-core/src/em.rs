@@ -3779,6 +3779,114 @@ mod tests {
     /// WRONG read. `ambiguous_indices` here is `[1, 2]`, so a positional zip
     /// would hand molecule 0's posterior to `UNAMB` and shift both ambiguous
     /// reads by one.
+    ///
+    /// M9 -- tie-break determinism. The argmax fold at the output stage uses
+    /// strict `>`, so on an EXACT posterior tie the FIRST candidate in pool
+    /// order wins. That rule was asserted in a comment which also claimed the
+    /// mutation "leaves the suite green" -- a mutation nobody had run. It did
+    /// leave the suite green: 70 passed, 0 failed. So the rule was unpinned,
+    /// and a refactor could have changed which transcript a tied read is
+    /// assigned to without any test objecting.
+    ///
+    /// The tie here is EXACT, not approximate, and that is the point. All four
+    /// evidence terms are identical between the two candidates:
+    ///   - `candidate_as` equal   => the alignment term is equal
+    ///   - `candidate_5p_gap` equal (both 0, inside the window) => equal
+    ///   - identical (mu, sigma2) in the emission table => the Gaussian is equal
+    ///   - so the softmax inputs are equal in every component, hence the
+    ///     posterior is bitwise equal and the fold must break the tie
+    ///
+    /// `ΔAS = 0` is also below `PRUNE_MAX_DELTA_AS`, so neither candidate is
+    /// pruned: a one-element posterior would make this test pass for the wrong
+    /// reason, which is exactly how an earlier draft of a nearby fixture
+    /// (`mixed_unambiguous_then_ambiguous`) was caught being vacuous.
+    ///
+    /// MUTATION: `w > acc.1` -> `w >= acc.1` must turn THIS test red, because
+    /// `>=` lets the later equal element overwrite the earlier one and the
+    /// winner becomes `tx1`. If it does not, the tie is unreachable through
+    /// this path and the assertion below is measuring something else.
+    #[test]
+    fn test_tied_posterior_resolves_to_the_first_candidate_in_pool_order() {
+        let log_pal = (100.0_f32).log2();
+        let emission = scratch("tiebreak_emission.parquet");
+        let profile = scratch("tiebreak_profile.parquet");
+        // IDENTICAL (mu, sigma2) => identical poly(A) term. These two rows are
+        // the whole reason the posterior ties.
+        write_test_emission(
+            &emission,
+            &[("tx0", "gene0", 7.0, 0.5), ("tx1", "gene1", 7.0, 0.5)],
+        );
+
+        let graph = FlatEvidenceGraph {
+            molecules: vec![MoleculeEvidence {
+                read_id: "TIED".to_string(),
+                log_pal,
+                candidate_offset: 0,
+                candidate_count: 2,
+            }],
+            candidate_nm: vec![0, 0],
+            candidate_mapq: vec![60, 60],
+            // tx0 first, tx1 second: the ORDER is the thing under test.
+            candidate_pool: vec![0, 1],
+            candidate_as: vec![900, 900],
+            candidate_5p_gap: vec![0, 0],
+            transcript_names: vec!["tx0".to_string(), "tx1".to_string()],
+            poly_a_is_placeholder: false,
+        };
+
+        let mut assigns: Vec<ReadAssignment> = Vec::new();
+        solve_and_write_profile(
+            graph,
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            5,
+            20.0,
+            FIVE_PRIME_OFF,
+            POLY_A_ON,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
+            None,
+            None,
+            Some(&mut assigns),
+        )
+        .unwrap();
+
+        assert_eq!(assigns.len(), 1, "one read in, one assignment out");
+        let a = &assigns[0];
+        assert_eq!(a.read_id, "TIED");
+
+        // NON-VACUITY. A one-candidate read -- or a read that resolved by AS
+        // rather than by a tie -- would give top_weight == 1.0 and entropy
+        // == 0.0. Asserting the 0.5/0.5 split first means a later failure of
+        // the winner assertion cannot be explained by "the tie never happened".
+        assert!(
+            (a.top_weight - 0.5).abs() < 1e-12,
+            "the posterior must actually be tied at 0.5/0.5, got top_weight = {} \
+             -- if this is 1.0 the fixture collapsed to one candidate and the \
+             winner assertion below would be vacuous",
+            a.top_weight
+        );
+        let ln2 = 2.0_f64.ln();
+        assert!(
+            (a.entropy - ln2).abs() < 1e-9,
+            "a 0.5/0.5 posterior has entropy ln 2 = {ln2}, got {} -- same \
+             non-vacuity reason as the top_weight assertion",
+            a.entropy
+        );
+
+        // The rule under test.
+        assert_eq!(
+            a.top_tx_id.as_deref(),
+            Some("tx0"),
+            "on an exact tie the FIRST candidate in pool order must win \
+             (strict `>` in the argmax fold). Getting tx1 here means the \
+             comparison was relaxed to `>=`, which is mutation M9."
+        );
+    }
+
     #[test]
     fn test_read_assignments_attach_each_posterior_to_its_own_read() {
         let log_pal = (100.0_f32).log2();

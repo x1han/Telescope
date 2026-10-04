@@ -318,17 +318,29 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
         // cannot be recovered reliably from a transcriptome BAM alone.
         //
         // MEASURED, not assumed, and the measurement is not uniform across the
-        // three input modes (2026-10-02, on the 10-sample COPD/HC cohort):
+        // three input modes. Every row below is the `trans_align/` BAM that
+        // Telescope actually consumes, re-measured 2026-10-04:
         //
-        //   AIDRS    nanocount/HC2.bam        8,016,260 records      0 supp
-        //   AIDRS    nanocount/COPD29.bam     7,707,895 records      0 supp
-        //   Bambu    COPD52.sorted.bam       29,658,736 records 82,080 supp (0.28%)
-        //   IsoQuant HC30.sorted.bam         25,344,489 records 53,116 supp (0.21%)
+        //   AIDRS    trans_align/HC2.sorted.bam    27,189,952 records 24,678 supp (0.091%)
+        //   AIDRS    trans_align/COPD29.sorted.bam 21,565,325 records 29,220 supp (0.135%)
+        //   Bambu    COPD52.sorted.bam            29,658,736 records 82,080 supp (0.28%)
+        //   IsoQuant HC30.sorted.bam              25,344,489 records 53,116 supp (0.21%)
         //
-        // So for the AIDRS path this is a NO-OP -- the transcriptome aligner
-        // emits primary + secondary only, and no record in 500,000 sampled has
-        // a hard clip at either end. It is NOT a no-op for the Bambu (F1) and
-        // IsoQuant (F2) paths, which are P0 items in the support matrix and
+        // Reproduce:
+        //   samtools view -c <bam>          # total
+        //   samtools view -c -f 2048 <bam>  # supplementary
+        //
+        // RETRACTED (2026-10-04). This table previously cited
+        // `aidrs_pipeline/nanocount/{HC2,COPD29}.bam` -- "8,016,260 records,
+        // 0 supp" -- and concluded the filter was a NO-OP for the AIDRS path.
+        // That was wrong twice over. The figures came from a DIFFERENT BAM: the
+        // `nanocount/` alignments, not the `trans_align/` ones Telescope reads
+        // (the same two-BAM conflation that made the shipped NanoCount TSVs
+        // unusable as a comparison arm). Measured on the real input, the AIDRS
+        // path DOES carry supplementary records, at ~0.1%.
+        //
+        // So this filter is a small live correction on all three paths, not
+        // defence in depth for AIDRS. It is larger on the Bambu (F1) and
         // which do carry supplementary records at ~0.2-0.3% of alignments. The
         // expert ruling that required this filter was right, and its priority
         // is F1/F2 rather than the path being developed today.
@@ -1053,14 +1065,18 @@ pub mod test_support {
     ///
     /// # Why this is defence in depth, not a live fix
     ///
-    /// Measured on the real cohort: `HC2.bam` 8,016,260 records, **0**
-    /// supplementary. `COPD29.bam` 7,707,895 records, **0**. No record in
-    /// 500,000 sampled has a hard clip at either end. The transcriptome
-    /// aligner emits primary + secondary only, so before this change the
-    /// supplementary path was unreachable on this data. It is kept for the
-    /// Bambu (F1) and IsoQuant (F2) paths and for any future aligner, and it
-    /// is kept because it is cheap and correct -- not because it fixes
-    /// anything measurable today.
+    /// RETRACTED (2026-10-04). This section used to claim the filter was a
+    /// no-op on the AIDRS path, citing `HC2.bam` at 8,016,260 records with **0**
+    /// supplementary. Those figures were read off
+    /// `aidrs_pipeline/nanocount/HC2.bam`, a different BAM from the
+    /// `trans_align/HC2.sorted.bam` this crate actually consumes.
+    ///
+    /// Measured on the real input (2026-10-04):
+    /// `trans_align/HC2.sorted.bam` 27,189,952 records, **24,678** supplementary
+    /// (0.091%); `trans_align/COPD29.sorted.bam` 21,565,325 records, **29,220**
+    /// (0.135%). So the supplementary path IS reachable on the AIDRS path, and
+    /// this filter is a small live correction there -- not defence in depth.
+    /// It is a larger one on the Bambu (0.28%) and IsoQuant (0.21%) paths.
     #[test]
     fn test_supplementary_alignments_are_dropped_rather_than_merged() {
         use Kind::*;
