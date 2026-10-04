@@ -873,7 +873,9 @@ fn main() -> Result<()> {
             );
             eprintln!(
                 "[telescope]      zero-power_resolved (same, but only over reads with \
-                 >=2 emission candidates): {} of {} ({})",
+                 >=2 emission candidates; CONVERGED mu, not the loaded model -- \
+                 the M-step pulls every weighted transcript's mu toward its own \
+                 reads, so this trends to 0 on any run that converges): {} of {} ({})",
                 stats.n_polya_zero_power_resolved,
                 stats.n_reads_multi_emission_candidate,
                 pct(
