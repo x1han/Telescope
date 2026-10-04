@@ -428,6 +428,24 @@ enum Cmd {
     },
 }
 
+/// Render `numerator / denominator` as a percentage string for the telemetry
+/// block, or `"n/a"` when the denominator is zero.
+///
+/// The `n/a` is the whole point. `0.0 / 0.0` is `NaN` in Rust, and the usual
+/// `.max(1)` guard fixes the NaN while rendering "no read qualified" as a
+/// confident `0.0%` -- a number that looks measured and is not. That is the
+/// exact failure mode the `_all` / `_resolved` split was made to remove, so
+/// reintroducing it in the print would undo the change at the last step.
+///
+/// Pinned by `pct_never_renders_a_zero_denominator_as_a_percentage`.
+fn pct(numerator: u64, denominator: u64) -> String {
+    if denominator == 0 {
+        "n/a".to_string()
+    } else {
+        format!("{:.1}%", numerator as f64 / denominator as f64 * 100.0)
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -823,39 +841,45 @@ fn main() -> Result<()> {
             // `_all`) so runs stay comparable; the new one excludes those reads
             // from BOTH numerator and denominator.
             //
-            // Every denominator below is `.max(1)`-guarded. `n_reads_multi_...`
-            // in particular is 0 on a sparse model -- which is exactly the
-            // regime this metric exists for -- and `0.0 / 0.0` in Rust is NaN,
-            // so an unguarded line prints "NaN%" and exits 0.
-            let n_with_cand = (stats.n_unambiguous + stats.n_ambiguous).max(1) as f64;
-            let n_multi = stats.n_reads_multi_emission_candidate.max(1) as f64;
+            // A denominator of ZERO PRINTS `n/a`, NOT `0.0%`. `0.0 / 0.0` in
+            // Rust is NaN, so an unguarded line prints "NaN%" -- and a
+            // `.max(1)` guard alone fixes the NaN while making "no read
+            // qualified" render as a confident 0.0%. That is the same class of
+            // defect as the metric this change is about: a number that looks
+            // measured and is not. `n_reads_multi_emission_candidate` is
+            // legitimately 0 on a sparse model, which is exactly the regime
+            // this metric exists for.
+            let n_with_cand = stats.n_unambiguous + stats.n_ambiguous;
             eprintln!("[telescope]    emission model coverage (reads with >=1 candidate):");
             eprintln!(
-                "[telescope]      reads with >=1 emission candidate : {} of {} ({:.1}%)",
+                "[telescope]      reads with >=1 emission candidate : {} of {} ({})",
                 stats.n_reads_any_emission_candidate,
-                n_with_cand as usize,
-                stats.n_reads_any_emission_candidate as f64 / n_with_cand * 100.0
+                n_with_cand,
+                pct(stats.n_reads_any_emission_candidate, n_with_cand as u64)
             );
             eprintln!(
-                "[telescope]      single-candidate reads           : {} of {} ({:.1}%)",
+                "[telescope]      single-candidate reads           : {} of {} ({})",
                 stats.n_reads_single_emission_candidate,
-                n_with_cand as usize,
-                stats.n_reads_single_emission_candidate as f64 / n_with_cand * 100.0
+                n_with_cand,
+                pct(stats.n_reads_single_emission_candidate, n_with_cand as u64)
             );
             eprintln!("[telescope]    poly(A) discriminative power:");
             eprintln!(
                 "[telescope]      zero-power_all     (identical mu/sigma2 across all \
-                 candidates that have an emission row): {} of {} ambiguous ({:.1}%)",
+                 candidates that have an emission row): {} of {} ambiguous ({})",
                 stats.n_polya_zero_power,
                 stats.n_ambiguous,
-                stats.n_polya_zero_power as f64 / n_ambig * 100.0
+                pct(stats.n_polya_zero_power, stats.n_ambiguous as u64)
             );
             eprintln!(
                 "[telescope]      zero-power_resolved (same, but only over reads with \
-                 >=2 emission candidates): {} of {} ({:.1}%)",
+                 >=2 emission candidates): {} of {} ({})",
                 stats.n_polya_zero_power_resolved,
                 stats.n_reads_multi_emission_candidate,
-                stats.n_polya_zero_power_resolved as f64 / n_multi * 100.0
+                pct(
+                    stats.n_polya_zero_power_resolved,
+                    stats.n_reads_multi_emission_candidate
+                )
             );
             if debug && !stats.em_trace.is_empty() {
                 eprintln!("[telescope]    EM trace:");
@@ -1041,6 +1065,32 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    /// A zero denominator must render as `n/a`, never as a percentage.
+    ///
+    /// `n_reads_multi_emission_candidate` is legitimately 0 whenever no read
+    /// has two candidates carrying an emission row — which is the normal state
+    /// of a badly-covered model, and precisely the state the `_all` / `_resolved`
+    /// split was created to characterise. The tempting guard is
+    /// `denominator.max(1)`, which removes the `NaN` and simultaneously reports
+    /// "no read qualified" as a confident `0.0%`.
+    ///
+    /// Asserting the STRING rather than the absence of a panic is the point:
+    /// a test that only checked "does not produce NaN" would still pass under
+    /// the `.max(1)` version, which is the defect.
+    #[test]
+    fn pct_never_renders_a_zero_denominator_as_a_percentage() {
+        assert_eq!(
+            pct(0, 0),
+            "n/a",
+            "0 of 0 is UNDEFINED, not 0.0% -- this is the vacuous-metric defect \
+             reappearing in the print"
+        );
+        // A real zero over a real denominator IS a real zero and must still say so.
+        assert_eq!(pct(0, 715_136), "0.0%");
+        assert_eq!(pct(1, 4), "25.0%");
+        assert_eq!(pct(1, 3), "33.3%");
+    }
 
     /// Pins the shipped defaults.
     ///

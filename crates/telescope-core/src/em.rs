@@ -1677,9 +1677,19 @@ pub struct TelEmStats {
     /// >=1 candidate" -- molecules with zero candidates are dropped earlier.
     pub n_reads_any_emission_candidate: u64,
     /// NUMERATOR for the single-candidate share: reads with exactly ONE
-    /// candidate carrying an emission row. These are the reads on which
-    /// `n_polya_zero_power` is most vacuous. Same denominator as
+    /// candidate carrying an emission row. Same denominator as
     /// `n_reads_any_emission_candidate`.
+    ///
+    /// ⚠️ THIS IS A STRICT SUPERSET OF THE VACUOUS READS, NOT THE SAME SET.
+    /// It is incremented in BOTH branches, so it includes unambiguous reads
+    /// that have one present candidate -- and those never reach
+    /// `n_polya_zero_power` at all, because that counter only runs on the
+    /// contested branch. Decomposing `zero-power_all` into "these are the reads
+    /// that made it vacuous" needs `n_reads_multi_emission_candidate` and the
+    /// per-read counts; the printed pair does NOT sum to it. In the fixture
+    /// `test_zero_power_resolved_excludes_reads_with_fewer_than_two_emission_candidates`
+    /// this counter is 2 and only ONE of those two is a vacuous zero-power
+    /// read (`SINGLE_THEN_GHOST`; the other is `UNAMBIGUOUS`).
     pub n_reads_single_emission_candidate: u64,
     /// EM trace: per-iter `(iter_index, log_likelihood, mean_entropy)`.
     pub em_trace: Vec<(usize, f64, f64)>,
