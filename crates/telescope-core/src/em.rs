@@ -1457,11 +1457,11 @@ struct CandidateAvailability {
     /// Present and competent, but `alpha <= 0.0` — pushed as `-inf`.
     ///
     /// Distinct from `n_incompetent` because the two are independent facts
-    /// about the same transcript and the M-step can move `alpha` to exactly 0
-    /// (`alpha = w_sum / n_total_molecules`, and `w_sum == 0` for any
-    /// transcript that won no posterior mass) without touching
-    /// `is_competent`. A single combined "incompetent or starved" bucket would
-    /// hide which of the two happened.
+    /// about the same transcript, and the M-step can drive `alpha` to exactly 0
+    /// — its update divides the posterior mass a transcript won by the total
+    /// molecule count, so a transcript that won none lands on 0 — without
+    /// touching `is_competent`. A single combined "incompetent or starved"
+    /// bucket would hide which of the two happened.
     n_alpha_zero: usize,
     /// Carried posterior mass. A ghost read has `n_live == 0`; see
     /// [`CandidateAvailability::is_ghost`].
@@ -1815,11 +1815,10 @@ pub struct TelEmStats {
     /// the transcript won no posterior mass.
     ///
     /// A genuinely distinct cause from the other two: `is_competent` is
-    /// M-step-invariant while `alpha` is exactly the field the M-step rewrites
-    /// (`alpha = w_sum / n_total_molecules`, and `w_sum == 0` for any
-    /// transcript that won no mass). A single combined "incompetent or starved"
-    /// bucket would hide which of the two happened, and they call for opposite
-    /// remedies.
+    /// M-step-invariant while `alpha` is exactly the field the M-step rewrites,
+    /// and it lands on 0 for a transcript that won no posterior mass. A single
+    /// combined "incompetent or starved" bucket would hide which of the two
+    /// happened, and they call for opposite remedies.
     pub n_ghost_read_all_alpha_zero: u64,
     /// ROW-LEVEL, and **not** comparable with any of the five read-level
     /// counters above. Incremented once per (read × candidate) row by the
