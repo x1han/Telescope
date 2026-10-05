@@ -809,11 +809,13 @@ fn main() -> Result<()> {
                 stats.n_ambiguous
             );
             eprintln!("[telescope]    EM iterations:          {}", stats.n_em_iter);
-            // Drop taxonomy. Every number below is a count of READS, and each
-            // population is printed under the denominator that population
-            // actually has: a single shared denominator would be meaningless,
-            // because an unambiguous read and a contested read cannot be
-            // dropped for the same reason at the same site.
+            // Drop taxonomy. Every number in the two groups below is a count
+            // of READS, and each group is printed under the denominator that
+            // population actually has: a single shared denominator would be
+            // meaningless, because an unambiguous read and a contested read
+            // cannot be dropped for the same reason at the same site. The
+            // tripwire after them is a ROW count and is deliberately outside
+            // both groups.
             let n_ghost = stats.n_dropped_no_competent_candidates;
             eprintln!("[telescope]    reads dropped, no profile row:");
             eprintln!(
@@ -852,8 +854,9 @@ fn main() -> Result<()> {
                         + stats.n_ghost_read_all_alpha_zero
                 )
             );
+            eprintln!("[telescope]    output-stage row filter -- a ROW count, not reads; a");
             eprintln!(
-                "[telescope]      output-stage row filter, a tripwire that must stay 0: {}",
+                "[telescope]    tripwire that must stay 0: {}",
                 stats.n_dropped_output_row_competence
             );
             let n_ambig = stats.n_ambiguous.max(1) as f64;

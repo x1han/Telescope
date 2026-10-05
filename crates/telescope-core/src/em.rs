@@ -132,8 +132,9 @@ pub fn load_emission_parameters<P: AsRef<Path>>(
 
 /// Run TEL-EM and write `telescope.profile.parquet`.
 ///
-/// Returns: stats `(n_unambiguous, n_ambiguous_em, n_ambiguous_iter, n_dropped_incompetent)`
-/// plus Phase A telemetry (entropy 3-tier, ghost-drop counter, EM log-L trace).
+/// Returns a `TelEmStats`, whose fields each carry their own unit and denominator
+/// in their doc comment; read it rather than this list, which is a summary of what
+/// the struct is FOR and goes stale when a field is renamed or split.
 ///
 /// `aln_weight_lambda` is the scale λ of the spec v0.2.7 F-EM-4 alignment term
 /// `ln A_rk = (AS_rk − max_j AS_rj) / λ`. It is only reachable for reads with
@@ -1544,6 +1545,12 @@ fn candidate_availability(
             av.n_missing += 1;
             continue;
         };
+        // Order matches the E-step's `!p.is_competent || p.alpha <= 0.0`, and
+        // it is load-bearing for a candidate that is BOTH: competence is
+        // tested first, so a doubly-dead candidate is attributed to
+        // incompetence. Swapping the two arms attributes it to starvation and
+        // changes nothing a test can see unless a fixture carries a candidate
+        // with `is_competent == false` AND `alpha == 0.0`; one now does.
         if !p.is_competent {
             av.n_incompetent += 1;
         } else if p.alpha <= 0.0 {
@@ -1786,6 +1793,13 @@ pub struct TelEmStats {
     pub n_unambiguous_dropped_incompetent: u64,
     /// READ-LEVEL, unambiguous population. Denominator `n_unambiguous`.
     /// The read's single candidate has no emission row at all.
+    ///
+    /// There is deliberately NO unambiguous counterpart to
+    /// `n_ghost_read_all_alpha_zero`: the unambiguous branch applies no `alpha`
+    /// mask, because a single-candidate read's posterior is the deterministic
+    /// `w == 1.0` and its abundance prior is never consulted. So the two
+    /// unambiguous buckets are not an incomplete three-way split -- they are
+    /// exhaustive for the drops that can actually happen there.
     ///
     /// This is the counter padding is expected to drive to zero:
     /// `build_emission_from_anchors` iterates only the anchor pool, so a
@@ -2335,21 +2349,29 @@ mod tests {
                 (100, true, 0.0),  // 3 present, competent, alpha == 0
                 (20, true, 0.5),   // 4 LIVE BUT PRUNED
                 (100, true, 0.5),  // 5 no emission row
+                // 7 present, incompetent AND alpha == 0: dead twice over. It
+                // must be attributed to incompetence, matching the E-step's
+                // `!p.is_competent || p.alpha <= 0.0` short-circuit. Without
+                // this candidate the two arms could be swapped and no test
+                // would notice.
+                (100, false, 0.0),
             ],
-            &[true, true, true, true, true, false],
+            &[true, true, true, true, true, false, true],
         );
         assert_eq!(av.n_live, 2, "0 and 1 only: candidate 4 is pruned");
         assert_eq!(av.n_missing, 1, "candidate 5 has no emission row");
         assert_eq!(
-            av.n_incompetent, 1,
-            "candidate 2 is is_polyA_competent=false"
+            av.n_incompetent, 2,
+            "candidates 2 and 7. Candidate 7 is incompetent AND alpha == 0, and the
+             E-step tests competence first, so it lands here and not in
+             `n_alpha_zero` -- see the note on the order of the two arms."
         );
         assert_eq!(
             av.n_alpha_zero, 1,
             "candidate 3 is competent but alpha == 0"
         );
         assert_eq!(
-            av.uniform_cause(6),
+            av.uniform_cause(7),
             None,
             "four different causes are present, so no single one accounts for the \
              read. Reporting any of them here would over-claim what padding fixes."
@@ -3263,7 +3285,7 @@ mod tests {
             rows[0].1, 1.0,
             "the lone survivor must absorb the whole posterior, not 0.9933"
         );
-        // NOTE on `stats.n_dropped_incompetent` being 0 here, which surprised
+        // NOTE on `stats.n_dropped_output_row_competence` being 0 here, which surprised
         // the first draft of this test. That counter is incremented by the
         // OUTPUT stage's `!p.is_competent` check, which is unreachable for an
         // AMBIGUOUS read: the E-step already pushed this candidate as `-inf`
