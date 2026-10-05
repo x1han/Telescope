@@ -758,7 +758,12 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
     let mut w_b = Float64Builder::new();
     let mut ncand_b = UInt16Builder::new();
     let mut as_ratio_b = Float32Builder::new();
-    let mut n_dropped_incompetent = 0_u64;
+    let mut n_unambiguous_dropped_incompetent = 0_u64;
+    let mut n_unambiguous_dropped_missing_emission = 0_u64;
+    let mut n_ghost_read_all_missing = 0_u64;
+    let mut n_ghost_read_all_incompetent = 0_u64;
+    let mut n_ghost_read_all_alpha_zero = 0_u64;
+    let mut n_dropped_output_row_competence = 0_u64;
     let mut n_dropped_no_competent_candidates = 0_u64;
     // EMISSION COVERAGE. Denominator for the two read-weighted numbers the CLI
     // prints: `n_unambiguous + n_ambiguous`, i.e. reads with at least one
@@ -826,7 +831,7 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         n_reads_single_emission_candidate += u64::from(un_with_emission);
         if let Some(ref p) = params[tx_id] {
             if !p.is_competent {
-                n_dropped_incompetent += 1;
+                n_unambiguous_dropped_incompetent += 1;
                 continue;
             }
             if want_read_assignments {
@@ -855,8 +860,12 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
             ncand_b.append_value(ncand);
             as_ratio_b.append_value(as_ratio);
         } else {
-            // transcript missing from emission parquet → skip
-            n_dropped_incompetent += 1;
+            // transcript missing from emission parquet → skip.
+            // This is the case that PADDING removes, and it was conflated with
+            // the `!p.is_competent` case above until the 2026-10-05 split; the
+            // two are independent facts about the transcript and only one of
+            // them is an emission-coverage problem.
+            n_unambiguous_dropped_missing_emission += 1;
         }
     }
 
@@ -916,6 +925,31 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         // Phase A entropy 3-tier + ghost-drop telemetry.
         if weights.is_empty() {
             n_dropped_no_competent_candidates += 1;
+            // GHOST DECOMPOSITION. `weights.is_empty()` on its own is a
+            // conflation of three unrelated causes — absent emission row,
+            // `is_polyA_competent == false`, and `alpha <= 0.0` — and the one
+            // number that motivated this change (603,936 reads on HC2) cannot
+            // be attributed to any of them without a census. The census
+            // replays the E-step's own filter over the read's ORIGINAL
+            // candidate range, against `last_estep_params` for the same reason
+            // `polya_emission_count_and_identity` above uses it: `final_weights`
+            // came from the pre-M-step model, and `alpha` is precisely the field
+            // the M-step rewrites.
+            //
+            // `n_dropped_no_competent_candidates` is UNCHANGED and remains the
+            // TOTAL, incremented above, so the three cause counters below are a
+            // partial decomposition of it rather than a replacement for it. A
+            // read whose candidates died for a mix of reasons, or with a pruned
+            // candidate among them, increments no cause counter; the CLI prints
+            // the remainder explicitly instead of letting the three look like
+            // they sum to the total.
+            let av = candidate_availability(&graph, mol, &last_estep_params, prune_max_delta_as);
+            match av.uniform_cause(mol.candidate_count as usize) {
+                Some(GhostCause::Missing) => n_ghost_read_all_missing += 1,
+                Some(GhostCause::Incompetent) => n_ghost_read_all_incompetent += 1,
+                Some(GhostCause::AlphaZero) => n_ghost_read_all_alpha_zero += 1,
+                None => {}
+            }
         } else {
             let h = posterior_entropy(&weights);
             // P1 fix: upper bound raised to 0.70 (was 0.60) so that a
@@ -1063,7 +1097,7 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
             let w_norm = w / retained_sum;
             if let Some(ref p) = params[tx_id] {
                 if !p.is_competent {
-                    n_dropped_incompetent += 1;
+                    n_dropped_output_row_competence += 1;
                     continue;
                 }
                 sample_b.append_value(sample_id);
@@ -1075,7 +1109,7 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
                 ncand_b.append_value(ncand);
                 as_ratio_b.append_value(as_ratio);
             } else {
-                n_dropped_incompetent += 1;
+                n_dropped_output_row_competence += 1;
             }
         }
     }
@@ -1193,7 +1227,12 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         n_unambiguous,
         n_ambiguous,
         n_em_iter,
-        n_dropped_incompetent,
+        n_unambiguous_dropped_incompetent,
+        n_unambiguous_dropped_missing_emission,
+        n_ghost_read_all_missing,
+        n_ghost_read_all_incompetent,
+        n_ghost_read_all_alpha_zero,
+        n_dropped_output_row_competence,
         n_dropped_no_competent_candidates,
         n_entropy_clean,
         n_entropy_partial,
@@ -1387,6 +1426,133 @@ fn read_max_as_ratio(graph: &FlatEvidenceGraph, mol: &MoleculeEvidence) -> f32 {
         return 0.0;
     }
     (second as f64 / largest as f64) as f32
+}
+
+/// Why a read's candidate set contains nothing that could carry posterior mass.
+///
+/// The census is taken over the read's ORIGINAL candidate range, and each
+/// bucket is defined by the E-step's own decision procedure, in the E-step's
+/// own order. That is the whole point: a read is a ghost exactly when the
+/// E-step's `max_ll` came out `-inf`, so any census that does not replay the
+/// E-step's filter will disagree with the fact it is being invoked to explain.
+///
+/// Concretely, the two ways a candidate can be absent from the E-step's `raw`
+/// vector are NOT the same and must not share a bucket:
+///
+/// - **pruned** (`delta_as > prune_max_delta_as`) — the E-step pushes `-inf`
+///   and `continue`s, so the entry IS in `raw`;
+/// - **no emission row** — the `if let Some(ref p) = params[tx_id]` arm has no
+///   `else`, so the entry is never pushed at all.
+///
+/// A census that lumped these together would report a cause for reads whose
+/// real cause was the other, which is the failure `test_ghost_decomposition_*`
+/// exists to catch. The prune is likewise excluded from every bucket rather
+/// than counted as one of the three causes, because a pruned candidate is dead
+/// for a reason no amount of emission padding addresses.
+struct CandidateAvailability {
+    /// No emission row at all — the candidate never reached `raw`.
+    n_missing: usize,
+    /// Present, but `is_polyA_competent == false` — pushed as `-inf`.
+    n_incompetent: usize,
+    /// Present and competent, but `alpha <= 0.0` — pushed as `-inf`.
+    ///
+    /// Distinct from `n_incompetent` because the two are independent facts
+    /// about the same transcript and the M-step can move `alpha` to exactly 0
+    /// (`alpha = w_sum / n_total_molecules`, and `w_sum == 0` for any
+    /// transcript that won no posterior mass) without touching
+    /// `is_competent`. A single combined "incompetent or starved" bucket would
+    /// hide which of the two happened.
+    n_alpha_zero: usize,
+    /// Carried posterior mass. A ghost read has `n_live == 0`; see
+    /// [`CandidateAvailability::is_ghost`].
+    n_live: usize,
+}
+
+impl CandidateAvailability {
+    /// The single cause shared by EVERY candidate, when exactly one cause
+    /// accounts for all of them; `None` when the read's candidates died for a
+    /// mix of reasons, or when any candidate was pruned. `candidate_count` is
+    /// the read's original candidate count — the denominator — and pruned
+    /// candidates are IN it and in NO bucket, so a read with a pruned candidate
+    /// plus a uniformly-missing remainder is reported as `None` rather than as
+    /// `Missing`: padding cannot revive a pruned candidate, so calling that
+    /// read recoverable would over-claim.
+    fn uniform_cause(&self, candidate_count: usize) -> Option<GhostCause> {
+        if candidate_count == 0 {
+            return None;
+        }
+        if self.n_missing == candidate_count {
+            Some(GhostCause::Missing)
+        } else if self.n_incompetent == candidate_count {
+            Some(GhostCause::Incompetent)
+        } else if self.n_alpha_zero == candidate_count {
+            Some(GhostCause::AlphaZero)
+        } else {
+            None
+        }
+    }
+}
+
+/// The one cause behind a ghost read, when the read has exactly one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GhostCause {
+    Missing,
+    Incompetent,
+    AlphaZero,
+}
+
+/// One walk of a read's candidate range, classifying each candidate by the
+/// E-step's own filter. See [`CandidateAvailability`] for why the buckets are
+/// defined this way and why pruning is excluded from all of them.
+///
+/// `params` must be `last_estep_params`, NOT `params`: the census explains a
+/// `final_weights` that was produced from the pre-M-step model, and `alpha` is
+/// exactly the field the M-step rewrites. This is the same trap
+/// `polya_emission_count_and_identity` already documents.
+fn candidate_availability(
+    graph: &FlatEvidenceGraph,
+    mol: &MoleculeEvidence,
+    params: &[Option<TranscriptParam>],
+    prune_max_delta_as: i32,
+) -> CandidateAvailability {
+    let off = mol.candidate_offset as usize;
+    let n = mol.candidate_count as usize;
+    let mut av = CandidateAvailability {
+        n_missing: 0,
+        n_incompetent: 0,
+        n_alpha_zero: 0,
+        n_live: 0,
+    };
+    // Same reference point as the E-step: the read's best `AS` over its FULL
+    // candidate range, taken before competence masking and including candidates
+    // that have no emission row. Reproducing it exactly is what makes the
+    // `delta_as` below comparable to the prune the E-step actually applied.
+    let max_as = graph.candidate_as[off..off + n]
+        .iter()
+        .fold(i32::MIN, |a, &b| a.max(b));
+    for c in 0..n {
+        let idx = off + c;
+        let tx_id = graph.candidate_pool[idx] as usize;
+        // `saturating_sub`, matching the E-step. A plain `-` would wrap under
+        // `--release` and a wrapped NEGATIVE delta_as would pass the prune,
+        // putting a candidate the E-step killed into the `n_live` bucket.
+        let delta_as = max_as.saturating_sub(graph.candidate_as[idx]);
+        if delta_as > prune_max_delta_as {
+            continue;
+        }
+        let Some(p) = params.get(tx_id).and_then(|o| o.as_ref()) else {
+            av.n_missing += 1;
+            continue;
+        };
+        if !p.is_competent {
+            av.n_incompetent += 1;
+        } else if p.alpha <= 0.0 {
+            av.n_alpha_zero += 1;
+        } else {
+            av.n_live += 1;
+        }
+    }
+    av
 }
 
 /// Posterior entropy (in nats) of a single ambiguous read over its
@@ -1608,9 +1774,87 @@ pub struct TelEmStats {
     pub n_unambiguous: usize,
     pub n_ambiguous: usize,
     pub n_em_iter: usize,
-    pub n_dropped_incompetent: u64,
-    /// Reads dropped because all candidates were `is_polyA_competent == false`
-    /// (ghost transcripts / n_flnc==0). Phase A telemetry.
+    /// READ-LEVEL, unambiguous population. Denominator `n_unambiguous`.
+    /// An unambiguous read has exactly one candidate, so this counts reads
+    /// whose single candidate was present and `is_polyA_competent == false`.
+    ///
+    /// Until the 2026-10-05 split this field ALSO counted contested reads
+    /// (every candidate incompetent) and, once per ROW, the output stage's own
+    /// filter — three different things under one name, and two different
+    /// denominators. The contested case is now `n_ghost_read_all_incompetent`
+    /// and the row-level one is `n_dropped_output_row_competence`.
+    pub n_unambiguous_dropped_incompetent: u64,
+    /// READ-LEVEL, unambiguous population. Denominator `n_unambiguous`.
+    /// The read's single candidate has no emission row at all.
+    ///
+    /// This is the counter padding is expected to drive to zero:
+    /// `build_emission_from_anchors` iterates only the anchor pool, so a
+    /// transcript with no anchor is absent from the table and every read whose
+    /// only candidate is such a transcript lands here. A non-zero value after a
+    /// padded build is a defect in the padding, not a property of the data.
+    pub n_unambiguous_dropped_missing_emission: u64,
+    /// READ-LEVEL, ghost population. Denominator
+    /// `n_dropped_no_competent_candidates`. Contested reads with no posterior
+    /// whose ENTIRE candidate range had no emission row.
+    ///
+    /// Kept separate from `n_unambiguous_dropped_missing_emission` rather than
+    /// summed into it because the two have different denominators: a single
+    /// combined "missing emission row" total could only be reported as a raw
+    /// count against no meaningful fraction, and the whole purpose of the
+    /// decomposition is to be able to say what fraction of each population
+    /// padding would have rescued.
+    pub n_ghost_read_all_missing: u64,
+    /// READ-LEVEL, ghost population. Denominator
+    /// `n_dropped_no_competent_candidates`. Contested reads with no posterior
+    /// whose entire candidate range was present and `is_polyA_competent == false`.
+    pub n_ghost_read_all_incompetent: u64,
+    /// READ-LEVEL, ghost population. Denominator
+    /// `n_dropped_no_competent_candidates`. Contested reads with no posterior
+    /// whose entire candidate range was present and competent but had
+    /// `alpha <= 0.0` — the abundance prior the M-step drove to zero because
+    /// the transcript won no posterior mass.
+    ///
+    /// A genuinely distinct cause from the other two: `is_competent` is
+    /// M-step-invariant while `alpha` is exactly the field the M-step rewrites
+    /// (`alpha = w_sum / n_total_molecules`, and `w_sum == 0` for any
+    /// transcript that won no mass). A single combined "incompetent or starved"
+    /// bucket would hide which of the two happened, and they call for opposite
+    /// remedies.
+    pub n_ghost_read_all_alpha_zero: u64,
+    /// ROW-LEVEL, and **not** comparable with any of the five read-level
+    /// counters above. Incremented once per (read × candidate) row by the
+    /// output stage when a row's transcript is `!is_competent` or absent from
+    /// `params`.
+    ///
+    /// This is 0 in practice, and it is meant to stay 0: the E-step already
+    /// pushed such candidates as `-inf` and `filter(ll > -inf)` removed them
+    /// from `weights`, so no such row can reach the emit loop. `is_competent`
+    /// is M-step-invariant (the M-step writes only `mu`, `sigma2`, `alpha`),
+    /// and a candidate with no emission row never enters `raw` at all, so
+    /// neither can appear here. It is a TRIPWIRE: if the E-step's `-inf` mask
+    /// is ever removed, this fires, and the read-level counters would silently
+    /// stop accounting for the output stage's share of the loss.
+    ///
+    /// `test_incompetent_candidate_is_excluded_from_the_renormalisation_base`
+    /// carries the NOTE recording that this counter reads 0 there and why.
+    pub n_dropped_output_row_competence: u64,
+    /// READ-LEVEL, ghost population. Contested reads (>= 2 candidates) with NO
+    /// posterior at all — `weights.is_empty()`. This is the TOTAL for the
+    /// decomposition above.
+    ///
+    /// The NAME predates the 2026-10-05 decomposition and is misleading in two
+    /// ways: it fires for several causes, not one, and the reads it counts are
+    /// reads rather than candidates. It is kept verbatim because
+    /// `workspace/validation/sim/telescope_sim_benchmark.py` compares its own
+    /// Python-side ghost count against this field and `die()`s on a mismatch,
+    /// so renaming it would break a gated external validation for no
+    /// informational gain. The CLI labels it "ghost reads, no posterior".
+    ///
+    /// `n_ghost_read_all_missing + n_ghost_read_all_incompetent +
+    /// n_ghost_read_all_alpha_zero` is a PARTIAL decomposition of it and does
+    /// not sum to it. The remainder is reads whose candidates died for a mix of
+    /// reasons, or that had a pruned candidate among them; the CLI prints that
+    /// remainder rather than letting the three look exhaustive.
     pub n_dropped_no_competent_candidates: u64,
     /// Posterior entropy 3-tier counters (per ambiguous read, in nats).
     /// clean: H < 0.20 nats (near-deterministic assignment).
@@ -2042,6 +2286,101 @@ mod tests {
             // synthetic/test graph: `log_pal` is a real measurement
             poly_a_is_placeholder: false,
         }
+    }
+
+    /// One-candidate-per-entry graph plus a matching `params` vector, for
+    /// testing [`candidate_availability`] directly.
+    ///
+    /// `spec` is one `(AS, is_competent, alpha)` per candidate, in the order
+    /// they should occupy the read's candidate range; `present` says whether
+    /// that candidate keeps its emission row. `synth_graph_with_gaps` assigns
+    /// `tx_id == position`, so `params[i]` is the parameters of candidate `i`.
+    fn census_fixture(spec: &[(i32, bool, f64)], present: &[bool]) -> CandidateAvailability {
+        let with_gaps: Vec<(&str, i32, u32)> =
+            spec.iter().map(|&(as_, _, _)| ("t", as_, 0)).collect();
+        let graph = synth_graph_with_gaps(7.0, &with_gaps);
+        let params: Vec<Option<TranscriptParam>> = spec
+            .iter()
+            .zip(present)
+            .map(|(&(_, competent, alpha), &keep)| {
+                keep.then(|| TranscriptParam {
+                    transcript_id: "t".into(),
+                    gene_id: "g".into(),
+                    is_competent: competent,
+                    mu_cohort: 7.0,
+                    mu: 7.0,
+                    sigma2_cohort: 0.04,
+                    sigma2: 0.04,
+                    alpha,
+                })
+            })
+            .collect();
+        candidate_availability(&graph, &graph.molecules[0], &params, PRUNE_MAX_DELTA_AS)
+    }
+
+    /// The census has to keep four things apart that all end in "this read has
+    /// no posterior", and the four are distinguished ONLY by which filter killed
+    /// the candidate. Three of the four are reachable from production data and
+    /// one (the `ΔAS` prune) is not: a pruned candidate is dead for a reason no
+    /// amount of emission padding addresses, so a read that has one is NOT
+    /// reported as recoverable.
+    #[test]
+    fn test_candidate_availability_keeps_four_death_causes_apart() {
+        // AS 100 is the read's best; AS 20 gives delta_as = 80 > 50, so
+        // candidate 4 is pruned however healthy its emission row is.
+        let av = census_fixture(
+            &[
+                (100, true, 0.5),  // 0 live
+                (100, true, 0.5),  // 1 live
+                (100, false, 0.5), // 2 incompetent
+                (100, true, 0.0),  // 3 present, competent, alpha == 0
+                (20, true, 0.5),   // 4 LIVE BUT PRUNED
+                (100, true, 0.5),  // 5 no emission row
+            ],
+            &[true, true, true, true, true, false],
+        );
+        assert_eq!(av.n_live, 2, "0 and 1 only: candidate 4 is pruned");
+        assert_eq!(av.n_missing, 1, "candidate 5 has no emission row");
+        assert_eq!(
+            av.n_incompetent, 1,
+            "candidate 2 is is_polyA_competent=false"
+        );
+        assert_eq!(
+            av.n_alpha_zero, 1,
+            "candidate 3 is competent but alpha == 0"
+        );
+        assert_eq!(
+            av.uniform_cause(6),
+            None,
+            "four different causes are present, so no single one accounts for the \
+             read. Reporting any of them here would over-claim what padding fixes."
+        );
+
+        // Each uniform cause, one at a time. `alpha == 0` is unreachable through
+        // the solver (a transcript only reaches it by winning no mass, and a
+        // transcript that wins no mass was already dead), which is exactly why
+        // it is pinned HERE rather than only in the end-to-end test.
+        assert_eq!(
+            census_fixture(&[(100, true, 0.5), (100, true, 0.5)], &[false, false]).uniform_cause(2),
+            Some(GhostCause::Missing)
+        );
+        assert_eq!(
+            census_fixture(&[(100, false, 0.5), (100, false, 0.5)], &[true, true]).uniform_cause(2),
+            Some(GhostCause::Incompetent)
+        );
+        assert_eq!(
+            census_fixture(&[(100, true, 0.0), (100, true, 0.0)], &[true, true]).uniform_cause(2),
+            Some(GhostCause::AlphaZero)
+        );
+        // A missing candidate ALONGSIDE a pruned one: padding would restore the
+        // missing row, but the pruned candidate stays dead, so the read stays a
+        // ghost. Reporting `Missing` would promise a rescue that does not come.
+        assert_eq!(
+            census_fixture(&[(100, true, 0.5), (20, true, 0.5)], &[false, true]).uniform_cause(2),
+            None,
+            "one candidate is missing and the other is pruned: the read is NOT \
+             rescued by padding, because the pruned candidate dies either way"
+        );
     }
 
     /// Read back `telescope.profile.parquet` as `(transcript_id, weight)` rows
@@ -5038,6 +5377,192 @@ mod tests {
     /// one of them has no emission row, so nothing was ever compared, and
     /// `zero-power_all` counts it anyway because that is what it has always
     /// done. If the two counters ever agree on this fixture, the exclusion is
+    /// STEP 0, end to end. Every dropped read lands in exactly one bucket, and
+    /// the buckets are the ones the CLI prints.
+    ///
+    /// What this pins that the census unit test cannot: that the CALL SITE
+    /// routes each cause to the field the CLI reads, and that a read which
+    /// loses only SOME of its candidates increments NOTHING. The second half is
+    /// the load-bearing half — a solver that counted every read with any dead
+    /// candidate would produce plausible-looking numbers for every cause and
+    /// still be wrong, because the number the padding experiment turns on is
+    /// "reads that padding would rescue", not "reads with something wrong".
+    ///
+    /// `max_iter = 1` on purpose. `alpha` only reaches 0 through the M-step, and
+    /// a transcript can only win no mass if it was already dead, so
+    /// `n_ghost_read_all_alpha_zero` is NOT reachable through the solver at any
+    /// iteration count. It is pinned in
+    /// `test_candidate_availability_keeps_four_death_causes_apart` instead, and
+    /// asserting 0 here is what documents that the gap is known rather than
+    /// accidental.
+    #[test]
+    fn test_drop_taxonomy_attributes_every_lost_read_to_exactly_one_cause() {
+        let log_pal = (100.0_f32).log2();
+        let emission = scratch("drop_taxonomy_emission.parquet");
+        let profile = scratch("drop_taxonomy_profile.parquet");
+        // tx4 and tx5 are INTENTIONALLY ABSENT: transcripts the emission model
+        // never fitted, the shape of the 37,081 missing rows.
+        write_test_emission_with_competence(
+            &emission,
+            &[
+                ("tx0", "gene0", 7.0, 0.04, true),
+                ("tx1", "gene1", 7.0, 0.04, true),
+                ("tx3", "gene3", 7.0, 0.04, false),
+                ("tx6", "gene6", 7.0, 0.04, false),
+            ],
+        );
+
+        //   UN_MISSING   [0]     -> tx4            absent from the model
+        //   UN_INCOMP    [1]     -> tx3            present, incompetent
+        //   UN_OK        [2]     -> tx0            present, competent
+        //   G_ALL_MISS   [3..5)  -> tx4, tx5       both absent
+        //   G_ALL_INC    [5..7)  -> tx3, tx6       both incompetent
+        //   G_MIXED      [7..9)  -> tx4, tx3       one absent, one incompetent
+        //   G_LIVE       [9..11) -> tx0, tx1       both fine
+        let molecules = vec![
+            MoleculeEvidence {
+                read_id: "UN_MISSING".into(),
+                log_pal,
+                candidate_offset: 0,
+                candidate_count: 1,
+            },
+            MoleculeEvidence {
+                read_id: "UN_INCOMP".into(),
+                log_pal,
+                candidate_offset: 1,
+                candidate_count: 1,
+            },
+            MoleculeEvidence {
+                read_id: "UN_OK".into(),
+                log_pal,
+                candidate_offset: 2,
+                candidate_count: 1,
+            },
+            MoleculeEvidence {
+                read_id: "G_ALL_MISS".into(),
+                log_pal,
+                candidate_offset: 3,
+                candidate_count: 2,
+            },
+            MoleculeEvidence {
+                read_id: "G_ALL_INC".into(),
+                log_pal,
+                candidate_offset: 5,
+                candidate_count: 2,
+            },
+            MoleculeEvidence {
+                read_id: "G_MIXED".into(),
+                log_pal,
+                candidate_offset: 7,
+                candidate_count: 2,
+            },
+            MoleculeEvidence {
+                read_id: "G_LIVE".into(),
+                log_pal,
+                candidate_offset: 9,
+                candidate_count: 2,
+            },
+        ];
+        let candidate_pool: Vec<u32> = vec![4, 3, 0, 4, 5, 3, 6, 4, 3, 0, 1];
+        let n = candidate_pool.len();
+        let graph = FlatEvidenceGraph {
+            molecules,
+            candidate_nm: vec![0; n],
+            candidate_mapq: vec![60; n],
+            // Equal AS everywhere, so `delta_as == 0` and the prune cannot fire.
+            // The census's prune bucket is exercised directly in
+            // `test_candidate_availability_keeps_four_death_causes_apart`; here
+            // it would be a fifth cause with nothing to attribute it to.
+            candidate_as: vec![900; n],
+            candidate_5p_gap: vec![0; n],
+            candidate_pool,
+            transcript_names: (0..7).map(|i| format!("tx{i}")).collect(),
+            poly_a_is_placeholder: false,
+        };
+
+        let stats = solve_and_write_profile(
+            graph,
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            1,
+            20.0,
+            FIVE_PRIME_OFF,
+            POLY_A_ON,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let rows = read_profile_by_read(&profile);
+        let _ = std::fs::remove_file(&emission);
+        let _ = std::fs::remove_file(&profile);
+
+        assert_eq!(stats.n_unambiguous, 3, "UN_MISSING, UN_INCOMP, UN_OK");
+        assert_eq!(stats.n_ambiguous, 4, "the four G_* reads are contested");
+
+        // Unambiguous population, denominator `n_unambiguous`.
+        assert_eq!(
+            stats.n_unambiguous_dropped_missing_emission, 1,
+            "only UN_MISSING's candidate is absent from the model"
+        );
+        assert_eq!(
+            stats.n_unambiguous_dropped_incompetent, 1,
+            "only UN_INCOMP's candidate carries is_polyA_competent == false"
+        );
+
+        // Ghost population, denominator `n_dropped_no_competent_candidates`.
+        assert_eq!(
+            stats.n_dropped_no_competent_candidates, 3,
+            "G_ALL_MISS, G_ALL_INC and G_MIXED have no live candidate. G_LIVE does \
+             NOT: losing candidates is not the same as having no posterior."
+        );
+        assert_eq!(stats.n_ghost_read_all_missing, 1, "G_ALL_MISS only");
+        assert_eq!(stats.n_ghost_read_all_incompetent, 1, "G_ALL_INC only");
+        assert_eq!(
+            stats.n_ghost_read_all_alpha_zero, 0,
+            "see the `max_iter = 1` note: unreachable through the solver"
+        );
+
+        // The three cause counters are a PARTIAL decomposition, and the CLI
+        // prints the remainder. G_MIXED is the remainder: one candidate absent
+        // and one incompetent, so padding alone does not revive it.
+        let attributed = stats.n_ghost_read_all_missing
+            + stats.n_ghost_read_all_incompetent
+            + stats.n_ghost_read_all_alpha_zero;
+        assert_eq!(
+            stats.n_dropped_no_competent_candidates - attributed,
+            1,
+            "G_MIXED must be counted in the ghost TOTAL and in no cause counter"
+        );
+
+        assert_eq!(
+            stats.n_dropped_output_row_competence, 0,
+            "the output stage's own competence filter is unreachable while the \
+             E-step pushes such candidates as -inf. If this is non-zero the \
+             read-level counters above no longer account for the whole loss."
+        );
+
+        // The same fact from the OUTPUT side: a read that loses some but not all
+        // of its candidates still gets its survivors' rows, and an all-dead read
+        // gets none.
+        // Compared as a multiset, not a sequence: the profile emits the
+        // unambiguous rows before the contested ones and that ordering is not
+        // what this test is about.
+        let mut emitted: Vec<&str> = rows.iter().map(|(r, _, _)| r.as_str()).collect();
+        emitted.sort_unstable();
+        assert_eq!(
+            emitted,
+            vec!["G_LIVE", "G_LIVE", "UN_OK"],
+            "only the reads with a live candidate may appear in the profile: {rows:?}"
+        );
+    }
+
     /// not happening.
     #[test]
     fn test_zero_power_resolved_excludes_reads_with_fewer_than_two_emission_candidates() {
