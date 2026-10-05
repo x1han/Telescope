@@ -125,6 +125,37 @@ enum Cmd {
         /// (informational; L3 is always applied when L1/L2 fail).
         #[arg(long, default_value_t = 50)]
         cohort_min_reads: usize,
+
+        /// REFERENCE UNIVERSE (padding). Path to the alignment BAM whose `@SQ`
+        /// header names every transcript the alignment can assign to.
+        ///
+        /// Without it the model covers only transcripts the anchor pool
+        /// observed, and a read whose candidate is outside that set is
+        /// dropped with no profile row -- 705,289 of them on HC2, 14.7% of all
+        /// reads. With it, every universe transcript missing from the pool is
+        /// emitted as a cohort-prior row carrying `n_cohort_flnc == 0`.
+        ///
+        /// Only the HEADER is read; no alignment record is touched.
+        #[arg(long)]
+        reference_bam: Option<PathBuf>,
+
+        /// Optional `transcript_id<TAB>gene_id` TSV, used to give IMPUTED
+        /// rows a real `gene_id` instead of falling back to the transcript id.
+        ///
+        /// The fallback is a different convention from the anchored rows in
+        /// the same file, which is harmless numerically -- `gene_id` feeds no
+        /// likelihood -- but it is a join trap for a downstream reader, so it
+        /// is worth passing when the mapping is on hand.
+        #[arg(long)]
+        tx_to_gene: Option<PathBuf>,
+
+        /// Where to write the provenance sidecar JSON. Defaults to
+        /// `<output>.provenance.json`.
+        ///
+        /// The parquet's 7 columns are frozen, so the record of WHERE the
+        /// universe came from and WHICH rows were imputed cannot live in it.
+        #[arg(long)]
+        provenance_out: Option<PathBuf>,
     },
 
     /// Module 2: extract single-molecule evidence from AIDRS-aligned BAM.
@@ -452,6 +483,9 @@ fn main() -> Result<()> {
         Cmd::BuildEmission {
             anchor_pool,
             transcript_evidence,
+            reference_bam,
+            tx_to_gene,
+            provenance_out,
             output,
             tx_min_reads,
             gene_min_reads,
@@ -475,11 +509,59 @@ fn main() -> Result<()> {
             eprintln!("  gene_min_reads:     {}", fb.gene_min_reads);
             eprintln!("  cohort_min_reads:   {}", fb.cohort_min_reads);
             eprintln!("  output:             {}", output.display());
+            // Reference universe: read HEADER-ONLY from the alignment BAM.
+            let universe: Option<Vec<String>> = match reference_bam {
+                Some(ref bam) => {
+                    eprintln!("  reference_bam:     {}", bam.display());
+                    let u = emission_model::read_reference_universe(bam)
+                        .context("Failed to read the reference universe from the BAM header")?;
+                    eprintln!("  @SQ transcripts:  {}", u.len());
+                    Some(u)
+                }
+                None => {
+                    eprintln!(
+                        "  reference_bam:     (none; the model will cover only the \
+                         anchor pool, and a read whose candidate is outside it will be \
+                         dropped with no profile row)"
+                    );
+                    None
+                }
+            };
+            let tx2g = match tx_to_gene {
+                Some(ref p) => {
+                    eprintln!("  tx_to_gene:        {}", p.display());
+                    Some(
+                        anchor_builder::TxToGene::from_tsv(p)
+                            .context("Failed to load tx-to-gene TSV")?,
+                    )
+                }
+                None => {
+                    eprintln!(
+                        "  tx_to_gene:        (none; imputed rows use gene_id := transcript_id)"
+                    );
+                    None
+                }
+            };
+            // Captured before `output` and `reference_bam` are moved into the
+            // call below: the sidecar defaults to sitting beside the parquet,
+            // and it records which file supplied the universe.
+            let prov_path: PathBuf = provenance_out.clone().unwrap_or_else(|| {
+                let mut q = output.clone();
+                let stem = q
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "emission".to_string());
+                q.set_file_name(format!("{stem}.provenance.json"));
+                q
+            });
+            let reference_source_for_prov = reference_bam.clone();
             let tiers = emission_model::build_emission_from_anchors(
                 anchor_pool,
                 transcript_evidence,
                 output,
                 &fb,
+                universe.as_deref(),
+                tx2g.as_ref(),
             )
             .context("Module 1 build_emission_from_anchors (Universal) failed")?;
             // L1/L2/L3 split, read off the RETURN VALUE rather than scraped
@@ -495,6 +577,71 @@ fn main() -> Result<()> {
                 tiers.l3,
                 tiers.l3 as f64 * 100.0 / n_tx_total,
             );
+
+            // The L1/L2/L3 percentages above keep describing the ANCHORED
+            // population: imputed rows are counted separately so those
+            // percentages stay comparable with every earlier run rather than
+            // silently rebasing onto the padded denominator.
+            //
+            // ---- EMISSION COMPLETENESS -------------------------------------
+            // Four counters, none inferable from the others. The point of
+            // printing `n_emission_after` on its own line is that a reader can
+            // check it against `n_reference` without trusting the summary.
+            let n_anchored = tiers.l1 + tiers.l2 + tiers.l3;
+            let n_after = n_anchored + tiers.n_imputed;
+            eprintln!(
+                "[telescope]  emission completeness: {} anchored, {} unanchored L3-padded ({:.1}%), total {}",
+                n_anchored,
+                tiers.n_imputed,
+                if tiers.n_reference == 0 {
+                    0.0
+                } else {
+                    100.0 * tiers.n_imputed as f64 / tiers.n_reference as f64
+                },
+                n_after,
+            );
+            eprintln!(
+                "[telescope]    n_reference_transcripts: {}",
+                tiers.n_reference
+            );
+            eprintln!("[telescope]    n_emission_before:        {}", n_anchored);
+            eprintln!("[telescope]    n_emission_after:         {}", n_after);
+            eprintln!(
+                "[telescope]    n_imputed_rows:           {}",
+                tiers.n_imputed
+            );
+            if tiers.n_anchored_not_in_reference > 0 {
+                eprintln!(
+                    "[telescope][WARN] {} anchored transcript(s) are absent from the reference universe, so n_emission_after ({}) is NOT the universe size ({}). The universe and the model disagree about which transcripts exist.",
+                    tiers.n_anchored_not_in_reference,
+                    n_after,
+                    tiers.n_reference,
+                );
+            }
+
+            // ---- PROVENANCE SIDECAR -----------------------------------------
+            // The parquet keeps 7 frozen columns, so "where did the universe
+            // come from" and "which rows were imputed" cannot be recorded
+            // inside it. They are recorded here, beside it.
+            //
+            // `reference_checksum` is explicitly null WITH A STATED REASON
+            // rather than omitted: "computed and empty" and "not computed" are
+            // different claims, and a reader must be able to tell them apart.
+            let prov = format!(
+                "{{\n  \"reference_source\": {},\n  \"reference_count\": {},\n  \"reference_checksum\": null,\n  \"reference_checksum_note\": \"not computed: the universe is taken verbatim from the BAM @SQ header, which is the authority by ruling. No reference fasta or GTF was hashed, so `reference_source` identifies a FILE, not a universe; `reference_count` is the checkable quantity.\",\n  \"imputation_rule\": \"cohort_prior\",\n  \"imputed_marker\": \"n_cohort_flnc == 0\",\n  \"schema_columns\": 7,\n  \"n_anchored\": {},\n  \"n_imputed\": {},\n  \"n_total\": {},\n  \"n_anchored_not_in_reference\": {}\n}}\n",
+                match reference_source_for_prov {
+                    Some(ref p) => format!("{:?}", p.display().to_string()),
+                    None => "null".to_string(),
+                },
+                tiers.n_reference,
+                n_anchored,
+                tiers.n_imputed,
+                n_after,
+                tiers.n_anchored_not_in_reference,
+            );
+            std::fs::write(&prov_path, prov)
+                .with_context(|| format!("Failed to write provenance sidecar {:?}", prov_path))?;
+            eprintln!("[telescope]  provenance sidecar: {}", prov_path.display());
             eprintln!("[telescope] done.");
             Ok(())
         }

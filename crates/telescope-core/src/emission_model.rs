@@ -97,6 +97,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+
+use crate::anchor_builder::TxToGene;
 use arrow::array::{
     Array, BooleanArray, BooleanBuilder, Float64Builder, Int32Array, ListArray, StringArray,
     StringBuilder, UInt32Builder,
@@ -683,6 +685,72 @@ pub struct FallbackTierCounts {
     pub l2: usize,
     /// L3: cohort-level fit (always available when ≥1 read).
     pub l3: usize,
+    /// Rows IMPUTED to reach the reference universe: a transcript named by
+    /// `@SQ` that the anchor pool never observed. Zero unless a
+    /// `reference_universe` was supplied.
+    ///
+    /// This is deliberately NOT folded into `l3`. Folding it there would keep
+    /// `l1 + l2 + l3 == rows.len()` true, but it would also silently rebase
+    /// the published tier percentages onto a 70,511-row denominator, turning
+    /// a previously printed `L3=17327 (51.8%)` into `(71.5%)` with no flag and
+    /// no doc change. Keeping it separate means the L1/L2/L3 percentages keep
+    /// describing the ANCHORED population — comparable with every earlier run —
+    /// and a reader who wants the whole table subtracts `n_imputed`.
+    ///
+    /// The partition invariant is therefore four terms, not three:
+    /// `l1 + l2 + l3 + n_imputed == rows.len()`. Pinned by
+    /// `test_l1_l2_l3_tier_attribution_and_split` and by
+    /// `test_padded_rows_are_cohort_fits_not_a_fourth_tier`.
+    pub n_imputed: usize,
+    /// Transcripts named by `reference_universe`. Zero when none was supplied.
+    pub n_reference: usize,
+    /// Anchored transcripts that the reference universe does NOT name.
+    ///
+    /// Non-zero means the model and the alignment reference disagree about
+    /// which transcripts exist, which makes the universe the wrong authority
+    /// and the emitted row count NOT equal to `n_reference`. The CLI warns
+    /// rather than silently reporting a `total` that is not the universe size.
+    pub n_anchored_not_in_reference: usize,
+}
+
+/// The authoritative reference universe: every `@SQ SN` in an alignment
+/// BAM's header, in header order.
+///
+/// WHY A BAM, AND WHY IT IS THE RIGHT AUTHORITY
+/// ------------------------------------------
+/// The emission model is keyed by the transcripts an alignment can name, so
+/// the set of transcripts the alignment CAN name is the only universe that
+/// makes a candidate evaluable. `tx2gene` is not a universe (it maps
+/// transcripts that exist; it does not say which exist), and a hand-kept list
+/// drifts from the reference it claims to describe. HC2 measured
+/// `n(model) - n(@SQ)` drift at exactly 0, which is what makes this
+/// checkable rather than merely defensible.
+///
+/// The BAM is read HEADER-ONLY. No record is touched, so this costs a few
+/// kilobytes of I/O on a multi-gigabyte file.
+pub fn read_reference_universe<P: AsRef<Path>>(bam_path: P) -> Result<Vec<String>> {
+    use std::fs::File;
+    use std::io::BufReader;
+
+    let file = File::open(bam_path.as_ref())
+        .with_context(|| format!("Failed to open reference BAM: {:?}", bam_path.as_ref()))?;
+    let mut reader = noodles_bam::io::Reader::new(BufReader::new(file));
+    let header = reader
+        .read_header()
+        .with_context(|| format!("Failed to read BAM header: {:?}", bam_path.as_ref()))?;
+
+    // `reference_sequences()` is keyed by ReferenceSequenceId and its
+    // iteration order matches the `@SQ` lines, which is what makes the result
+    // deterministic. Names are NOT de-duplicated: SAM requires `@SQ SN` to be
+    // unique, so a duplicate means a malformed file, and silently collapsing
+    // one would turn a corrupt reference into a plausible-looking universe.
+    Ok((0..header.reference_sequences().len())
+        .map(|i| match header.reference_sequences().get_index(i) {
+            Some((name, _)) => name.to_string(),
+            None => String::new(),
+        })
+        .filter(|n| !n.is_empty())
+        .collect())
 }
 
 /// Build `telescope.emission.parquet` from a Universal Mode
@@ -712,6 +780,8 @@ pub fn build_emission_from_anchors<P, Q>(
     transcript_evidence_path: Option<Q>,
     output_path: P,
     fallback: &FallbackConfig,
+    reference_universe: Option<&[String]>,
+    tx_to_gene: Option<&TxToGene>,
 ) -> Result<FallbackTierCounts>
 where
     P: AsRef<Path>,
@@ -791,52 +861,128 @@ where
     let mut mu_builder = Float64Builder::new();
     let mut sigma2_builder = Float64Builder::new();
 
-    // Deterministic output ordering: sort by transcript_id.
+    // THE EMITTED KEY SET. Normally this is the anchor pool's transcripts and
+    // nothing else, which is precisely the defect that padding exists to fix:
+    // a read whose candidate is absent from the table cannot be evaluated, so
+    // it is dropped with no profile row. With a reference universe the set
+    // becomes the UNION, and a universe key with no anchors becomes an imputed
+    // row.
+    //
+    // A universe key that DOES have anchors is reached through `tx_accums`
+    // and therefore takes the anchored path — the union makes a double emit
+    // structurally impossible rather than something a test has to catch.
     let mut tx_keys: Vec<&String> = tx_accums.keys().collect();
+    let mut imputed_keys: std::collections::HashSet<&String> = std::collections::HashSet::new();
+    let mut n_reference = 0usize;
+    let mut n_anchored_not_in_reference = 0usize;
+    if let Some(universe) = reference_universe {
+        n_reference = universe.len();
+        let anchored: std::collections::HashSet<&String> = tx_accums.keys().collect();
+        for tx in universe {
+            if anchored.contains(tx) {
+                continue;
+            }
+            imputed_keys.insert(tx);
+            tx_keys.push(tx);
+        }
+        n_anchored_not_in_reference = anchored.iter().filter(|tx| !universe.contains(tx)).count();
+    }
+
+    // Deterministic output ordering: sort by transcript_id. The union adds
+    // keys that were not in the map, so this sort is what makes the padded
+    // output byte-stable across runs and HashMap iteration orders.
     tx_keys.sort();
 
     let mut n_l1 = 0usize;
     let mut n_l2 = 0usize;
     let mut n_l3 = 0usize;
 
-    for tx_id in tx_keys {
-        let acc = &tx_accums[tx_id];
-        let n = acc.len();
-        // Universal-Mode polyA_frac: anchor filter enforces
-        // pt:i >= 10, so by construction this is 1.0 for any
-        // non-empty transcript. Documented in module docstring.
-        let poly_a_frac = 1.0_f64;
-        let is_poly_a_competent = n > 0;
+    // Captured before the loop consumes the vector: the emitted row count is
+    // the union's size, and it is what the run header must report once a
+    // reference universe makes it differ from `tx_accums.len()`.
+    let n_rows_emitted = tx_keys.len();
 
-        let fit = if n >= fallback.tx_min_reads {
-            n_l1 += 1;
-            // L1: per-tx fit. `n >= tx_min_reads >= 1` implies
-            // `log2_pals` is non-empty, so unwrap is safe.
-            fit_log_normal(&acc.log2_pals).expect("L1 fit must succeed when n >= tx_min_reads >= 1")
-        } else if let Some(gf) = gene_fit.get(&acc.gene_id) {
-            n_l2 += 1;
-            // L2: per-gene fit. Shared across all underpowered txs in gene.
-            *gf
-        } else {
-            n_l3 += 1;
-            // L3: cohort-level fallback (always available).
-            cohort_fit
-        };
+    for tx_id in tx_keys {
+        // IMPUTED ROW. Reached only for a universe key with no anchors, which
+        // the union above guarantees is disjoint from `tx_accums`.
+        //
+        // Every value here is the cohort fit, and `n_cohort_flnc = 0` is the
+        // in-schema marker that says "imputed, not observed" — the 7-column
+        // schema is frozen and gets no eighth column for this.
+        //
+        // `is_polyA_competent = true` is the load-bearing choice and it is NOT
+        // a claim that this transcript was measured to have a poly(A) tail. It
+        // says the row is evaluable: the F3 axiom isolates transcripts with NO
+        // poly(A), and a transcript absent from the anchor pool has not been
+        // shown to be one. HC2 measured `pt >= 10` on 98.23% of the reads
+        // landing on exactly this set, so the isolated case is not what is
+        // being padded.
+        let (gene_id, poly_a_frac, is_poly_a_competent, n_obs, fit) =
+            match tx_accums.get(tx_id.as_str()) {
+                None => {
+                    let gene = tx_to_gene
+                        .and_then(|m| m.get(tx_id).cloned())
+                        .unwrap_or_else(|| (*tx_id).clone());
+                    (
+                        gene,
+                        1.0_f64,
+                        true,
+                        0_u32,
+                        LogNormalFit {
+                            mu: cohort_fit.mu,
+                            sigma2: cohort_fit.sigma2,
+                        },
+                    )
+                }
+                Some(acc) => {
+                    let n = acc.len();
+                    // Universal-Mode polyA_frac: anchor filter enforces
+                    // pt:i >= 10, so by construction this is 1.0 for any
+                    // non-empty transcript. Documented in module docstring.
+                    let fit = if n >= fallback.tx_min_reads {
+                        n_l1 += 1;
+                        // L1: per-tx fit. `n >= tx_min_reads >= 1` implies
+                        // `log2_pals` is non-empty, so unwrap is safe.
+                        fit_log_normal(&acc.log2_pals)
+                            .expect("L1 fit must succeed when n >= tx_min_reads >= 1")
+                    } else if let Some(gf) = gene_fit.get(&acc.gene_id) {
+                        n_l2 += 1;
+                        // L2: per-gene fit. Shared across all underpowered txs in gene.
+                        *gf
+                    } else {
+                        n_l3 += 1;
+                        // L3: cohort-level fallback (always available).
+                        cohort_fit
+                    };
+                    (acc.gene_id.clone(), 1.0_f64, n > 0, n as u32, fit)
+                }
+            };
 
         tx_id_builder.append_value(tx_id);
-        gene_id_builder.append_value(&acc.gene_id);
+        gene_id_builder.append_value(&gene_id);
         frac_builder.append_value(poly_a_frac);
         competent_builder.append_value(is_poly_a_competent);
         // `n_cohort_flnc` := the number of anchor OBSERVATIONS for this
-        // transcript (`acc.len()`), NOT a count of distinct poly(A) lengths
-        // and NOT a cohort-fallback count. Two reads carrying the same
-        // `poly_a_length` are two anchor rows and this value is 2.
+        // transcript, NOT a count of distinct poly(A) lengths and NOT a
+        // cohort-fallback count. Two reads carrying the same `poly_a_length`
+        // are two anchor rows and this value is 2.
         //
-        // Which fallback level produced the row's `(mu, sigma2)` is not
+        // WHICH FALLBACK LEVEL produced the row's `(mu, sigma2)` is not
         // recorded here; it is inferred by comparing `n` against
         // `tx_min_reads` / `gene_min_reads`. Pinned by
         // `test_n_cohort_flnc_counts_observations_not_distinct_lengths`.
-        count_builder.append_value(n as u32);
+        //
+        // `0` NOW HAS A SECOND MEANING, and that is deliberate: it marks an
+        // IMPUTED row, emitted to reach the reference universe for a
+        // transcript the anchor pool never observed. Before reference-universe
+        // padding, `0` was unreachable in this file -- a transcript with no
+        // anchors had no row at all -- so nothing downstream could have been
+        // relying on it. Inside the parquet an imputed row is
+        // indistinguishable from a transcript observed zero times; that is
+        // the accepted cost of the frozen 7-column schema, and the
+        // discriminators live outside it (`FallbackTierCounts::n_imputed` and
+        // the CLI's provenance sidecar).
+        count_builder.append_value(n_obs);
         mu_builder.append_value(fit.mu);
         sigma2_builder.append_value(fit.sigma2);
     }
@@ -875,17 +1021,25 @@ where
     // a number no test can read.
     //
     // The run header stays here because only this function knows how many
-    // cohort reads survived the `em_eligible` filter.
+    // cohort reads survived the `em_eligible` filter. The THIRD number is the
+    // emitted row count: it is NOT `tx_accums.len()` once a reference universe
+    // is supplied, and printing the anchored count alone beside a padded table
+    // would state a row count the file does not have.
     eprintln!(
-        "[telescope]  Universal mode: {} transcripts, {} cohort reads",
+        "[telescope]  Universal mode: {} anchored transcripts, {} cohort reads, \
+         {} rows emitted",
         tx_accums.len(),
         cohort_log2_pals.len(),
+        n_rows_emitted,
     );
 
     Ok(FallbackTierCounts {
         l1: n_l1,
         l2: n_l2,
         l3: n_l3,
+        n_imputed: imputed_keys.len(),
+        n_reference,
+        n_anchored_not_in_reference,
     })
 }
 
@@ -1220,6 +1374,8 @@ mod tests {
             None::<&str>,
             &out_univ,
             &FallbackConfig::default(),
+            None,
+            None,
         )
         .expect("Universal mode run");
 
@@ -1322,7 +1478,7 @@ mod tests {
             gene_min_reads: 30,
             cohort_min_reads: 50,
         };
-        build_emission_from_anchors(&anchor_pool, None::<&str>, &out, &fb)
+        build_emission_from_anchors(&anchor_pool, None::<&str>, &out, &fb, None, None)
             .expect("Universal mode run");
 
         let rows = read_emission_parquet(&out);
@@ -1444,7 +1600,7 @@ mod tests {
         );
 
         let fb = FallbackConfig::default();
-        build_emission_from_anchors(&anchor_pool, Some(&te_path), &out, &fb)
+        build_emission_from_anchors(&anchor_pool, Some(&te_path), &out, &fb, None, None)
             .expect("Universal mode run with em_eligible filter");
 
         let rows = read_emission_parquet(&out);
@@ -1495,8 +1651,15 @@ mod tests {
         let anchor_pool = tmp.join("anchor_pool.parquet");
         let out = tmp.join("emission.parquet");
         write_anchor_pool_parquet(&anchor_pool, &fxs);
-        build_emission_from_anchors(&anchor_pool, None::<&str>, &out, &FallbackConfig::default())
-            .expect("Universal mode run on a duplicate-length transcript");
+        build_emission_from_anchors(
+            &anchor_pool,
+            None::<&str>,
+            &out,
+            &FallbackConfig::default(),
+            None,
+            None,
+        )
+        .expect("Universal mode run on a duplicate-length transcript");
 
         let rows = read_emission_parquet(&out);
         assert_eq!(rows.len(), 1, "one transcript row expected");
@@ -1592,7 +1755,7 @@ mod tests {
             gene_min_reads: 30,
             cohort_min_reads: 50,
         };
-        let tiers = build_emission_from_anchors(&anchor_pool, None::<&str>, &out, &fb)
+        let tiers = build_emission_from_anchors(&anchor_pool, None::<&str>, &out, &fb, None, None)
             .expect("Universal mode run");
 
         // (1) THE SPLIT — read off the return value. This is the assertion
@@ -1603,7 +1766,10 @@ mod tests {
             FallbackTierCounts {
                 l1: 1,
                 l2: 4,
-                l3: 1
+                l3: 1,
+                n_imputed: 0,
+                n_reference: 0,
+                n_anchored_not_in_reference: 0
             },
             "the L1/L2/L3 split: 1 transcript at/above tx_min_reads, 4 sharing a \
              qualifying gene pool, 1 in neither"
@@ -1871,5 +2037,232 @@ mod tests {
                  {b:?} vs {a:?}"
             );
         }
+    }
+    /// PADDING. The emitted row set is the UNION of the anchor pool and the
+    /// reference universe, and an imputed row is the cohort fit marked by
+    /// `n_cohort_flnc == 0`.
+    ///
+    /// These are the assertions the whole feature rests on, and each one has a
+    /// mutation that breaks it:
+    ///
+    /// | claim | breaking mutation |
+    /// |---|---|
+    /// | `rows.len() == |universe|` | drop the imputed arm of the row match |
+    /// | sorted by `transcript_id` | remove `tx_keys.sort()` |
+    /// | imputed rows carry the COHORT fit | fit them from something else |
+    /// | `n_cohort_flnc == 0` on imputed rows | write `1` |
+    /// | an anchored+universe key is emitted ONCE | `if anchored.contains(tx)` -> `if false` |
+    /// | `l1+l2+l3+n_imputed == rows.len()` | count imputed rows in `l3` instead |
+    #[test]
+    fn test_padded_rows_are_cohort_fits_marked_by_a_zero_observation_count() {
+        let tmp = std::env::temp_dir().join("telescope_test_padding");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+
+        // One well-observed transcript -> L1 (>= tx_min_reads = 10).
+        let fxs = vec![TxFixture {
+            gene_id: "gene_a".into(),
+            tx_id: "tx_anchored".into(),
+            pals: vec![80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91],
+        }];
+        let anchor_pool = tmp.join("anchor_pool.parquet");
+        let out = tmp.join("emission.parquet");
+        write_anchor_pool_parquet(&anchor_pool, &fxs);
+
+        // Deliberately NOT sorted, and `tx_anchored` IS in the universe, so
+        // the test also covers the intersection rather than only the padding.
+        let universe: Vec<String> =
+            vec!["tx_anchored".into(), "tx_pad_b".into(), "tx_pad_a".into()];
+        let tiers = build_emission_from_anchors(
+            &anchor_pool,
+            None::<&str>,
+            &out,
+            &FallbackConfig::default(),
+            Some(&universe),
+            None,
+        )
+        .expect("Universal mode run with a reference universe");
+
+        let rows = read_emission_parquet(&out);
+        assert_eq!(
+            rows.len(),
+            3,
+            "the emitted set is the UNION: 1 anchored + 2 imputed, and the \\
+             intersection transcript must not be emitted twice. rows={rows:?}"
+        );
+        assert_eq!(tiers.n_imputed, 2);
+        assert_eq!(tiers.n_reference, 3);
+        assert_eq!(tiers.n_anchored_not_in_reference, 0);
+
+        // Deterministic ordering. The union adds keys the map never had, so
+        // this sort is what makes a padded build byte-stable.
+        let ids: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["tx_anchored", "tx_pad_a", "tx_pad_b"],
+            "output must be sorted by transcript_id regardless of the universe's \\
+             input order"
+        );
+
+        // The anchored row keeps its own fit and its own observation count.
+        assert_eq!(rows[0].4, 12, "12 anchor observations");
+        assert!(rows[0].3, "observed transcripts are competent");
+
+        // The cohort fit, computed by calling the SAME private helper the
+        // build calls, so the expectation cannot drift from the code.
+        let cohort_in: Vec<f64> = (80..=91).map(|p| (p as f64).log2()).collect();
+        let cohort = cohort_log_normal_fit(&cohort_in).expect("cohort fit");
+        for r in &rows[1..] {
+            assert_eq!(
+                r.4, 0,
+                "an IMPUTED row is marked by n_cohort_flnc == 0, which is the only \\
+                 in-schema signal available under the frozen 7-column schema"
+            );
+            assert!(
+                r.3,
+                "imputed rows are is_polyA_competent == true: the row asserts the \\
+                 transcript is EVALUABLE, not that its poly(A) was measured"
+            );
+            assert_eq!(r.1, r.0, "no tx2gene supplied, so gene_id := transcript_id");
+            assert_eq!(r.2, 1.0, "polyA_frac");
+            assert!(
+                (r.5 - cohort.mu).abs() < 1e-12,
+                "an imputed row carries the COHORT mu, not a fit of its own. \
+                 got {} want {}",
+                r.5,
+                cohort.mu
+            );
+            assert!(
+                (r.6 - cohort.sigma2).abs() < 1e-12,
+                "an imputed row carries the COHORT sigma2. got {} want {}",
+                r.6,
+                cohort.sigma2
+            );
+        }
+        // And the imputed rows are NOT the anchored transcript's fit: if they
+        // were, the assertion above would pass for the wrong reason whenever
+        // the two happened to coincide.
+        assert!(
+            (rows[0].5 - rows[1].5).abs() > 1e-9,
+            "CONTROL: the anchored mu must differ from the cohort mu, or the \\
+             cohort assertion above is vacuous. anchored={} cohort={}",
+            rows[0].5,
+            rows[1].5
+        );
+
+        // THE PARTITION IS FOUR TERMS NOW, not three. This is the invariant
+        // that keeps `n_imputed` from being double-counted or dropped.
+        assert_eq!(
+            tiers.l1 + tiers.l2 + tiers.l3 + tiers.n_imputed,
+            rows.len(),
+            "l1 + l2 + l3 + n_imputed must partition the output rows"
+        );
+        assert_eq!(
+            tiers.l1 + tiers.l2 + tiers.l3,
+            1,
+            "the tier counters describe the ANCHORED population only. Folding \\
+             imputed rows into l3 would silently rebase every published tier \\
+             percentage onto the padded denominator."
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The universe and the model can disagree about which transcripts exist.
+    /// When they do, `n_emission_after` is NOT the universe size, and saying so
+    /// is the difference between a warning and a wrong `total` nobody checks.
+    #[test]
+    fn test_anchored_transcripts_absent_from_the_universe_are_counted_not_dropped() {
+        let tmp = std::env::temp_dir().join("telescope_test_drift");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+
+        let fxs = vec![TxFixture {
+            gene_id: "gene_a".into(),
+            tx_id: "tx_anchored".into(),
+            pals: vec![80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91],
+        }];
+        let anchor_pool = tmp.join("anchor_pool.parquet");
+        let out = tmp.join("emission.parquet");
+        write_anchor_pool_parquet(&anchor_pool, &fxs);
+
+        // The universe knows nothing about the one anchored transcript.
+        let universe: Vec<String> = vec!["tx_pad_a".into()];
+        let tiers = build_emission_from_anchors(
+            &anchor_pool,
+            None::<&str>,
+            &out,
+            &FallbackConfig::default(),
+            Some(&universe),
+            None,
+        )
+        .expect("Universal mode run with a disagreeing universe");
+
+        assert_eq!(
+            tiers.n_anchored_not_in_reference, 1,
+            "the drift is COUNTED. Silently dropping the anchored row would make \\
+             the emitted table disagree with the model that produced it."
+        );
+        assert_eq!(tiers.n_reference, 1);
+        assert_eq!(tiers.n_imputed, 1);
+        let rows = read_emission_parquet(&out);
+        assert_eq!(
+            rows.len(),
+            2,
+            "the anchored row is still emitted: the union is a UNION. rows={rows:?}"
+        );
+        assert_eq!(rows[0].0, "tx_anchored", "sorted first");
+        assert_eq!(rows[1].4, 0, "tx_pad_a is the imputed one");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `n == 0` inside the parquet is now ambiguous on purpose, and this pins
+    /// the ambiguity rather than leaving it to a reader to discover: with a
+    /// universe, `0` means "imputed"; without one, it cannot occur at all.
+    ///
+    /// The two conditions are DISJOINT by construction, which is what makes a
+    /// single marker usable: there is no run in which a `0` is ambiguous
+    /// between "imputed" and "observed zero times", because the second cannot
+    /// occur while the first is possible.
+    #[test]
+    fn test_without_a_universe_no_row_is_imputed() {
+        let tmp = std::env::temp_dir().join("telescope_test_nopad");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+
+        let fxs = vec![TxFixture {
+            gene_id: "gene_a".into(),
+            tx_id: "tx_only".into(),
+            pals: vec![80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91],
+        }];
+        let anchor_pool = tmp.join("anchor_pool.parquet");
+        let out = tmp.join("emission.parquet");
+        write_anchor_pool_parquet(&anchor_pool, &fxs);
+        let tiers = build_emission_from_anchors(
+            &anchor_pool,
+            None::<&str>,
+            &out,
+            &FallbackConfig::default(),
+            None,
+            None,
+        )
+        .expect("Universal mode run without a universe");
+
+        assert_eq!(tiers.n_imputed, 0);
+        assert_eq!(tiers.n_reference, 0);
+        assert_eq!(tiers.n_anchored_not_in_reference, 0);
+        let rows = read_emission_parquet(&out);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].4, 12,
+            "12 anchor observations, so this column is not 0 in an unpadded build"
+        );
+        assert!(
+            rows.iter().all(|r| r.4 > 0),
+            "every row in an unpadded build has at least one observation"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
