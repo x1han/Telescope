@@ -677,7 +677,7 @@ fn read_anchor_pool_parquet<P: AsRef<Path>>(
 /// left the whole test suite green while changing the number a reader of the
 /// run compares across arms. The counters are returned so that both the CLI and
 /// a test read the same value from the same place.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FallbackTierCounts {
     /// L1: `n_reads_tx >= fallback.tx_min_reads` — per-transcript fit.
     pub l1: usize,
@@ -711,6 +711,12 @@ pub struct FallbackTierCounts {
     /// and the emitted row count NOT equal to `n_reference`. The CLI warns
     /// rather than silently reporting a `total` that is not the universe size.
     pub n_anchored_not_in_reference: usize,
+    /// Absolute path of the per-transcript provenance sidecar just written.
+    ///
+    /// Returned rather than only logged: the sidecar is a product of this
+    /// function, and a product whose path only exists on stderr cannot be
+    /// opened by the test that is supposed to check it.
+    pub provenance_path: std::path::PathBuf,
 }
 
 /// The authoritative reference universe: every `@SQ SN` in an alignment
@@ -751,6 +757,94 @@ pub fn read_reference_universe<P: AsRef<Path>>(bam_path: P) -> Result<Vec<String
         })
         .filter(|n| !n.is_empty())
         .collect())
+}
+
+/// The four provenance tiers, exactly as written into
+/// `<stem>.provenance.parquet`'s `tier` column.
+///
+/// WHY THESE FOUR AND NOT THREE. The L1/L2/L3 cascade has three levels, and
+/// an IMPUTED row is not one of them: it has no anchors at all, so it never
+/// entered the cascade. Folding it into `L3` would make "L3" mean both "this
+/// transcript's own gene pool was too small" and "this transcript was never
+/// observed", which are different facts with different consequences downstream.
+/// `L3_imputed` and `L3_anchored` are therefore separate enum values even
+/// though both carry the cohort fit.
+pub const TIER_L1: &str = "L1";
+pub const TIER_L2: &str = "L2";
+pub const TIER_L3_ANCHORED: &str = "L3_anchored";
+pub const TIER_L3_IMPUTED: &str = "L3_imputed";
+
+/// Schema of the per-transcript provenance sidecar: exactly four columns.
+///
+/// Deliberately NOT a column of `telescope.emission.parquet`. That schema is
+/// frozen at seven columns, and the question this table answers — which
+/// fallback level produced this row's `(mu, sigma2)` — is not answerable from
+/// `n_cohort_flnc` alone, because L2 is decided by the GENE's pooled count
+/// while the parquet only carries the TRANSCRIPT's own count. The
+/// discriminators have to live outside the frozen file.
+pub fn provenance_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("transcript_id", DataType::Utf8, false),
+        Field::new("gene_id", DataType::Utf8, false),
+        Field::new("tier", DataType::Utf8, false),
+        Field::new("n_anchor", DataType::UInt32, false),
+    ]))
+}
+
+/// Write the per-transcript provenance sidecar next to the emission parquet.
+///
+/// `rows` MUST already be sorted strictly ascending by `transcript_id`, and
+/// MUST be the same key set as the emission file, in the same order. Both
+/// invariants hold by construction at the call site in
+/// [`build_emission_from_anchors`], where the row loop iterates one sorted
+/// `tx_keys` vector and appends to both builders in lockstep.
+///
+/// The file name is derived from `emission_path` by replacing `.parquet`
+/// with `.provenance.parquet`, so `<stem>.emission.parquet` produces
+/// `<stem>.emission.provenance.parquet`. The path is RETURNED as well as
+/// written, because a path that only reaches stderr is a path no test can
+/// open.
+pub fn write_provenance_parquet<P: AsRef<Path>>(
+    emission_path: P,
+    rows: &[(String, String, &'static str, u32)],
+) -> Result<std::path::PathBuf> {
+    let emission_path = emission_path.as_ref();
+    let out_path = emission_path.with_extension("provenance.parquet");
+
+    let mut tx_b = StringBuilder::new();
+    let mut gene_b = StringBuilder::new();
+    let mut tier_b = StringBuilder::new();
+    let mut n_b = UInt32Builder::new();
+    for (tx, gene, tier, n) in rows {
+        tx_b.append_value(tx);
+        gene_b.append_value(gene);
+        tier_b.append_value(*tier);
+        n_b.append_value(*n);
+    }
+
+    let schema = provenance_schema();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(tx_b.finish()),
+            Arc::new(gene_b.finish()),
+            Arc::new(tier_b.finish()),
+            Arc::new(n_b.finish()),
+        ],
+    )
+    .context("Failed to build provenance RecordBatch")?;
+    let out_file = File::create(&out_path)
+        .with_context(|| format!("Failed to create provenance parquet {:?}", out_path))?;
+    let props = WriterProperties::builder().build();
+    let mut writer = ArrowWriter::try_new(out_file, schema, Some(props))
+        .context("Failed to create provenance ArrowWriter")?;
+    writer
+        .write(&batch)
+        .context("Failed to write provenance batch")?;
+    writer
+        .close()
+        .context("Failed to close provenance writer")?;
+    Ok(out_path)
 }
 
 /// Build `telescope.emission.parquet` from a Universal Mode
@@ -860,6 +954,12 @@ where
     let mut count_builder = UInt32Builder::new();
     let mut mu_builder = Float64Builder::new();
     let mut sigma2_builder = Float64Builder::new();
+    // Provenance sidecar, built in lockstep with the emission row below. It is
+    // a SEPARATE FILE, not an eighth column: the 7-column emission schema is
+    // frozen, and `n_cohort_flnc == 0` is the only in-schema marker of an
+    // imputed row, so the fallback LEVEL that produced an ANCHORED row's
+    // `(mu, sigma2)` is not recoverable from the parquet itself.
+    let mut tier_builder = StringBuilder::new();
 
     // THE EMITTED KEY SET. Normally this is the anchor pool's transcripts and
     // nothing else, which is precisely the defect that padding exists to fix:
@@ -902,6 +1002,14 @@ where
     // reference universe makes it differ from `tx_accums.len()`.
     let n_rows_emitted = tx_keys.len();
 
+    // The same rows, in the same order, as a plain Vec. This is the ONLY place
+    // the two tables are kept in step, which is why the sidecar is written
+    // from here rather than re-derived by re-reading the parquet back: a
+    // re-read would be a second code path that could disagree with the first
+    // and there would be nothing to catch it.
+    let mut provenance_rows: Vec<(String, String, &'static str, u32)> =
+        Vec::with_capacity(n_rows_emitted);
+
     for tx_id in tx_keys {
         // IMPUTED ROW. Reached only for a universe key with no anchors, which
         // the union above guarantees is disjoint from `tx_accums`.
@@ -917,7 +1025,7 @@ where
         // shown to be one. HC2 measured `pt >= 10` on 98.23% of the reads
         // landing on exactly this set, so the isolated case is not what is
         // being padded.
-        let (gene_id, poly_a_frac, is_poly_a_competent, n_obs, fit) =
+        let (gene_id, poly_a_frac, is_poly_a_competent, n_obs, fit, tier) =
             match tx_accums.get(tx_id.as_str()) {
                 None => {
                     let gene = tx_to_gene
@@ -932,6 +1040,7 @@ where
                             mu: cohort_fit.mu,
                             sigma2: cohort_fit.sigma2,
                         },
+                        TIER_L3_IMPUTED,
                     )
                 }
                 Some(acc) => {
@@ -939,22 +1048,25 @@ where
                     // Universal-Mode polyA_frac: anchor filter enforces
                     // pt:i >= 10, so by construction this is 1.0 for any
                     // non-empty transcript. Documented in module docstring.
-                    let fit = if n >= fallback.tx_min_reads {
+                    let (fit, tier) = if n >= fallback.tx_min_reads {
                         n_l1 += 1;
                         // L1: per-tx fit. `n >= tx_min_reads >= 1` implies
                         // `log2_pals` is non-empty, so unwrap is safe.
-                        fit_log_normal(&acc.log2_pals)
-                            .expect("L1 fit must succeed when n >= tx_min_reads >= 1")
+                        (
+                            fit_log_normal(&acc.log2_pals)
+                                .expect("L1 fit must succeed when n >= tx_min_reads >= 1"),
+                            TIER_L1,
+                        )
                     } else if let Some(gf) = gene_fit.get(&acc.gene_id) {
                         n_l2 += 1;
                         // L2: per-gene fit. Shared across all underpowered txs in gene.
-                        *gf
+                        (*gf, TIER_L2)
                     } else {
                         n_l3 += 1;
                         // L3: cohort-level fallback (always available).
-                        cohort_fit
+                        (cohort_fit, TIER_L3_ANCHORED)
                     };
-                    (acc.gene_id.clone(), 1.0_f64, n > 0, n as u32, fit)
+                    (acc.gene_id.clone(), 1.0_f64, n > 0, n as u32, fit, tier)
                 }
             };
 
@@ -985,6 +1097,8 @@ where
         count_builder.append_value(n_obs);
         mu_builder.append_value(fit.mu);
         sigma2_builder.append_value(fit.sigma2);
+        tier_builder.append_value(tier);
+        provenance_rows.push((tx_id.clone(), gene_id.clone(), tier, n_obs));
     }
 
     let schema = output_schema();
@@ -1033,6 +1147,10 @@ where
         n_rows_emitted,
     );
 
+    // Written AFTER the emission parquet so that a failure here cannot leave a
+    // provenance file describing a model that was never emitted.
+    let provenance_path = write_provenance_parquet(output_path.as_ref(), &provenance_rows)?;
+
     Ok(FallbackTierCounts {
         l1: n_l1,
         l2: n_l2,
@@ -1040,13 +1158,14 @@ where
         n_imputed: imputed_keys.len(),
         n_reference,
         n_anchored_not_in_reference,
+        provenance_path,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int32Builder, ListBuilder};
+    use arrow::array::{Int32Builder, ListBuilder, UInt32Array};
 
     #[test]
     fn min_cohort_variance_value() {
@@ -1231,6 +1350,52 @@ mod tests {
     /// Read `telescope.emission.parquet` back into a
     /// `Vec<(transcript_id, mu, sigma2, n_cohort_flnc, polyA_frac, is_polyA_competent)>`
     /// for assertions. Sorted by `transcript_id`.
+    /// Read the provenance sidecar back as (transcript_id, gene_id, tier,
+    /// n_anchor). Deliberately a SEPARATE reader from `read_emission_parquet`
+    /// so the test is not comparing one in-memory vector against itself.
+    fn read_provenance_parquet(path: &Path) -> Vec<(String, String, String, u32)> {
+        let f = File::open(path).expect("open provenance parquet");
+        let b = ParquetRecordBatchReaderBuilder::try_new(f).expect("init provenance reader");
+        let mut reader = b.with_batch_size(8192).build().expect("build");
+        let mut out = Vec::new();
+        for batch in reader {
+            let batch = batch.expect("provenance batch");
+            let tx = batch
+                .column_by_name("transcript_id")
+                .expect("tx")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("tx str");
+            let gene = batch
+                .column_by_name("gene_id")
+                .expect("gene")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("gene str");
+            let tier = batch
+                .column_by_name("tier")
+                .expect("tier")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("tier str");
+            let n = batch
+                .column_by_name("n_anchor")
+                .expect("n_anchor")
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .expect("n_anchor u32");
+            for i in 0..batch.num_rows() {
+                out.push((
+                    tx.value(i).to_string(),
+                    gene.value(i).to_string(),
+                    tier.value(i).to_string(),
+                    n.value(i),
+                ));
+            }
+        }
+        out
+    }
+
     fn read_emission_parquet(path: &Path) -> Vec<(String, String, f64, bool, u32, f64, f64)> {
         let f = File::open(path).expect("open emission parquet");
         let b = ParquetRecordBatchReaderBuilder::try_new(f).expect("init reader");
@@ -1769,7 +1934,10 @@ mod tests {
                 l3: 1,
                 n_imputed: 0,
                 n_reference: 0,
-                n_anchored_not_in_reference: 0
+                n_anchored_not_in_reference: 0,
+                // Pinned against the naming rule rather than against the
+                // value the function returned, which would be a tautology.
+                provenance_path: out.with_extension("provenance.parquet"),
             },
             "the L1/L2/L3 split: 1 transcript at/above tx_min_reads, 4 sharing a \
              qualifying gene pool, 1 in neither"
@@ -2053,6 +2221,147 @@ mod tests {
     /// | `n_cohort_flnc == 0` on imputed rows | write `1` |
     /// | an anchored+universe key is emitted ONCE | `if anchored.contains(tx)` -> `if false` |
     /// | `l1+l2+l3+n_imputed == rows.len()` | count imputed rows in `l3` instead |
+    #[test]
+    /// THE PROVENANCE SIDECAR IS THE ONLY PLACE THE FALLBACK LEVEL IS WRITTEN
+    /// DOWN. `n_cohort_flnc` cannot recover it: L2 is decided by the GENE's
+    /// pooled count, and the frozen parquet carries only the TRANSCRIPT's own
+    /// count. So if the tier column is wrong, every downstream `tier` join is
+    /// wrong, and nothing else in the file would notice.
+    ///
+    /// This reads the sidecar back from disk with its own reader and checks
+    /// three things separately, because they fail differently:
+    ///   * the key set and ORDER match the emission parquet exactly (an
+    ///     unordered or short sidecar turns the downstream join into a
+    ///     different, wrong join);
+    ///   * `n_anchor == 0` if and only if the tier is `L3_imputed` (the two
+    ///     encodings of "imputed" must not drift apart);
+    ///   * the tier histogram reproduces `FallbackTierCounts` (the counters the
+    ///     CLI prints must describe the same partition the file records).
+    #[test]
+    fn test_provenance_sidecar_agrees_with_the_emission_rows_row_by_row() {
+        let tmp = std::env::temp_dir().join("telescope_test_provenance");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+
+        // All three anchored tiers in one fixture, plus two imputed keys.
+        //
+        // L2 is the hard one to reach and getting it wrong is silent: it needs
+        // the GENE's pooled count over `gene_min_reads` while the TRANSCRIPT's
+        // own count is under `tx_min_reads`. An earlier version of this fixture
+        // had 12 + 3 reads in gene_a against a default `gene_min_reads` of 30,
+        // so no gene fit existed at all and `tx_l2` silently became L3_anchored.
+        // The row-by-row assertions still passed; only the `n_l2 > 0` CONTROL
+        // below caught it, which is the reason that control is here.
+        //
+        //   tx_l1  12 reads           >= 10            -> L1
+        //   tx_l3  20 reads           >= 10            -> L1
+        //   tx_l2   3 reads           <  10, gene_a    -> L2
+        //   gene_a pool 12+3+20 = 35 >= 30
+        let fxs = vec![
+            TxFixture {
+                gene_id: "gene_a".into(),
+                tx_id: "tx_l1".into(),
+                pals: (80..=91).collect::<Vec<i32>>(),
+            },
+            TxFixture {
+                gene_id: "gene_a".into(),
+                tx_id: "tx_l2".into(),
+                pals: vec![80, 81, 82],
+            },
+            TxFixture {
+                gene_id: "gene_a".into(),
+                tx_id: "tx_l3".into(),
+                pals: (100..=119).collect::<Vec<i32>>(),
+            },
+        ];
+        let anchor_pool = tmp.join("anchor_pool.parquet");
+        let out = tmp.join("emission.parquet");
+        write_anchor_pool_parquet(&anchor_pool, &fxs);
+
+        let universe: Vec<String> = vec![
+            "tx_l1".into(),
+            "tx_l2".into(),
+            "tx_l3".into(),
+            "tx_pad_b".into(),
+            "tx_pad_a".into(),
+        ];
+        let tiers = build_emission_from_anchors(
+            &anchor_pool,
+            None::<&str>,
+            &out,
+            &FallbackConfig::default(),
+            Some(&universe),
+            None,
+        )
+        .expect("Universal mode run");
+
+        assert_eq!(
+            tiers.provenance_path,
+            out.with_extension("provenance.parquet"),
+            "the sidecar is named from the emission file name"
+        );
+
+        let prov = read_provenance_parquet(&tiers.provenance_path);
+        let emission = read_emission_parquet(&out);
+
+        assert_eq!(
+            prov.len(),
+            emission.len(),
+            "the sidecar must have exactly one row per emission row"
+        );
+        for (p, e) in prov.iter().zip(emission.iter()) {
+            assert_eq!(
+                p.0, e.0,
+                "sidecar and emission must agree on transcript_id IN ORDER; a \
+                 sidecar sorted differently turns every downstream join into a \
+                 different join"
+            );
+            assert_eq!(p.1, e.1, "gene_id must agree row by row");
+        }
+        assert!(
+            prov.windows(2).all(|w| w[0].0 < w[1].0),
+            "the sidecar must be STRICTLY ascending by transcript_id: {:?}",
+            prov
+        );
+
+        for (tx, gene, tier, n_anchor) in &prov {
+            let imputed = *tier == TIER_L3_IMPUTED;
+            assert_eq!(
+                *n_anchor == 0,
+                imputed,
+                "{tx}: n_anchor == 0 must mean exactly 'imputed', and this row \
+                 is tier {tier} with n_anchor {n_anchor} (gene {gene})"
+            );
+        }
+
+        let n_l1 = prov.iter().filter(|r| r.2 == TIER_L1).count();
+        let n_l2 = prov.iter().filter(|r| r.2 == TIER_L2).count();
+        let n_l3a = prov.iter().filter(|r| r.2 == TIER_L3_ANCHORED).count();
+        let n_l3i = prov.iter().filter(|r| r.2 == TIER_L3_IMPUTED).count();
+        assert_eq!(
+            (n_l1, n_l2, n_l3a, n_l3i),
+            (tiers.l1, tiers.l2, tiers.l3, tiers.n_imputed),
+            "the tier histogram in the file must reproduce the counters the CLI \
+             prints. counters=({}, {}, {}, {}) file=({}, {}, {}, {})",
+            tiers.l1,
+            tiers.l2,
+            tiers.l3,
+            tiers.n_imputed,
+            n_l1,
+            n_l2,
+            n_l3a,
+            n_l3i
+        );
+        assert_eq!(n_l3i, 2, "the fixture pads exactly two transcripts");
+        assert!(
+            n_l1 > 0 && n_l2 > 0,
+            "CONTROL: the fixture must exercise L1 and L2, or the L2 row above \
+             is not actually testing the L2 label. l1={n_l1} l2={n_l2}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn test_padded_rows_are_cohort_fits_marked_by_a_zero_observation_count() {
         let tmp = std::env::temp_dir().join("telescope_test_padding");

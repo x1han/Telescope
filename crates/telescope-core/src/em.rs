@@ -24,7 +24,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use arrow::array::{
     BooleanArray, Float32Builder, Float64Array, Float64Builder, Int32Builder, StringArray,
-    StringBuilder, UInt16Builder, UInt32Array, UInt32Builder,
+    StringBuilder, UInt16Builder, UInt32Array,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -2061,7 +2061,7 @@ mod tests {
 
     use std::path::PathBuf;
 
-    use arrow::array::{Array, BooleanBuilder, Int64Array};
+    use arrow::array::{Array, BooleanBuilder, Int64Array, UInt32Builder};
 
     use crate::evidence::MoleculeEvidence;
 
@@ -5664,11 +5664,10 @@ mod tests {
 
         // Cleanup AFTER both runs, not inside the closure: a solve that failed
         // would otherwise have already deleted the fixture it was reading.
+        //
+        // The guard is not optional: the fixture must actually produce a
+        // degenerate read, or every assertion below is a statement about zero.
         let (all_imputed, e1, p1) = run(0, "imputed");
-
-        // Guard: the fixture must actually produce a degenerate read, or both
-        // of the assertions below are about zero.
-        let (all_imputed, _e1, _p1) = run(0, "imputed");
         assert!(
             all_imputed.n_entropy_degenerate > 0,
             "FIXTURE IS BROKEN: four identical candidates must give H = ln 4 > 0.70, \
@@ -5702,6 +5701,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn test_drop_taxonomy_attributes_every_lost_read_to_exactly_one_cause() {
         let log_pal = (100.0_f32).log2();
         let emission = scratch("drop_taxonomy_emission.parquet");

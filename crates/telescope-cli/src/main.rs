@@ -388,6 +388,20 @@ enum Cmd {
         /// Output `telescope.sample_summary.parquet`.
         #[arg(long)]
         output: PathBuf,
+
+        /// Per-transcript provenance sidecar from `build-emission`
+        /// (`<stem>.emission.provenance.parquet`).
+        ///
+        /// OPTIONAL, and the difference is not cosmetic. Without it the key set
+        /// is whatever the profile happens to contain, which is an INNER JOIN
+        /// against the reference universe: a transcript no read landed on is
+        /// absent from the output entirely. With it, every transcript in the
+        /// universe gets a row, zero-filled, carrying its `tier` and
+        /// `n_anchor` -- which is what Tier 3 needs, because NanoCount
+        /// transcripts that are missing there must be filled with 0 rather than
+        /// dropped by a join.
+        #[arg(long)]
+        provenance: Option<PathBuf>,
     },
 
     /// D1 Universal Mode: build poly(A) anchor pool from BAMs (no AIDRS needed).
@@ -1104,11 +1118,18 @@ fn main() -> Result<()> {
             eprintln!("[telescope] done.");
             Ok(())
         }
-        Cmd::Summarize { profile, output } => {
+        Cmd::Summarize {
+            profile,
+            output,
+            provenance,
+        } => {
             eprintln!("[telescope] Profile Summary Engine");
             eprintln!("  profile: {}", profile.display());
             eprintln!("  output:  {}", output.display());
-            summary::summarize_profile_parquet(&profile, &output)
+            if let Some(p) = &provenance {
+                eprintln!("  provenance: {}", p.display());
+            }
+            summary::summarize_profile_parquet(&profile, &output, provenance.as_deref())
                 .context("summary::summarize_profile_parquet failed")?;
             eprintln!("[telescope] done.");
             Ok(())
