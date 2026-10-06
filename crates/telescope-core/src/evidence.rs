@@ -56,6 +56,93 @@ pub struct MoleculeEvidence {
 /// (`resolver::pool_evidence_graphs`) desynchronises a pool from
 /// `candidate_pool` and reads it from the wrong BAM's coordinate frame; the
 /// only guard is a `debug_assert_eq!`, which is compiled out in release.
+/// Record-level accounting for the filters in `extract_evidence_with`.
+///
+/// WHY A LEDGER AND NOT A COUNTER
+/// ------------------------------
+/// The expert ruling (2026-10-06, Q5) asked for a counter of records lost
+/// during evidence extraction, to be exposed as statistics. The first draft of
+/// that work put the counter at the `entry.candidates.is_empty()` guard, which
+/// turns out to be **structurally unreachable**: an entry is only ever created
+/// by `or_insert_with` immediately before a `push`, with no `continue` or
+/// `return` in between, so every entry has `candidates.len() >= 1` forever. A
+/// counter there would have read 0 for every input, which is worse than no
+/// counter -- it would have been reported as a measurement.
+///
+/// A single counter is also not enough. This function drops records at SIX
+/// distinct sites, and a count of only the largest one leaves a residual that
+/// no reader can attribute: it is indistinguishable from a bug. So this is a
+/// closed ledger, not a tally -- `ledger_deficit()` is asserted to be 0 inside
+/// the library before the graph is returned, which makes a future new drop
+/// site FAIL LOUDLY at the point it is added instead of quietly skewing one
+/// number forever.
+///
+/// SCOPE, stated precisely because it is easy to over-claim
+/// -------------------------------------------------------
+/// These are RECORD counts, not read counts and not candidate counts. One read
+/// contributes 1 record per alignment it has, so `records_entered` exceeds the
+/// molecule count and `dropped_tes_window` is a property of alignments, not of
+/// molecules. The record-level `records_with_candidates` is NOT the molecule
+/// count either: the push below is a MERGE, so a second record for the same
+/// (read, transcript) contributes 1 here and 0 new molecules. The candidate
+/// conservation law lives in `em::CandidateLedger`, which is a different and
+/// finer-grained accounting at a different stage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FilterCounts {
+    /// Every record read from the BAM, before any filter. The LHS of the
+    /// identity below.
+    pub records_entered: u64,
+    /// `FLAG & 4` -- carries no alignment evidence.
+    pub dropped_unmapped: u64,
+    /// `FLAG & 2048` -- dropped, not merged (see the SAM-semantics note at the
+    /// filter; merging a split read's segments is unsound from a transcriptome
+    /// BAM alone).
+    pub dropped_supplementary: u64,
+    /// The requested poly(A) tag is absent or unparseable on this record.
+    pub dropped_no_poly_a_tag: u64,
+    /// The poly(A) tag parsed to a non-positive value or to one above
+    /// `i32::MAX`. Distinct from the above because the extraction SUCCEEDED
+    /// and the value was rejected.
+    pub dropped_invalid_poly_a: u64,
+    /// `alignment_span()` returned `None` or `Err` -- the CIGAR could not be
+    /// resolved to a reference span.
+    pub dropped_no_span: u64,
+    /// The span resolved to 0.
+    pub dropped_empty_span: u64,
+    /// 3' TES boundary: the alignment ends more than `tes_slack` before the
+    /// transcript's 3' end.
+    pub dropped_tes_window: u64,
+    /// Records that survived every filter and reached candidate construction.
+    ///
+    /// This is the identity's RHS, and it is a RECORD count: a record whose
+    /// (read, transcript) pair already exists is merged away here and adds no
+    /// molecule. See the scope note above.
+    pub records_with_candidates: u64,
+}
+
+impl FilterCounts {
+    /// Sum of every drop bucket.
+    pub fn dropped_total(&self) -> u64 {
+        self.dropped_unmapped
+            + self.dropped_supplementary
+            + self.dropped_no_poly_a_tag
+            + self.dropped_invalid_poly_a
+            + self.dropped_no_span
+            + self.dropped_empty_span
+            + self.dropped_tes_window
+    }
+
+    /// `records_entered - (dropped_total + records_with_candidates)`.
+    ///
+    /// MUST be 0. A non-zero value means a record left the stream through a
+    /// path that is not in the ledger -- an early `return`, a `?`, or a drop
+    /// site added without its counter. This is the assertion that gives the
+    /// other seven fields their meaning.
+    pub fn ledger_deficit(&self) -> i64 {
+        self.records_entered as i64 - (self.dropped_total() + self.records_with_candidates) as i64
+    }
+}
+
 #[derive(Debug)]
 pub struct FlatEvidenceGraph {
     pub molecules: Vec<MoleculeEvidence>,
@@ -99,6 +186,11 @@ pub struct FlatEvidenceGraph {
     /// 0, but `solve_and_write_profile` is a public function and a library
     /// caller never touches the CLI.
     pub poly_a_is_placeholder: bool,
+    /// Record-level filter ledger for the extraction that produced this graph.
+    /// See [`FilterCounts`] for why this is a closed identity rather than a
+    /// single tally, and for what these counts are NOT (they are not reads and
+    /// not molecules).
+    pub stats: FilterCounts,
 }
 
 /// Where per-read poly(A) length comes from.
@@ -238,6 +330,11 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
     let mut poly_a_records_seen: u64 = 0;
     let mut poly_a_hits: u64 = 0;
 
+    // Record-level filter ledger. Asserted closed at the end of this function
+    // (`fc.ledger_deficit() == 0`), so adding a drop site without its counter
+    // fails the build's next test run instead of silently skewing a number.
+    let mut fc = FilterCounts::default();
+
     // Temporary per-read accumulator.
     //
     // MEMORY (COPD29, 16.4 GB BAM): adding A_rk moved peak RSS 2.99 GB → ~4.1 GB.
@@ -292,9 +389,11 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
 
     let mut record = bam::Record::default();
     while reader.read_record(&mut record)? != 0 {
+        fc.records_entered += 1;
         // Skip unmapped reads — they carry no alignment evidence.
         let flags = record.flags();
         if flags.is_unmapped() {
+            fc.dropped_unmapped += 1;
             continue;
         }
         // SUPPLEMENTARY (`FLAG & 2048`) records are DROPPED, not merged.
@@ -345,6 +444,7 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
         // expert ruling that required this filter was right, and its priority
         // is F1/F2 rather than the path being developed today.
         if flags.is_supplementary() {
+            fc.dropped_supplementary += 1;
             continue;
         }
 
@@ -394,9 +494,15 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
             PolyASource::BamTag(tag) => match data.get(tag) {
                 Some(Ok(value)) => match value.as_int() {
                     Some(len) if len > 0 && len <= i32::MAX as i64 => len as i32,
-                    _ => continue, // skip non-positive or >i32::MAX
+                    _ => {
+                        fc.dropped_invalid_poly_a += 1;
+                        continue; // skip non-positive or >i32::MAX
+                    }
                 },
-                _ => continue, // skip missing or unparseable tag
+                _ => {
+                    fc.dropped_no_poly_a_tag += 1;
+                    continue; // skip missing or unparseable tag
+                }
             },
             PolyASource::None => {
                 // Declared-absent. Nothing is dropped; the placeholder is NOT
@@ -425,9 +531,13 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
         };
         let span = match record.alignment_span() {
             Some(Ok(s)) => s,
-            _ => continue,
+            _ => {
+                fc.dropped_no_span += 1;
+                continue;
+            }
         };
         if span == 0 {
+            fc.dropped_empty_span += 1;
             continue; // empty alignment
         }
         let ref_end = start_pos + span - 1;
@@ -435,8 +545,17 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
         // 3' TES boundary filter: read must terminate within `tes_slack`
         // of the transcript's 3' end (1-based coordinate system).
         if ref_end + tes_slack < ref_len {
+            fc.dropped_tes_window += 1;
             continue;
         }
+
+        // Every filter has now been passed. This is the RHS term of the
+        // ledger identity, and it is deliberately placed HERE rather than at
+        // the `push` further down: from this point to the push there is no
+        // `continue`, `return`, or `?` (checked by reading the whole span), so
+        // the two placements are equivalent, and this one cannot be skipped by
+        // a future early-exit added in between.
+        fc.records_with_candidates += 1;
 
         // 3. Observed 5' gap `g_k`, in this candidate's own cDNA coordinates.
         //
@@ -622,6 +741,17 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
     // hypothetical under-count would degrade to today's `push` growth rather
     // than to a wrong graph.
     //
+    // CORRECTION (2026-10-06, Q5). The `continue` this filter "mirrors" is
+    // UNREACHABLE. An entry is only ever created by `or_insert_with` at the
+    // push site below, on a fresh `Vec::new()`, and the `match` that follows
+    // is straight-line: its `None` arm must run on the first record for that
+    // read, so every entry has `candidates.len() >= 1` permanently and
+    // `is_empty()` is always false. The reservation is still an upper bound
+    // (that holds a fortiori), so nothing above is invalidated -- but the
+    // filter is a no-op, and an earlier plan to put the Q5 record-loss counter
+    // on that guard would have produced a counter reading 0 for every input.
+    // See `FilterCounts`.
+    //
     // NOTE: Module 3's `ΔAS > 50` prune deliberately does NOT run here. It
     // needs the read's completed candidate list, so it cannot be applied in
     // the per-record loop above; putting it here instead would leave every
@@ -696,6 +826,18 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
     debug_assert_eq!(candidate_pool.len(), candidate_mapq.len());
     debug_assert_eq!(candidate_pool.len(), candidate_5p_gap.len());
 
+    // THE LEDGER CLOSES HERE, or the library is wrong. A new drop site added
+    // above without its counter, or an early `?`/`return` added between the
+    // filters and the push, makes this non-zero and fails the test suite --
+    // which is the entire reason this is a sum and not a single tally.
+    assert_eq!(
+        fc.ledger_deficit(),
+        0,
+        "evidence filter ledger does not close: {fc:?} -- a record left the \
+         stream through an uncounted path (a new drop site without its counter, \
+         or an early return between the filters and the candidate push)"
+    );
+
     Ok(FlatEvidenceGraph {
         molecules,
         candidate_pool,
@@ -705,6 +847,7 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
         candidate_5p_gap,
         transcript_names,
         poly_a_is_placeholder: matches!(poly_a, PolyASource::None),
+        stats: fc,
     })
 }
 
@@ -1228,6 +1371,112 @@ pub mod test_support {
             30,
             "the control read is unaffected by the filter"
         );
+    }
+
+    /// A forward alignment that STOPS SHORT of the transcript's 3' end.
+    ///
+    /// WHY THIS HELPER WAS ADDED (2026-10-06, Q5) -- and what it does NOT fix.
+    ///
+    /// The obvious claim to make here is "the 3' TES filter is untested". That
+    /// claim is FALSE, and it is worth recording why, because the first draft
+    /// of this comment asserted it. The filter does fire on an existing
+    /// fixture: `test_supplementary_alignments_are_dropped_rather_than_merged`
+    /// writes a `900M` record from position 1, whose alignment ends 1100 bases
+    /// short of the 3' end and is therefore dropped at `tes_slack = 35`. The
+    /// test asserts `molecules.is_empty()` on it.
+    ///
+    /// What was genuinely missing is narrower, and this helper addresses exactly
+    /// that:
+    ///
+    /// 1. NO ACCOUNTING. A read dropped here was indistinguishable from a read
+    ///    that never existed. `dropped_tes_window` did not exist, so the
+    ///    fixture's disappearance proved the filter fired without saying how
+    ///    many records it fired on.
+    /// 2. NO BOUNDARY. `molecules.is_empty()` stays true whether the filter
+    ///    rejects at `end_offset > tes_slack` or `>= tes_slack`, and whether it
+    ///    compares `ref_end` or `ref_end + 1`. An off-by-one in the condition
+    ///    is invisible to it. `synth_record_short_of_tes` puts a read exactly
+    ///    at `tes_slack` and one at `tes_slack + 1` in the same run, which
+    ///    pins both sides.
+    ///
+    /// The general `gap` helpers still cannot express either case — they derive
+    /// the span from `REF_LEN` so the read always ends on the last base — so
+    /// the boundary genuinely was unreachable without a new helper.
+    ///
+    /// `end_offset` is how many bases short of `REF_LEN` the alignment's last
+    /// base sits, so `end_offset = 0` is the full-length case every other helper
+    /// produces. The filter drops the record iff `end_offset > tes_slack`, which
+    /// makes the boundary exactly testable rather than approximately.
+    ///
+    /// `start` is 1-based. The span is derived as `REF_LEN − end_offset −
+    /// start + 1`, so the CIGAR and the coordinates can never disagree.
+    pub fn synth_record_short_of_tes(
+        name: &str,
+        ref_id: usize,
+        start: usize,
+        end_offset: usize,
+        as_score: Option<i32>,
+        nm: i32,
+        mapq: u8,
+    ) -> RecordBuf {
+        assert!(
+            end_offset < REF_LEN && start <= REF_LEN - end_offset,
+            "synth_record_short_of_tes: start {start} + end_offset {end_offset} \
+             does not fit inside REF_LEN {REF_LEN}"
+        );
+        let span = REF_LEN - end_offset - start + 1;
+        let cigar: Cigar = [Op::new(Kind::Match, span)].into_iter().collect();
+        let mut tags = vec![(TAG_PT, Value::from(100i32)), (TAG_NM, Value::from(nm))];
+        if let Some(a) = as_score {
+            tags.push((TAG_AS, Value::from(a)));
+        }
+        RecordBuf::builder()
+            .set_name(name)
+            .set_flags(Flags::empty())
+            .set_reference_sequence_id(ref_id)
+            .set_alignment_start(Position::new(start).expect("start is 1-based and non-zero"))
+            .set_mapping_quality(MappingQuality::new(mapq).unwrap())
+            .set_cigar(cigar)
+            .set_data(tags.into_iter().collect())
+            .build()
+    }
+
+    /// A full-length forward match carrying `pt:i`, with SAM `flags` set by the
+    /// caller instead of derived from a 5' gap.
+    ///
+    /// This exists to make the FLAG-only drop buckets (`dropped_unmapped`,
+    /// `dropped_supplementary`) observable. Neither was reachable from any
+    /// other fixture: every helper in this file emits a mapped, non-
+    /// supplementary forward match, so both counters read 0 on the entire
+    /// suite. That is not a harmless untested branch -- it means an assertion
+    /// of the form `dropped_unmapped == 0` elsewhere is a tautology, which is
+    /// the same trap this ledger was built to avoid.
+    ///
+    /// SCOPE: the record keeps a valid reference and a full-length CIGAR even
+    /// when asked for `UNMAPPED`, which is not what a real unmapped record
+    /// looks like. That is deliberate and sufficient: both filters read FLAGS
+    /// and `continue` before the reference is touched, so this pins the flag
+    /// branch and nothing else.
+    pub fn synth_record_with_flags(
+        name: &str,
+        ref_id: usize,
+        flags: Flags,
+        as_score: Option<i32>,
+    ) -> RecordBuf {
+        let cigar: Cigar = [Op::new(Kind::Match, REF_LEN)].into_iter().collect();
+        let mut tags = vec![(TAG_PT, Value::from(100i32)), (TAG_NM, Value::from(0i32))];
+        if let Some(a) = as_score {
+            tags.push((TAG_AS, Value::from(a)));
+        }
+        RecordBuf::builder()
+            .set_name(name)
+            .set_flags(flags)
+            .set_reference_sequence_id(ref_id)
+            .set_alignment_start(Position::new(1).expect("1-based and non-zero"))
+            .set_mapping_quality(MappingQuality::new(60).unwrap())
+            .set_cigar(cigar)
+            .set_data(tags.into_iter().collect())
+            .build()
     }
 
     /// Writes `records` under a 3-transcript header (tx0/tx1/tx2, `REF_LEN` bp
@@ -1874,6 +2123,7 @@ mod tests {
             transcript_names: vec![],
             // synthetic/test graph: `log_pal` is a real measurement
             poly_a_is_placeholder: false,
+            stats: crate::evidence::FilterCounts::default(),
         };
 
         let hist = graph.candidate_count_histogram();
@@ -1940,7 +2190,106 @@ mod tests {
             transcript_names: vec![],
             // synthetic/test graph: `log_pal` is a real measurement
             poly_a_is_placeholder: false,
+            stats: crate::evidence::FilterCounts::default(),
         };
         assert!(graph.candidate_count_histogram().is_empty());
+    }
+
+    /// The 3' TES filter, at its exact boundary, and the ledger that accounts
+    /// for it.
+    ///
+    /// The filter is `ref_end + tes_slack < ref_len` -> drop, so a read ending
+    /// exactly `tes_slack` bases short of the transcript's 3' end is KEPT and
+    /// one ending `tes_slack + 1` short is DROPPED. An off-by-one in either
+    /// direction (strict vs non-strict, `ref_end` vs `ref_end + 1`) is
+    /// invisible to a test that only checks "some read was dropped".
+    ///
+    /// The pre-existing coverage does not pin that boundary.
+    /// `test_supplementary_alignments_are_dropped_rather_than_merged` does
+    /// trip the filter -- on a `900M` record ending 1100 bases short -- but it
+    /// asserts `molecules.is_empty()`, which is true at every offset from
+    /// `tes_slack + 1` to `REF_LEN`. This test is the one that pins WHERE the
+    /// edge is, and it is the first to assert the drop COUNT rather than only
+    /// the drop's effect on the graph.
+    ///
+    /// The four buckets this fixture cannot trip are asserted zero HERE, and
+    /// that assertion is only meaningful because
+    /// `test_flag_drop_buckets_are_observable` pins two of them non-zero on
+    /// real records. Without that sibling test these four lines would pass
+    /// against counters that were never wired to anything.
+    #[test]
+    fn test_tes_filter_boundary_is_exact_and_the_ledger_closes() {
+        const TES_SLACK: usize = 35;
+
+        // One read at the last allowed offset (kept), one one base further out
+        // (dropped), one full length (kept).
+        let recs = vec![
+            synth_record_short_of_tes("at_boundary", 0, 1, TES_SLACK, Some(1000), 1, 60),
+            synth_record_short_of_tes("past_boundary", 0, 1, TES_SLACK + 1, Some(1000), 1, 60),
+            synth_record("full_length", 0, Some(1000), 1, 60),
+        ];
+        let path = write_synthetic_bam("tes_boundary", recs);
+        let graph = extract_evidence(&path, TES_SLACK).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let s = graph.stats;
+        assert_eq!(s.records_entered, 3, "{s:?}");
+        assert_eq!(
+            s.dropped_tes_window, 1,
+            "exactly one read is past the window: {s:?}"
+        );
+        assert_eq!(s.records_with_candidates, 2, "{s:?}");
+        assert_eq!(s.ledger_deficit(), 0, "ledger must close: {s:?}");
+        assert_eq!(s.dropped_total(), 1, "{s:?}");
+
+        // The two surviving reads are the ones the boundary predicts, named
+        // rather than counted: a count of 2 would also be satisfied by the
+        // wrong two.
+        let kept: Vec<&str> = graph.molecules.iter().map(|m| m.read_id.as_str()).collect();
+        assert!(kept.contains(&"at_boundary"), "kept {kept:?}");
+        assert!(kept.contains(&"full_length"), "kept {kept:?}");
+        assert!(!kept.contains(&"past_boundary"), "kept {kept:?}");
+
+        // Buckets this fixture cannot exercise. Pinned non-zero by
+        // `test_flag_drop_buckets_are_observable`.
+        assert_eq!(s.dropped_unmapped, 0, "{s:?}");
+        assert_eq!(s.dropped_supplementary, 0, "{s:?}");
+        assert_eq!(s.dropped_no_poly_a_tag, 0, "{s:?}");
+        assert_eq!(s.dropped_invalid_poly_a, 0, "{s:?}");
+    }
+
+    /// The two FLAG-only drop buckets are reachable and non-zero.
+    ///
+    /// This is the sibling that makes the zero-assertions in
+    /// `test_tes_filter_boundary_is_exact_and_the_ledger_closes` non-trivial,
+    /// and it is also the mutation target for the corresponding increments:
+    /// delete either `fc.dropped_* += 1` and this test goes red. Deleting the
+    /// TES increment is caught by the test above AND by the library's
+    /// `ledger_deficit() == 0` assertion, which panics rather than merely
+    /// reporting.
+    #[test]
+    fn test_flag_drop_buckets_are_observable() {
+        use noodles_sam::alignment::record::Flags;
+
+        let recs = vec![
+            synth_record_with_flags("unmapped", 0, Flags::UNMAPPED, Some(1000)),
+            synth_record_with_flags("supp", 0, Flags::SUPPLEMENTARY, Some(1000)),
+            synth_record("survivor", 0, Some(1000), 1, 60),
+        ];
+        let path = write_synthetic_bam("flag_buckets", recs);
+        let graph = extract_evidence(&path, 35).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let s = graph.stats;
+        assert_eq!(s.records_entered, 3, "{s:?}");
+        assert_eq!(s.dropped_unmapped, 1, "{s:?}");
+        assert_eq!(s.dropped_supplementary, 1, "{s:?}");
+        assert_eq!(s.records_with_candidates, 1, "{s:?}");
+        assert_eq!(s.ledger_deficit(), 0, "ledger must close: {s:?}");
+        assert_eq!(
+            graph.molecules.len(),
+            1,
+            "only the survivor reaches the graph"
+        );
     }
 }

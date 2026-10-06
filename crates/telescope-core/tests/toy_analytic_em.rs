@@ -264,6 +264,7 @@ fn build_graph(fx: &Fixture) -> FlatEvidenceGraph {
         transcript_names: vec!["tx0".to_string(), "tx1".to_string()],
         // synthetic graph: `log_pal` is a real measurement
         poly_a_is_placeholder: false,
+        stats: telescope_core::evidence::FilterCounts::default(),
     }
 }
 

@@ -2758,6 +2758,7 @@ mod tests {
             transcript_names,
             // synthetic/test graph: `log_pal` is a real measurement
             poly_a_is_placeholder: false,
+            stats: crate::evidence::FilterCounts::default(),
         }
     }
 
@@ -2816,6 +2817,7 @@ mod tests {
             candidate_5p_gap: Vec::new(),
             transcript_names: Vec::new(),
             poly_a_is_placeholder: false,
+            stats: crate::evidence::FilterCounts::default(),
         };
         for (mi, cands) in molecules.iter().enumerate() {
             let offset = g.candidate_pool.len() as u32;
@@ -3552,6 +3554,7 @@ mod tests {
             transcript_names: vec!["tx0".to_string(), "tx1".to_string()],
             // synthetic/test graph: `log_pal` is a real measurement
             poly_a_is_placeholder: false,
+            stats: crate::evidence::FilterCounts::default(),
         };
         assert_eq!(graph.candidate_pool.len(), n);
         assert_eq!(graph.candidate_as.len(), n);
@@ -4998,6 +5001,7 @@ mod tests {
             candidate_as,
             transcript_names: vec!["tx0".to_string(), "tx1".to_string(), "tx2".to_string()],
             poly_a_is_placeholder: false,
+            stats: crate::evidence::FilterCounts::default(),
         }
     }
 
@@ -5044,6 +5048,7 @@ mod tests {
             candidate_as: vec![900, 900, 900],
             transcript_names: vec!["tx0".to_string(), "tx1".to_string(), "tx2".to_string()],
             poly_a_is_placeholder: false,
+            stats: crate::evidence::FilterCounts::default(),
         }
     }
 
@@ -5082,6 +5087,7 @@ mod tests {
             candidate_as: vec![900, 900, 900],
             transcript_names: vec!["tx0".to_string(), "tx1".to_string(), "tx2".to_string()],
             poly_a_is_placeholder: false,
+            stats: crate::evidence::FilterCounts::default(),
         }
     }
 
@@ -5144,6 +5150,7 @@ mod tests {
             candidate_5p_gap: vec![0, 0],
             transcript_names: vec!["tx0".to_string(), "tx1".to_string()],
             poly_a_is_placeholder: false,
+            stats: crate::evidence::FilterCounts::default(),
         };
 
         let mut assigns: Vec<ReadAssignment> = Vec::new();
@@ -5882,6 +5889,7 @@ mod tests {
             candidate_5p_gap: vec![0; n],
             transcript_names: (0..n).map(|i| format!("tx{i}")).collect(),
             poly_a_is_placeholder: false,
+            stats: crate::evidence::FilterCounts::default(),
         };
         let params = cands
             .iter()
@@ -6161,6 +6169,7 @@ mod tests {
             candidate_pool,
             transcript_names: (0..6).map(|i| format!("tx{i}")).collect(),
             poly_a_is_placeholder: false,
+            stats: crate::evidence::FilterCounts::default(),
         };
 
         let stats = solve_and_write_profile(
@@ -6315,6 +6324,7 @@ mod tests {
                 candidate_pool: vec![0, 1, 2, 3],
                 transcript_names: (0..4).map(|i| format!("tx{i}")).collect(),
                 poly_a_is_placeholder: false,
+                stats: crate::evidence::FilterCounts::default(),
             };
             let stats = solve_and_write_profile(
                 graph,
@@ -6459,6 +6469,7 @@ mod tests {
             candidate_pool,
             transcript_names: (0..7).map(|i| format!("tx{i}")).collect(),
             poly_a_is_placeholder: false,
+            stats: crate::evidence::FilterCounts::default(),
         };
 
         let stats = solve_and_write_profile(
@@ -6613,6 +6624,7 @@ mod tests {
             candidate_pool,
             transcript_names: (0..7).map(|i| format!("tx{i}")).collect(),
             poly_a_is_placeholder: false,
+            stats: crate::evidence::FilterCounts::default(),
         };
 
         let stats = solve_and_write_profile(
@@ -6743,6 +6755,7 @@ mod tests {
             candidate_pool,
             transcript_names: (0..2).map(|i| format!("tx{i}")).collect(),
             poly_a_is_placeholder: false,
+            stats: crate::evidence::FilterCounts::default(),
         };
 
         let run = |w: f64, tag: &str| {
@@ -6758,6 +6771,7 @@ mod tests {
                     candidate_pool: graph.candidate_pool.clone(),
                     transcript_names: graph.transcript_names.clone(),
                     poly_a_is_placeholder: false,
+                    stats: crate::evidence::FilterCounts::default(),
                 },
                 &emission,
                 "TEST",

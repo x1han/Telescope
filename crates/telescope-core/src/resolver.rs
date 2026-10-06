@@ -425,6 +425,7 @@ where
         // measurements, never a `PolyASource::None` placeholder. The flag is
         // re-derived below from the graphs being pooled rather than assumed.
         poly_a_is_placeholder: false,
+        stats: crate::evidence::FilterCounts::default(),
     };
     let mut count: usize = 0;
 
@@ -434,6 +435,22 @@ where
         // Propagate the provenance flag rather than leaving the `false` above as
         // a claim: `pooled` is only a placeholder graph if EVERY input was one.
         pooled.poly_a_is_placeholder &= g.poly_a_is_placeholder;
+        // The filter ledger is ADDITIVE across pooled BAMs: each input's counts
+        // describe records from that BAM only, and the pooled graph's records
+        // are the disjoint union of them. Copying one input's ledger here
+        // instead of summing would make `records_entered` describe one sample
+        // while the pools describe ten -- the same numerator-over-denominator
+        // shape the workspace rule singles out. `FilterCounts` is `Copy` and
+        // every field is a plain `u64`, so this is a field-wise sum.
+        pooled.stats.records_entered += g.stats.records_entered;
+        pooled.stats.dropped_unmapped += g.stats.dropped_unmapped;
+        pooled.stats.dropped_supplementary += g.stats.dropped_supplementary;
+        pooled.stats.dropped_no_poly_a_tag += g.stats.dropped_no_poly_a_tag;
+        pooled.stats.dropped_invalid_poly_a += g.stats.dropped_invalid_poly_a;
+        pooled.stats.dropped_no_span += g.stats.dropped_no_span;
+        pooled.stats.dropped_empty_span += g.stats.dropped_empty_span;
+        pooled.stats.dropped_tes_window += g.stats.dropped_tes_window;
+        pooled.stats.records_with_candidates += g.stats.records_with_candidates;
         if pooled.transcript_names.is_empty() {
             pooled.transcript_names = g.transcript_names;
         } else if pooled.transcript_names != g.transcript_names {
@@ -603,6 +620,7 @@ mod tests {
             transcript_names: vec!["tx_a".into(), "tx_b".into(), "tx_c".into(), "tx_d".into()],
             // synthetic/test graph: `log_pal` is a real measurement
             poly_a_is_placeholder: false,
+            stats: crate::evidence::FilterCounts::default(),
         };
         let mut tx2g = HashMap::new();
         tx2g.insert("tx_a".into(), "gene_a".into());
@@ -663,6 +681,7 @@ mod tests {
             transcript_names: vec!["tx_a".into(), "tx_b".into()],
             // synthetic/test graph: `log_pal` is a real measurement
             poly_a_is_placeholder: false,
+            stats: crate::evidence::FilterCounts::default(),
         };
         let mut tx2g = HashMap::new();
         tx2g.insert("tx_a".into(), "gene_a".into());
@@ -703,6 +722,7 @@ mod tests {
             transcript_names: vec!["tx_a".into(), "tx_b".into()],
             // synthetic/test graph: `log_pal` is a real measurement
             poly_a_is_placeholder: false,
+            stats: crate::evidence::FilterCounts::default(),
         };
         let mut tx2g = HashMap::new();
         tx2g.insert("tx_a".into(), "gene_a".into());

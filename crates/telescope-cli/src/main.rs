@@ -23,6 +23,68 @@ const POLY_A_SOURCE_HELP: &str = "Where per-read poly(A) length comes from: \
      `--poly-a-weight 0`). A BAM carrying no poly(A) at all is a hard error, \
      not an empty graph.";
 
+/// Print the Module-2 record filter ledger.
+///
+/// One function, three call sites, on purpose: the three Module-2 entry points
+/// (`extract`, `quant` on one BAM, and `pool` over a cohort) must report the
+/// same buckets in the same order, or two of the three numbers are not
+/// comparable and a reader has to know which path produced which. The pooled
+/// site's counts are the field-wise SUM over the cohort BAMs, so its
+/// `records_entered` covers the union of the inputs rather than any one of them.
+///
+/// The bucket order matches `FilterCounts::dropped_total` so a reader can add
+/// the column by eye and check the identity. `deficit` is printed even though
+/// the library asserts it is 0: if that assert is ever removed or compiled out,
+/// this line is what would show the ledger failing rather than a plausible
+/// number quietly omitting a drop site.
+fn print_filter_ledger(s: &telescope_core::evidence::FilterCounts, indent: &str) {
+    eprintln!("{indent}record filter ledger (RECORDS, not reads, not molecules)");
+    eprintln!(
+        "{indent}  records entered        : {:>12}",
+        s.records_entered
+    );
+    eprintln!(
+        "{indent}    - unmapped            : {:>12}",
+        s.dropped_unmapped
+    );
+    eprintln!(
+        "{indent}    - supplementary       : {:>12}",
+        s.dropped_supplementary
+    );
+    eprintln!(
+        "{indent}    - poly(A) tag missing : {:>12}",
+        s.dropped_no_poly_a_tag
+    );
+    eprintln!(
+        "{indent}    - poly(A) value bad   : {:>12}",
+        s.dropped_invalid_poly_a
+    );
+    eprintln!(
+        "{indent}    - no CIGAR span       : {:>12}",
+        s.dropped_no_span
+    );
+    eprintln!(
+        "{indent}    - empty span          : {:>12}",
+        s.dropped_empty_span
+    );
+    eprintln!(
+        "{indent}    - 3' TES window       : {:>12}",
+        s.dropped_tes_window
+    );
+    eprintln!(
+        "{indent}  dropped total          : {:>12}",
+        s.dropped_total()
+    );
+    eprintln!(
+        "{indent}  reached candidates     : {:>12}",
+        s.records_with_candidates
+    );
+    eprintln!(
+        "{indent}  ledger deficit         : {:>12}  (must be 0)",
+        s.ledger_deficit()
+    );
+}
+
 /// Default λ of the F-EM-4 alignment term `ln A_rk = (AS_rk − max_j AS_rj)/λ`.
 /// Referenced by both clap's default and the `quant` telemetry so the shipped
 /// default and the claim printed next to it cannot drift apart. Provenance is
@@ -699,6 +761,7 @@ fn main() -> Result<()> {
                 .iter()
                 .map(|m| m.candidate_count as u64)
                 .sum();
+            print_filter_ledger(&graph.stats, "[telescope]  ");
             let avg = if graph.molecules.is_empty() {
                 0.0
             } else {
@@ -850,6 +913,7 @@ fn main() -> Result<()> {
                 }
             }
             eprintln!("[telescope]    molecules:      {}", graph.molecules.len());
+            print_filter_ledger(&graph.stats, "[telescope]    ");
             eprintln!(
                 "[telescope]    transcripts:    {}",
                 graph.transcript_names.len()
@@ -1324,6 +1388,7 @@ fn main() -> Result<()> {
                 graph.transcript_names.len(),
                 graph.candidate_pool.len(),
             );
+            print_filter_ledger(&graph.stats, "[telescope]  ");
 
             // Load transcript→gene mapping (TSV) → HashMap<String, String>.
             let tx_to_gene_map: std::collections::HashMap<String, String> = match tx_to_gene {
