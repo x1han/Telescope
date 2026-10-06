@@ -34,8 +34,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array,
-};
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
