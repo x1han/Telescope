@@ -34,7 +34,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow::array::{BooleanArray, Float64Array, StringArray};
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
@@ -103,6 +104,13 @@ fn scratch(name: &str) -> PathBuf {
 /// fails LOUDLY — `load_emission_parameters` `context()`s on any column it
 /// needs and cannot find, so adding a sixth column to the reader breaks this
 /// test at the first read instead of quietly reading a default.
+///
+/// That prediction was tested for real on 2026-10-06: the sixth column
+/// (`n_cohort_flnc`, the in-schema marker of an IMPUTED row) went in, and
+/// `cargo test --lib` stayed green because it only builds the lib's own
+/// fixtures. The breakage appeared in `cargo test --release` on this file
+/// only. A required column is a change to the READ CONTRACT, and a lib-only
+/// test run cannot see one.
 fn write_emission(path: &PathBuf, rows: &[(&str, &str, f64, f64)]) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("transcript_id", DataType::Utf8, false),
@@ -110,6 +118,10 @@ fn write_emission(path: &PathBuf, rows: &[(&str, &str, f64, f64)]) {
         Field::new("is_polyA_competent", DataType::Boolean, false),
         Field::new("mu_logPAL", DataType::Float64, false),
         Field::new("sigma2_logPAL", DataType::Float64, false),
+        // Non-zero on every row: these are hand-fitted values, so no row here
+        // is imputed. The loader REQUIRES this column -- see the doc comment
+        // above and `TranscriptParam::is_imputed`.
+        Field::new("n_cohort_flnc", DataType::UInt32, false),
     ]));
     let batch = RecordBatch::try_new(
         schema,
@@ -127,6 +139,7 @@ fn write_emission(path: &PathBuf, rows: &[(&str, &str, f64, f64)]) {
             Arc::new(Float64Array::from(
                 rows.iter().map(|r| r.3).collect::<Vec<_>>(),
             )),
+            Arc::new(UInt32Array::from(vec![10u32; rows.len()])),
         ],
     )
     .expect("emission RecordBatch");

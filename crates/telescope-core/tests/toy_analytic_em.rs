@@ -146,7 +146,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow::array::{BooleanArray, Float64Array, StringArray};
+use arrow::array::{BooleanArray, Float64Array, StringArray, UInt32Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
@@ -274,6 +274,12 @@ fn write_emission(path: &PathBuf) {
         Field::new("is_polyA_competent", DataType::Boolean, false),
         Field::new("mu_logPAL", DataType::Float64, false),
         Field::new("sigma2_logPAL", DataType::Float64, false),
+        // Non-zero on both rows: these are hand-written fixtures, so no row is
+        // imputed. The loader REQUIRES this column since 2026-10-06 (it is the
+        // only in-schema marker of an imputed row); a fifth-column fixture
+        // fails at the first read rather than quietly reporting every row as
+        // anchored.
+        Field::new("n_cohort_flnc", DataType::UInt32, false),
     ]));
     let batch = RecordBatch::try_new(
         schema,
@@ -286,6 +292,7 @@ fn write_emission(path: &PathBuf) {
             // a missing one is a panic rather than a readable failure.
             Arc::new(Float64Array::from(vec![6.0, 6.0])),
             Arc::new(Float64Array::from(vec![0.04, 0.04])),
+            Arc::new(UInt32Array::from(vec![10u32, 10u32])),
         ],
     )
     .expect("emission RecordBatch");
