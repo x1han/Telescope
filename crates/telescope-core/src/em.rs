@@ -341,6 +341,22 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         );
     }
 
+    // `max_iter == 0` runs no E-step at all, so `last_estep_params` stays empty
+    // and the candidate census — which replays the E-step's filter against
+    // `last_estep_params` — classifies EVERY contested candidate as having no
+    // emission row. The conservation law still closes, because the census and
+    // the E-step agree that nothing is live, but the printed decomposition would
+    // then be a confident falsehood: it would attribute the entire candidate
+    // set to missing emission rows on a run that never looked at one. The
+    // ledger made this lie louder, so the input is now rejected instead.
+    if max_iter == 0 {
+        anyhow::bail!(
+            "max_iter must be >= 1 (got {}); with 0 iterations no E-step runs, no posterior is \
+             produced, and every candidate would be reported as having no emission row",
+            max_iter
+        );
+    }
+
     let mut param_map = load_emission_parameters(emission_path)?;
     let num_transcripts = graph.transcript_names.len();
     let n_emission = param_map.len();
@@ -394,11 +410,23 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
     // 1. Split molecules by candidate_count.
     let mut unambiguous_indices: Vec<usize> = Vec::new();
     let mut ambiguous_indices: Vec<usize> = Vec::new();
+    // Left-hand side of the candidate conservation law. Accumulated HERE, in the
+    // one place that already walks every molecule, rather than in either output
+    // arm — an arm-scoped sum would silently exclude the other arm's candidates.
+    // `candidate_count == 0` contributes 0, which is what keeps it out of the
+    // identity: such a molecule has no candidate to account for.
+    let mut ledger = CandidateLedger::default();
     for (idx, mol) in graph.molecules.iter().enumerate() {
         match mol.candidate_count {
             0 => {}
-            1 => unambiguous_indices.push(idx),
-            _ => ambiguous_indices.push(idx),
+            n => {
+                ledger.total_candidates += u64::from(n);
+                if n == 1 {
+                    unambiguous_indices.push(idx);
+                } else {
+                    ambiguous_indices.push(idx);
+                }
+            }
         }
     }
     let n_total_molecules = graph.molecules.len() as f64;
@@ -865,6 +893,12 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         if let Some(ref p) = params[tx_id] {
             if !p.is_competent {
                 n_unambiguous_dropped_incompetent += 1;
+                // One candidate, one fate. The read-level counter above and the
+                // candidate-level counter here are the same number; they are
+                // kept separate so the ledger does not depend on the invariant
+                // "an unambiguous read has exactly one candidate" holding
+                // somewhere else in the file.
+                ledger.unambig_incompetent += 1;
                 continue;
             }
             if want_read_assignments {
@@ -892,6 +926,7 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
             w_b.append_value(1.0);
             ncand_b.append_value(ncand);
             as_ratio_b.append_value(as_ratio);
+            ledger.unambig_emitted += 1;
         } else {
             // transcript missing from emission parquet → skip.
             // This is the case that PADDING removes, and it was conflated with
@@ -899,6 +934,7 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
             // two are independent facts about the transcript and only one of
             // them is an emission-coverage problem.
             n_unambiguous_dropped_missing_emission += 1;
+            ledger.unambig_missing += 1;
         }
     }
 
@@ -955,6 +991,26 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
             n_polya_zero_power += 1;
         }
 
+        // CANDIDATE CONSERVATION LEDGER. Taken for EVERY contested read, not
+        // only for ghosts.
+        //
+        // This call used to sit inside `if weights.is_empty()` below, because
+        // the census existed only to decompose the ghost count. That scoping is
+        // correct for that job and fatal for this one: a counter incremented
+        // inside it accumulates over the ghost subpopulation — 603,936 reads on
+        // HC2, 12.6% — and then reads as though it described the whole run. The
+        // 20.10% candidate deficit this ledger was built to explain is
+        // overwhelmingly NOT on ghost reads, so a ghost-scoped census would
+        // have "explained" a sliver of it and reported the rest as unexplained
+        // while looking complete. The census is called ONCE and both consumers
+        // read the result.
+        let av = candidate_availability(&graph, mol, &last_estep_params, prune_max_delta_as);
+        ledger.pruned_delta_as += av.n_pruned_delta_as as u64;
+        ledger.missing += av.n_missing as u64;
+        ledger.incompetent += av.n_incompetent as u64;
+        ledger.alpha_zero += av.n_alpha_zero as u64;
+        ledger.live_candidates += av.n_live as u64;
+
         // Phase A entropy 3-tier + ghost-drop telemetry.
         if weights.is_empty() {
             n_dropped_no_competent_candidates += 1;
@@ -975,8 +1031,8 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
             // read whose candidates died for a mix of reasons, or with a pruned
             // candidate among them, increments no cause counter; the CLI prints
             // the remainder explicitly instead of letting the three look like
-            // they sum to the total.
-            let av = candidate_availability(&graph, mol, &last_estep_params, prune_max_delta_as);
+            // they sum to the total. `uniform_cause` still ignores
+            // `n_pruned_delta_as` on purpose — see `CandidateAvailability`.
             match av.uniform_cause(mol.candidate_count as usize) {
                 Some(GhostCause::Missing) => n_ghost_read_all_missing += 1,
                 Some(GhostCause::Incompetent) => n_ghost_read_all_incompetent += 1,
@@ -1159,8 +1215,18 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
             .map(|&(_, w)| w)
             .sum();
 
+        // The census's `n_live` claims this many candidates reached `weights`.
+        // Comparing the two is the only check that the census and the E-step
+        // still agree; see `CandidateLedger::census_vs_estep_deficit`.
+        ledger.live_candidates_entered += weights.len() as u64;
+
         for (tx_id, w) in weights {
             if w < min_weight {
+                // Provably 0 at `min_weight = 0.0`: every posterior is
+                // `exp(ll - log_z) >= 0`, so `w < 0.0` is never true. A test
+                // pins that, which is a free check that this counter is wired
+                // to this branch and not to some other `continue`.
+                ledger.pruned_min_weight += 1;
                 continue;
             }
             // Safe: this body only runs when at least one weight is retained.
@@ -1173,6 +1239,7 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
             if let Some(ref p) = params[tx_id] {
                 if !p.is_competent {
                     n_dropped_output_row_competence += 1;
+                    ledger.dropped_output_competence += 1;
                     continue;
                 }
                 sample_b.append_value(sample_id);
@@ -1183,8 +1250,10 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
                 w_b.append_value(w_norm);
                 ncand_b.append_value(ncand);
                 as_ratio_b.append_value(as_ratio);
+                ledger.rows_emitted += 1;
             } else {
                 n_dropped_output_row_competence += 1;
+                ledger.dropped_output_competence += 1;
             }
         }
     }
@@ -1265,6 +1334,52 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
     writer.write(&batch).context("Failed to write batch")?;
     writer.close().context("Failed to close writer")?;
 
+    // THE CANDIDATE CONSERVATION TRIPWIRE.
+    //
+    // Deliberately AFTER the parquet is closed, not before. The profile is the
+    // expensive artefact — an HC2 run is minutes of EM over 27M alignments — and
+    // deleting it because an instrumentation counter disagreed would destroy the
+    // evidence needed to find out why. The error message says so explicitly, so
+    // nobody reads this as "the output is corrupt, re-run".
+    //
+    // Deliberately HERE and not in the CLI. Placed in the CLI it would be a
+    // property of the presentation layer: `solve_and_write_profile` is a public
+    // entry point, every test calls it directly, and an invariant that only the
+    // binary checks is an invariant the test suite never exercises.
+    //
+    // What a non-zero value means, stated because the failure mode is
+    // misattribution: it means a class of candidate reached no terminal bucket,
+    // which is exactly the state the ledger was in before `ΔAS`-pruned
+    // candidates were counted (HC2: a 4,535,230 deficit, 20.10%). It does NOT
+    // mean candidates are being lost from the profile. `min_weight` is a
+    // caller-supplied cutoff and a fifth of a six-way contested read falling
+    // below 0.01 posterior is an ordinary, expected shape; that mass belongs in
+    // `pruned_min_weight`, which is precisely what makes `deficit()` 0.
+    anyhow::ensure!(
+        ledger.deficit() == 0,
+        "candidate ledger does not close: deficit {} (candidates {} vs terminal fates {}). \
+         This is an instrumentation defect -- some class of candidate reached no bucket -- \
+         NOT lost reads. The profile at {:?} was written in full and is intact; keep it and \
+         use it to find the unaccounted class. Per-bucket ledger: {:?}",
+        ledger.deficit(),
+        ledger.total_candidates,
+        ledger.terminal_sum(),
+        output_profile_path.as_ref(),
+        ledger,
+    );
+    anyhow::ensure!(
+        ledger.census_vs_estep_deficit() == 0,
+        "candidate census disagrees with the E-step by {} candidates: the census replayed \
+         {} live candidates but the E-step carried {} into `weights`. These are two \
+         implementations of one predicate (max_as, the saturating_sub, the strict `>`) and \
+         they have drifted apart. Do NOT loosen this assert -- the census is a reimplementation \
+         and the drift, not the assert, is the bug. Ledger: {:?}",
+        ledger.census_vs_estep_deficit(),
+        ledger.live_candidates,
+        ledger.live_candidates_entered,
+        ledger,
+    );
+
     if let Some(out) = output_emission_params.as_deref_mut() {
         // `last_estep_params`, NOT `params` — see the declaration. On the
         // `max_iter`-exhaustion path `params` is one M-step past the state that
@@ -1302,6 +1417,7 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         n_unambiguous,
         n_ambiguous,
         n_em_iter,
+        ledger,
         n_unambiguous_dropped_incompetent,
         n_unambiguous_dropped_missing_emission,
         n_ghost_read_all_missing,
@@ -1523,9 +1639,19 @@ fn read_max_as_ratio(graph: &FlatEvidenceGraph, mol: &MoleculeEvidence) -> f32 {
 ///
 /// A census that lumped these together would report a cause for reads whose
 /// real cause was the other, which is the failure `test_ghost_decomposition_*`
-/// exists to catch. The prune is likewise excluded from every bucket rather
-/// than counted as one of the three causes, because a pruned candidate is dead
-/// for a reason no amount of emission padding addresses.
+/// exists to catch.
+///
+/// The prune was ALSO excluded from every bucket here until 2026-10-06, on the
+/// sound grounds that a pruned candidate is dead for a reason no amount of
+/// emission padding addresses. That reasoning still governs
+/// [`CandidateAvailability::uniform_cause`] and is unchanged. It did not,
+/// however, survive contact with the conservation law: "excluded from the
+/// cause buckets" is not the same claim as "belonged to no bucket at all", and
+/// the second reading is what left the candidate ledger unable to close. The
+/// prune is now counted in its own bucket for the ledger's benefit and still
+/// excluded from cause attribution, because the two questions are different
+/// ones — "would padding have saved this read?" and "where did this candidate
+/// go?" — and only the second needs the prune on the books.
 struct CandidateAvailability {
     /// No emission row at all — the candidate never reached `raw`.
     n_missing: usize,
@@ -1540,8 +1666,32 @@ struct CandidateAvailability {
     /// touching `is_competent`. A single combined "incompetent or starved"
     /// bucket would hide which of the two happened.
     n_alpha_zero: usize,
+    /// Killed by the E-step's `ΔAS` prune — `delta_as > prune_max_delta_as`.
+    ///
+    /// This bucket did not exist before 2026-10-06, and its absence is what
+    /// made the candidate ledger unclosable: a pruned candidate hit a bare
+    /// `continue` and belonged to no bucket at all, so the census accounted for
+    /// fewer candidates than the graph produced and the difference was
+    /// unattributable. The expert team's P0 asked for an unaccounted remainder
+    /// of exactly zero, and no counter set can reach zero while a whole class
+    /// of candidates is in none of them.
+    ///
+    /// It is recorded here and is deliberately NOT consulted by
+    /// [`CandidateAvailability::uniform_cause`]. A pruned candidate is dead for
+    /// a reason no amount of emission padding addresses, so attributing a read
+    /// with one to `Missing` would over-claim — that reasoning is unchanged and
+    /// still correct. The two questions are different: `uniform_cause` asks
+    /// "would padding have saved this read?", the ledger asks "where did this
+    /// candidate go?". Only the second one needs the prune counted.
+    n_pruned_delta_as: usize,
     /// Carried posterior mass. A ghost read has `n_live == 0`; see
     /// [`CandidateAvailability::is_ghost`].
+    ///
+    /// NOT a terminal fate. Live candidates go on to be split by `min_weight`
+    /// and by the output stage's own competence recheck, so this bucket is an
+    /// intermediate and is EXCLUDED from [`CandidateLedger::deficit`]. Counting
+    /// it there as well as counting its own descendants would inflate the
+    /// deficit by `n_live` on every correct run.
     n_live: usize,
 }
 
@@ -1598,6 +1748,7 @@ fn candidate_availability(
         n_missing: 0,
         n_incompetent: 0,
         n_alpha_zero: 0,
+        n_pruned_delta_as: 0,
         n_live: 0,
     };
     // Same reference point as the E-step: the read's best `AS` over its FULL
@@ -1615,6 +1766,12 @@ fn candidate_availability(
         // putting a candidate the E-step killed into the `n_live` bucket.
         let delta_as = max_as.saturating_sub(graph.candidate_as[idx]);
         if delta_as > prune_max_delta_as {
+            // Counted, but not attributed: see the struct doc. The E-step
+            // pushes this candidate as `-inf` (em.rs:554), so it never reaches
+            // `weights` and never emits a row. Without this increment it is a
+            // candidate the graph produced and no bucket claims, which is
+            // exactly the gap `CandidateLedger` exists to close.
+            av.n_pruned_delta_as += 1;
             continue;
         }
         let Some(p) = params.get(tx_id).and_then(|o| o.as_ref()) else {
@@ -1636,6 +1793,128 @@ fn candidate_availability(
         }
     }
     av
+}
+
+/// The candidate conservation ledger: every candidate the evidence graph
+/// produced is accounted for by exactly one terminal fate.
+///
+/// WHY IT EXISTS. The read ledger closed exactly (4,798,271 in = 4,798,271 out
+/// on HC2) and the candidate ledger did not: the sum of `n_candidates_before_cutoff`
+/// over emitting reads is 22,567,103 while the profile holds 18,031,873 rows,
+/// leaving 4,535,230 (20.10%) that no counter claimed and no report mentioned.
+/// A deficit that large and that silent is not a measurement, it is a missing
+/// instrument, and the first job was to build the instrument rather than to
+/// guess at the cause.
+///
+/// WHAT "TERMINAL FATE" MEANS, and the one trap in this struct. A candidate is
+/// counted exactly once, at the point where it stops moving. The E-step census
+/// splits the contested read's candidates four ways, and the survivor bucket is
+/// then split three ways at the output stage — so the survivors are counted
+/// there and NOT here. `live_candidates` is recorded because
+/// [`CandidateLedger::census_vs_estep_deficit`] needs it, but
+/// [`CandidateLedger::deficit`] deliberately does not sum it: adding an
+/// intermediate to the sum of its own descendants double-counts every live
+/// candidate, which on HC2 would report a deficit of ~15M — larger than the
+/// 4.5M this was built to explain — and would do so on the first CORRECT run.
+///
+/// SCOPE, stated because the left and right sides do not share a denominator by
+/// construction. `total_candidates` counts every candidate of every molecule
+/// with `candidate_count >= 1`, including candidates on reads that emitted
+/// nothing at all. That is the point: a read whose every candidate was pruned
+/// or culled contributes to the left and to no row on the right, and the
+/// ledger's job is to make it visible rather than to let it vanish.
+///
+/// The two molecule populations are counted separately because they cannot die
+/// the same way. A single-candidate molecule has `max_as` equal to its own `AS`,
+/// so `delta_as == 0` and the `ΔAS` prune can never fire on it (this needs
+/// `prune_max_delta_as >= 0`, validated at em.rs:335); the unambiguous arm also
+/// applies no `alpha` mask, by design, since its posterior is the deterministic
+/// `w ≡ 1.0`. Its three buckets are therefore exhaustive among themselves and
+/// there is no `unambig_*_pruned` column because there is nothing to put in it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CandidateLedger {
+    /// Σ `MoleculeEvidence::candidate_count` over molecules with
+    /// `candidate_count >= 1`. This is the ledger's left-hand side.
+    pub total_candidates: u64,
+
+    // --- contested arm, decided by the E-step census ---
+    /// Killed by `ΔAS > prune_max_delta_as`.
+    pub pruned_delta_as: u64,
+    /// No emission row for this transcript.
+    pub missing: u64,
+    /// `is_polyA_competent == false`.
+    pub incompetent: u64,
+    /// Competent but `alpha <= 0.0`, i.e. it won no posterior mass anywhere.
+    pub alpha_zero: u64,
+    /// Candidates that reached `weights`. INTERMEDIATE — see the struct doc.
+    pub live_candidates: u64,
+
+    // --- contested arm, decided at the output stage ---
+    /// Live candidates whose posterior fell below `min_weight`.
+    ///
+    /// Not a constant: `min_weight` is a caller-supplied parameter (CLI
+    /// default 0.01), so this bucket moves when the flag moves. At
+    /// `min_weight = 0.0` it is provably exactly 0, because every posterior is
+    /// `exp(ll - log_z) >= 0` and `w < 0.0` is then never true. Its MAGNITUDE
+    /// is not a stable baseline; only a non-zero deficit is a bug signal.
+    pub pruned_min_weight: u64,
+    /// Passed `min_weight`, then dropped by the output stage's own
+    /// `is_competent` / `params` recheck. Structurally 0 in production — the
+    /// E-step already filtered both — which is the point of counting it.
+    pub dropped_output_competence: u64,
+    /// Candidate rows actually written to the profile parquet, contested arm.
+    pub rows_emitted: u64,
+
+    // --- unambiguous arm ---
+    pub unambig_incompetent: u64,
+    pub unambig_missing: u64,
+    pub unambig_emitted: u64,
+
+    /// Σ `weights.len()` over contested reads — the other side of
+    /// [`CandidateLedger::census_vs_estep_deficit`].
+    pub live_candidates_entered: u64,
+}
+
+impl CandidateLedger {
+    /// Terminal fates only. See the struct doc for why `live_candidates` is
+    /// recorded but not summed.
+    fn terminal_sum(&self) -> u64 {
+        self.pruned_delta_as
+            + self.missing
+            + self.incompetent
+            + self.alpha_zero
+            + self.pruned_min_weight
+            + self.dropped_output_competence
+            + self.rows_emitted
+            + self.unambig_incompetent
+            + self.unambig_missing
+            + self.unambig_emitted
+    }
+
+    /// `total_candidates` minus the sum of the terminal fates.
+    ///
+    /// **Must be exactly 0.** The expert team's P0 asked for an unaccounted
+    /// remainder of exactly zero, and this is that number. A non-zero value is
+    /// a real defect in the instrumentation — a candidate class that reached no
+    /// bucket, the way the `ΔAS` prune reached none before 2026-10-06.
+    pub fn deficit(&self) -> i64 {
+        self.total_candidates as i64 - self.terminal_sum() as i64
+    }
+
+    /// `live_candidates` minus `live_candidates_entered`, i.e. 0 when the
+    /// census's replay of the E-step's filter agrees with the E-step itself.
+    ///
+    /// This is a SECOND, independent identity, and it is the only thing that
+    /// can catch drift between `candidate_availability` and the E-step. Those
+    /// two are separate implementations of the same predicate — the census
+    /// re-derives `max_as`, the `saturating_sub` and the strict `>` itself, and
+    /// they agreed by inspection when this was written. Agreement by inspection
+    /// is not agreement, and the census has already silently diverged from the
+    /// E-step once (`params.get` vs `params[]`, documented below). This number
+    /// is what turns that class of bug from a wrong number into a crash.
+    pub fn census_vs_estep_deficit(&self) -> i64 {
+        self.live_candidates as i64 - self.live_candidates_entered as i64
+    }
 }
 
 /// Posterior entropy (in nats) of a single ambiguous read over its
@@ -1854,6 +2133,12 @@ pub fn write_emission_params_parquet(
 /// TEL-EM execution stats for logging / telemetry.
 #[derive(Debug, Clone)]
 pub struct TelEmStats {
+    /// Candidate conservation ledger. `deficit()` is asserted to be 0 inside
+    /// `solve_and_write_profile` before this is ever returned, so reaching a
+    /// caller with a non-zero deficit is not reachable through that entry
+    /// point; the field is public because the CLI prints the decomposition, and
+    /// the per-bucket magnitudes are the whole point of the exercise.
+    pub ledger: CandidateLedger,
     pub n_unambiguous: usize,
     pub n_ambiguous: usize,
     pub n_em_iter: usize,
@@ -2479,6 +2764,288 @@ mod tests {
             })
             .collect();
         candidate_availability(&graph, &graph.molecules[0], &params, PRUNE_MAX_DELTA_AS)
+    }
+
+    /// A graph with one molecule PER ENTRY of `molecules`, so a fixture can mix
+    /// the unambiguous and contested populations in a single solve.
+    ///
+    /// `synth_graph_with_gaps` builds exactly one molecule, so it cannot express
+    /// "one read with one candidate and another with three" — and the ledger is
+    /// precisely a statement about BOTH populations at once, so a fixture that
+    /// only ever has one of them would leave half the identity untested.
+    /// Transcript names are made globally unique by prefixing the read index,
+    /// because `candidate_pool` holds indices into ONE shared
+    /// `transcript_names` and two reads naming the same transcript is a
+    /// different (and separately interesting) scenario.
+    fn multi_molecule_graph(
+        log_pal: f32,
+        molecules: &[Vec<(&str, i32, u32)>],
+    ) -> FlatEvidenceGraph {
+        let mut g = FlatEvidenceGraph {
+            molecules: Vec::new(),
+            candidate_nm: Vec::new(),
+            candidate_mapq: Vec::new(),
+            candidate_pool: Vec::new(),
+            candidate_as: Vec::new(),
+            candidate_5p_gap: Vec::new(),
+            transcript_names: Vec::new(),
+            poly_a_is_placeholder: false,
+        };
+        for (mi, cands) in molecules.iter().enumerate() {
+            let offset = g.candidate_pool.len() as u32;
+            for (tx, as_score, gap) in cands {
+                let name = format!("r{mi}_{tx}");
+                g.candidate_pool.push(g.transcript_names.len() as u32);
+                g.transcript_names.push(name);
+                g.candidate_as.push(*as_score);
+                g.candidate_5p_gap.push(*gap);
+                g.candidate_nm.push(0);
+                g.candidate_mapq.push(60);
+            }
+            g.molecules.push(MoleculeEvidence {
+                read_id: format!("r{mi}"),
+                log_pal,
+                candidate_offset: offset,
+                candidate_count: cands.len() as u16,
+            });
+        }
+        g
+    }
+
+    /// The emission parquet matching [`multi_molecule_graph`]'s naming, for
+    /// every transcript named in `wants` and no others.
+    fn multi_molecule_emission(path: &Path, wants: &[&str]) {
+        let rows: Vec<(&str, &str, f64, f64)> = wants.iter().map(|t| (*t, "g", 7.0, 0.5)).collect();
+        write_test_emission(path, &rows);
+    }
+
+    /// THE CONSERVATION LAW. Every candidate the graph produced is claimed by
+    /// exactly one terminal fate.
+    ///
+    /// This is the test the 2026-10-06 P0 asked for. Before the ledger existed
+    /// the equivalent assertion was impossible to even state: the `ΔAS` prune
+    /// put a candidate in no bucket at all, so the sum of the buckets was short
+    /// of the candidate count by a number nothing reported. Mutation M22 reverts
+    /// the prune increment and must turn THIS test red — a ledger test that
+    /// cannot detect an unaccounted candidate is the same class of failure as
+    /// the bug it was written for.
+    ///
+    /// The fixture deliberately covers the four contested fates and all three
+    /// unambiguous ones in one solve, because the identity is a claim about
+    /// their SUM. A fixture exercising one bucket at a time would pass just as
+    /// happily with the buckets wired to the wrong branches.
+    #[test]
+    fn test_candidate_ledger_claims_every_candidate_exactly_once() {
+        let emission = local_scratch("ledger_emission.parquet");
+        let profile = local_scratch("ledger_profile.parquet");
+        // r0: 1 candidate  -> unambig, emitted.
+        // r1: 2 equal-AS   -> contested, both live, both emitted at MIN_WEIGHT.
+        // r2: 1 live + 1 at AS 500 -> contested, the second is ΔAS-pruned
+        //     (delta_as = 500 > 50) BEFORE the emission lookup, which is the
+        //     precedence being pinned: r2_bad is deliberately absent from the
+        //     emission parquet, and must be reported as pruned, not missing.
+        // r3: 1 candidate with no emission row -> unambig, missing.
+        let graph = multi_molecule_graph(
+            10.0,
+            &[
+                vec![("solo", 1000, 0)],
+                vec![("a", 1000, 0), ("b", 1000, 0)],
+                vec![("live", 1000, 0), ("bad", 500, 0)],
+                vec![("gone", 1000, 0)],
+            ],
+        );
+        multi_molecule_emission(&emission, &["r0_solo", "r1_a", "r1_b", "r2_live"]);
+
+        let stats = solve_and_write_profile(
+            graph,
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            5,
+            20.0,
+            FIVE_PRIME_OFF,
+            POLY_A_ON,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
+            None,
+            None,
+            None,
+        )
+        .expect("solve must succeed; the in-library tripwire would have fired otherwise");
+        let l = stats.ledger;
+
+        assert_eq!(
+            l.deficit(),
+            0,
+            "every candidate must have exactly one terminal fate. Ledger: {l:?}"
+        );
+        assert_eq!(l.total_candidates, 6, "1 + 2 + 2 + 1 candidates");
+        assert_eq!(l.pruned_delta_as, 1, "r2_bad: delta_as = 500 > 50");
+        assert_eq!(l.missing, 0, "the pruned candidate is never looked up");
+        assert_eq!(l.incompetent, 0);
+        assert_eq!(l.alpha_zero, 0);
+        assert_eq!(l.pruned_min_weight, 0, "MIN_WEIGHT = 0.01 on 0.5/0.5 pairs");
+        assert_eq!(l.dropped_output_competence, 0);
+        assert_eq!(l.rows_emitted, 3, "r1_a, r1_b, r2_live");
+        assert_eq!(l.unambig_emitted, 1, "r0_solo");
+        assert_eq!(l.unambig_missing, 1, "r3_gone");
+        assert_eq!(l.unambig_incompetent, 0);
+        assert_eq!(
+            l.census_vs_estep_deficit(),
+            0,
+            "the census replayed {} live candidates, the E-step carried {}",
+            l.live_candidates,
+            l.live_candidates_entered
+        );
+        assert_eq!(l.live_candidates, 3, "r1_a, r1_b, r2_live");
+    }
+
+    /// `min_weight` culling is a terminal fate and must be on the books.
+    ///
+    /// Uses `min_weight = 0.6` on a 2-way contested read whose posteriors are
+    /// 0.5/0.5, so BOTH fall below the cut and the read emits nothing. This is
+    /// the case the Round 8 deficit was most likely made of, and it is the one
+    /// bucket that moves with a caller-supplied flag — so it is pinned by
+    /// construction rather than by a baselined magnitude.
+    #[test]
+    fn test_candidate_ledger_attributes_min_weight_culls() {
+        let emission = local_scratch("ledger_mw_emission.parquet");
+        let profile = local_scratch("ledger_mw_profile.parquet");
+        let graph = multi_molecule_graph(
+            10.0,
+            &[vec![("a", 1000, 0)], vec![("x", 1000, 0), ("y", 1000, 0)]],
+        );
+        multi_molecule_emission(&emission, &["r0_a", "r1_x", "r1_y"]);
+
+        let stats = solve_and_write_profile(
+            graph,
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            5,
+            20.0,
+            FIVE_PRIME_OFF,
+            POLY_A_ON,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            0.6,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let l = stats.ledger;
+        assert_eq!(l.deficit(), 0, "ledger: {l:?}");
+        assert_eq!(l.pruned_min_weight, 2, "both 0.5-weight candidates");
+        assert_eq!(l.rows_emitted, 0, "the contested read emits nothing");
+        assert_eq!(l.unambig_emitted, 1, "the unambiguous read is unaffected");
+    }
+
+    /// At `min_weight = 0.0` the cutoff is provably inert: every posterior is
+    /// `exp(ll - log_z) >= 0`, so `w < 0.0` is never true. Pinning the zero is
+    /// a free check that `pruned_min_weight` is wired to THAT branch and not to
+    /// some other `continue` in the emit loop.
+    #[test]
+    fn test_candidate_ledger_min_weight_zero_prunes_nothing() {
+        let emission = local_scratch("ledger_mw0_emission.parquet");
+        let profile = local_scratch("ledger_mw0_profile.parquet");
+        let graph = multi_molecule_graph(
+            10.0,
+            &[vec![("a", 1000, 0)], vec![("x", 1000, 0), ("y", 1000, 0)]],
+        );
+        multi_molecule_emission(&emission, &["r0_a", "r1_x", "r1_y"]);
+        let stats = solve_and_write_profile(
+            graph,
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            5,
+            20.0,
+            FIVE_PRIME_OFF,
+            POLY_A_ON,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            0.0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let l = stats.ledger;
+        assert_eq!(l.pruned_min_weight, 0, "w < 0.0 is never true");
+        assert_eq!(l.deficit(), 0, "ledger: {l:?}");
+        assert_eq!(l.rows_emitted, 2, "both contested candidates emit");
+    }
+
+    /// The census must COUNT a pruned candidate even though it must not
+    /// ATTRIBUTE one to it. These are different questions and the ledger needs
+    /// the first while ghost decomposition needs the second.
+    #[test]
+    fn test_census_counts_the_prune_without_attributing_to_it() {
+        let av = census_fixture(
+            &[
+                (100, true, 0.5), // live
+                (20, true, 0.5),  // pruned: delta_as = 80 > 50
+            ],
+            &[true, true],
+        );
+        assert_eq!(av.n_pruned_delta_as, 1, "candidate 1 is pruned");
+        assert_eq!(av.n_live, 1, "and it is not live");
+        assert_eq!(
+            av.n_pruned_delta_as + av.n_live + av.n_missing + av.n_incompetent + av.n_alpha_zero,
+            2,
+            "the five buckets partition the candidate range"
+        );
+        // The prune still disqualifies uniform attribution: a read with a
+        // pruned candidate is not reported as `Missing`, because padding
+        // cannot revive a candidate the aligner already ruled out.
+        assert_eq!(
+            av.uniform_cause(2),
+            None,
+            "one live + one pruned is not a uniform cause"
+        );
+    }
+
+    /// `max_iter = 0` runs no E-step, so `last_estep_params` is empty and the
+    /// census would classify every contested candidate as having no emission
+    /// row — a confident falsehood about a run that never looked at one. The
+    /// ledger made that lie louder, so the input is rejected instead.
+    #[test]
+    fn test_max_iter_zero_is_rejected_rather_than_reported_as_all_missing() {
+        let emission = local_scratch("ledger_iter0_emission.parquet");
+        let profile = local_scratch("ledger_iter0_profile.parquet");
+        let graph = multi_molecule_graph(
+            10.0,
+            &[vec![("a", 1000, 0)], vec![("x", 1000, 0), ("y", 1000, 0)]],
+        );
+        multi_molecule_emission(&emission, &["r0_a", "r1_x", "r1_y"]);
+        let err = solve_and_write_profile(
+            graph,
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            0,
+            20.0,
+            FIVE_PRIME_OFF,
+            POLY_A_ON,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
+            None,
+            None,
+            None,
+        )
+        .expect_err("max_iter = 0 must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("max_iter must be >= 1"),
+            "error must name the cause, got: {msg}"
+        );
     }
 
     /// The census has to keep four things apart that all end in "this read has

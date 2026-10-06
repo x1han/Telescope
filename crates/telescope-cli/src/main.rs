@@ -1029,10 +1029,74 @@ fn main() -> Result<()> {
                         + stats.n_ghost_read_all_alpha_zero
                 )
             );
-            eprintln!("[telescope]    output-stage row filter -- a ROW count, not reads; a");
             eprintln!(
-                "[telescope]    tripwire that must stay 0: {}",
+                "[telescope]    output-stage row filter -- a ROW count, not reads; a \
+                 tripwire that must stay 0: {}",
                 stats.n_dropped_output_row_competence
+            );
+            // CANDIDATE CONSERVATION LEDGER. A count of CANDIDATE ROWS, on its
+            // own denominator, for the same reason the two groups above are not
+            // pooled: a candidate cannot be lost for the same reason a read
+            // cannot, and reading the two ladders against each other is how the
+            // original 20.10% deficit went unexamined for a round.
+            let led = &stats.ledger;
+            eprintln!("[telescope]    candidate ledger (every candidate, one terminal fate):");
+            eprintln!(
+                "[telescope]      candidates off the graph          : {}",
+                led.total_candidates
+            );
+            eprintln!("[telescope]      -- contested, decided by the E-step:");
+            eprintln!(
+                "[telescope]         pruned by delta-AS            : {}",
+                led.pruned_delta_as
+            );
+            eprintln!(
+                "[telescope]         no emission row                : {}",
+                led.missing
+            );
+            eprintln!(
+                "[telescope]         is_polyA_competent == false   : {}",
+                led.incompetent
+            );
+            eprintln!(
+                "[telescope]         alpha <= 0                    : {}",
+                led.alpha_zero
+            );
+            eprintln!("[telescope]      -- contested, decided at the output stage:");
+            eprintln!(
+                "[telescope]         below min_weight              : {}   (moves with --min-weight; 0 by construction at 0)",
+                led.pruned_min_weight
+            );
+            eprintln!(
+                "[telescope]         recheck competence / params    : {}   (tripwire, must stay 0)",
+                led.dropped_output_competence
+            );
+            eprintln!(
+                "[telescope]         rows emitted                  : {}",
+                led.rows_emitted
+            );
+            eprintln!("[telescope]      -- unambiguous reads (1 candidate each):");
+            eprintln!(
+                "[telescope]         is_polyA_competent == false   : {}",
+                led.unambig_incompetent
+            );
+            eprintln!(
+                "[telescope]         no emission row                : {}",
+                led.unambig_missing
+            );
+            eprintln!(
+                "[telescope]         rows emitted                  : {}",
+                led.unambig_emitted
+            );
+            eprintln!(
+                "[telescope]      UNACCOUNTED DEFICIT             : {}   (must be exactly 0; \
+                 the run aborts above if it is not)",
+                led.deficit()
+            );
+            eprintln!(
+                "[telescope]      census vs E-step disagreement   : {}   (must be 0; these are \
+                 two implementations of one predicate)",
+                led.census_vs_estep_deficit()
             );
             let n_ambig = stats.n_ambiguous.max(1) as f64;
             eprintln!("[telescope]    posterior entropy histogram:");
