@@ -1356,7 +1356,7 @@ mod tests {
     fn read_provenance_parquet(path: &Path) -> Vec<(String, String, String, u32)> {
         let f = File::open(path).expect("open provenance parquet");
         let b = ParquetRecordBatchReaderBuilder::try_new(f).expect("init provenance reader");
-        let mut reader = b.with_batch_size(8192).build().expect("build");
+        let reader = b.with_batch_size(8192).build().expect("build");
         let mut out = Vec::new();
         for batch in reader {
             let batch = batch.expect("provenance batch");
