@@ -1023,6 +1023,26 @@ fn main() -> Result<()> {
                 stats.n_entropy_degenerate,
                 stats.n_entropy_degenerate as f64 / n_ambig * 100.0
             );
+            // The degenerate reads split by MECHANISM, because the two are
+            // flat for different reasons and a single number cannot be read.
+            // Both are printed against the SAME denominator -- the degenerate
+            // total, not n_ambig -- because the question is "of the degenerate
+            // reads, how many are this kind", and dividing by n_ambig here would
+            // silently answer a different question. The CLI prints the
+            // residual `n_ambig - degenerate` nowhere, so this is the only
+            // place the composition is visible.
+            eprintln!(
+                "[telescope]        of which padded-padded ambiguity: {} ({:.1}% of degenerate)",
+                stats.n_degenerate_all_imputed,
+                stats.n_degenerate_all_imputed as f64 / stats.n_entropy_degenerate.max(1) as f64
+                    * 100.0
+            );
+            eprintln!(
+                "[telescope]        of which real candidate competition: {} ({:.1}% of degenerate)",
+                stats.n_degenerate_with_anchored,
+                stats.n_degenerate_with_anchored as f64 / stats.n_entropy_degenerate.max(1) as f64
+                    * 100.0
+            );
             // Degradation telemetry. TWO zero-power metrics, because at less
             // than full model coverage the old one is largely vacuous -- a read
             // with one emission candidate satisfies "all candidates share one

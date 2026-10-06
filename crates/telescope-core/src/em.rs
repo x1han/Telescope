@@ -24,7 +24,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use arrow::array::{
     BooleanArray, Float32Builder, Float64Array, Float64Builder, Int32Builder, StringArray,
-    StringBuilder, UInt16Builder,
+    StringBuilder, UInt16Builder, UInt32Array, UInt32Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -51,6 +51,23 @@ pub struct TranscriptParam {
     pub sigma2: f64,
     /// Mixing proportion π_k (initialized at iter 0, updated each M-step).
     pub alpha: f64,
+    /// TRUE when this row was IMPUTED to reach the reference universe, i.e.
+    /// `n_cohort_flnc == 0` in the emission parquet. It carries the cohort
+    /// fit rather than a fit of its own, so every imputed row of one build
+    /// shares an identical `(mu, sigma2)` pair.
+    ///
+    /// This is NOT inferable from the likelihood: an imputed row is
+    /// numerically indistinguishable from an observed row that happens to
+    /// have drawn the cohort median. It is read from the marker column
+    /// because the 7-column schema is frozen and there is nowhere else for
+    /// it to live.
+    ///
+    /// The counter it exists for (`n_degenerate_all_imputed`) is a
+    /// DIAGNOSTIC, not a quality score: a flat posterior over several
+    /// imputed rows means the poly(A) term could not separate them, and the
+    /// question is whether that is a modelling gap or a genuine tie between
+    /// real transcripts. See `README` in comms/2026-10-05-round6-summary.
+    pub is_imputed: bool,
 }
 
 /// Load `telescope.emission.parquet` produced by Module 1.
@@ -102,6 +119,18 @@ pub fn load_emission_parameters<P: AsRef<Path>>(
             .as_any()
             .downcast_ref::<Float64Array>()
             .context("sigma2_logPAL is not Float64Array")?;
+        // `n_cohort_flnc == 0` is the ONLY in-schema marker of an imputed row.
+        // It is REQUIRED, not optional: an emission model built without
+        // `--reference-bam` still emits a `n_cohort_flnc` column, and reading
+        // it as required means a hand-built model that omits the column is
+        // rejected here instead of silently classifying every row as
+        // anchored and reporting a degenerate count of zero.
+        let nobs_col = batch
+            .column_by_name("n_cohort_flnc")
+            .context("Missing 'n_cohort_flnc'")?
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .context("n_cohort_flnc is not UInt32Array")?;
 
         for i in 0..batch.num_rows() {
             let tr_id = tr_col.value(i).to_string();
@@ -122,6 +151,7 @@ pub fn load_emission_parameters<P: AsRef<Path>>(
                     sigma2_cohort,
                     sigma2: sigma2_cohort,
                     alpha: 0.0, // initialized in solve_and_write_profile
+                    is_imputed: nobs_col.value(i) == 0,
                 },
             );
         }
@@ -784,6 +814,8 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
     let mut n_entropy_clean = 0_u64;
     let mut n_entropy_partial = 0_u64;
     let mut n_entropy_degenerate = 0_u64;
+    let mut n_degenerate_all_imputed = 0_u64;
+    let mut n_degenerate_with_anchored = 0_u64;
     let mut n_polya_zero_power = 0_u64;
 
     // Per-read assignments are filled into a molecule-indexed slot vector and
@@ -963,6 +995,48 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
                 n_entropy_partial += 1;
             } else {
                 n_entropy_degenerate += 1;
+                // Split the degenerate reads by WHY they are flat.
+                //
+                // `weights` carries the GLOBAL transcript id of every surviving
+                // candidate (pushed as `tx_id`, which is
+                // `graph.candidate_pool[...]`, not a position in the
+                // candidate list), and `params` is indexed by that same global
+                // id -- so the imputed flag is one lookup and there is no
+                // second pass and no change to the hot path's arithmetic.
+                //
+                // WHAT THIS DELIBERATELY DOES NOT DO: it does not also split on
+                // "ΔAS == 0 among the survivors". That looks like a free extra
+                // axis and is not. `raw` is NOT index-aligned with the
+                // candidate list -- a candidate with no emission row falls
+                // through the `if let Some(ref p)` arm and pushes NOTHING --
+                // so the surviving entries cannot be mapped back to
+                // `graph.candidate_as` positions without either duplicating
+                // the E-step's three-way survival predicate (which would be a
+                // second implementation of a rule that can silently drift) or
+                // changing the E-step's tuple type. Neither is worth it for a
+                // sub-classification of a diagnostic. The H > 0.70 gate has
+                // already established that the posterior IS flat; whether the
+                // alignment term also tied is a strictly finer question and is
+                // left unasked rather than answered approximately.
+                let mut all_imputed = true;
+                for &(tx_idx, w) in &weights {
+                    if w <= 0.0 {
+                        continue;
+                    }
+                    let imputed = params[tx_idx]
+                        .as_ref()
+                        .map(|p| p.is_imputed)
+                        .unwrap_or(true);
+                    if !imputed {
+                        all_imputed = false;
+                        break;
+                    }
+                }
+                if all_imputed {
+                    n_degenerate_all_imputed += 1;
+                } else {
+                    n_degenerate_with_anchored += 1;
+                }
             }
         }
 
@@ -1238,6 +1312,8 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         n_entropy_clean,
         n_entropy_partial,
         n_entropy_degenerate,
+        n_degenerate_all_imputed,
+        n_degenerate_with_anchored,
         n_polya_zero_power,
         n_polya_zero_power_resolved,
         n_reads_multi_emission_candidate,
@@ -1880,6 +1956,33 @@ pub struct TelEmStats {
     /// re-derives these tiers from the doc comment rather than from the
     /// comparison in the E-step will bin the wrong reads.
     pub n_entropy_degenerate: u64,
+    /// Of the `n_entropy_degenerate` reads, the ones whose ENTIRE surviving
+    /// candidate set is IMPUTED (`n_cohort_flnc == 0`, carrying the shared
+    /// cohort fit). Unit: READS. Denominator: `n_entropy_degenerate`.
+    ///
+    /// This is the `padded-padded ambiguity` of the expert ruling. It exists
+    /// because those reads are flat for a MECHANISM that is not the same as
+    /// a genuine tie: every candidate shares one identical density, so the
+    /// poly(A) term is EXACTLY zero in every pairwise odds ratio and the read
+    /// is decided by the alignment and abundance terms alone. A read that is
+    /// flat across two real, differently-fitted transcripts is flat for a
+    /// different reason, and conflating the two makes the count unreadable.
+    ///
+    /// Read this as a DIAGNOSTIC split, not a verdict. Both sub-populations
+    /// are real ambiguity between real transcripts; whether the first is a
+    /// modelling gap or an accurate statement of a tie is an open question
+    /// and is NOT decided by these counters.
+    pub n_degenerate_all_imputed: u64,
+    /// `n_degenerate_all_imputed`'s complement inside `n_entropy_degenerate`:
+    /// reads that are degenerate with at least one ANCHORED candidate in the
+    /// set. Unit: READS. Denominator: `n_entropy_degenerate`.
+    ///
+    /// `n_degenerate_all_imputed + n_degenerate_with_anchored` must equal
+    /// `n_entropy_degenerate` EXACTLY, and `verify_step0_drops.py`'s successor
+    /// checks that it does. Three counters that partition a fourth is only
+    /// useful if the partition is checked; `test_degenerate_tie_split_partitions_the_degenerate_reads`
+    /// is what turns a claim about the split into a checked one.
+    pub n_degenerate_with_anchored: u64,
     /// DEGRADATION TELEMETRY. Contested reads (≥ 2 candidates) whose
     /// candidate set carries ZERO poly(A) discriminative power: every
     /// candidate that has an emission row shares one identical
@@ -1995,6 +2098,26 @@ mod tests {
         std::env::temp_dir().join(format!("telescope_em_{}_{}", name, std::process::id()))
     }
 
+    /// Same as `scratch` but on the LOCAL filesystem (`/tmp`, xfs) rather than
+    /// `$TMPDIR`.
+    ///
+    /// `$TMPDIR` here is `/datg/hanxi/tmp`, which is **nfs4**. A parquet written
+    /// there and then immediately opened for reading is subject to NFS client
+    /// attribute caching: under enough concurrent I/O the reader can observe
+    /// `Size is 0 but need 8` even though the writer closed the file
+    /// successfully moments earlier. That is a real, observed failure of this
+    /// suite (it took out `test_degenerate_tie_split...` intermittently, only
+    /// when the full 78-test set ran in parallel, never in isolation).
+    ///
+    /// The broader `scratch()` still uses `$TMPDIR` and that is a live
+    /// flakiness risk for every test in this module, not just this one. It is
+    /// NOT changed here because it is outside the scope of this change and
+    /// would need its own mutation/repeat evidence to be trusted; it is
+    /// recorded in EXPERIMENT.md as an open item instead.
+    fn local_scratch(name: &str) -> PathBuf {
+        PathBuf::from("/tmp").join(format!("telescope_em_{}_{}", name, std::process::id()))
+    }
+
     /// Write a minimal `telescope.emission.parquet`: one poly(A)-competent row
     /// per `(transcript_id, gene_id, mu_logPAL, sigma2_logPAL)`.
     fn write_test_emission(path: &Path, rows: &[(&str, &str, f64, f64)]) {
@@ -2012,25 +2135,50 @@ mod tests {
     /// while that keeps incompetent rows out of `weights`. Nothing tested that
     /// coupling, so a future change to the mask would silently break
     /// normalisation with every test still green.
+    /// `n_cohort_flnc` is written as a NON-ZERO constant for every row, so
+    /// every pre-existing test using this helper keeps its original meaning:
+    /// no row is imputed.
+    ///
+    /// It is written at all, rather than omitted, because the loader now
+    /// REQUIRES the column. That requirement is deliberate -- a hand-built
+    /// model without the marker would otherwise be read as "every row is
+    /// anchored" and `n_degenerate_all_imputed` would report a confident 0.
+    /// `write_test_emission_with_nobs` is the variant that can mark a row
+    /// imputed.
     fn write_test_emission_with_competence(path: &Path, rows: &[(&str, &str, f64, f64, bool)]) {
+        let with_nobs: Vec<(&str, &str, f64, f64, bool, u32)> = rows
+            .iter()
+            .map(|&(tx, g, mu, s2, c)| (tx, g, mu, s2, c, 10))
+            .collect();
+        write_test_emission_with_nobs(path, &with_nobs)
+    }
+
+    /// Same as `write_test_emission_with_competence` but with an explicit
+    /// `n_cohort_flnc` per row, so a test can mark a row IMPUTED with 0 -- the
+    /// only in-schema signal that the row carries the cohort fit rather than
+    /// one of its own.
+    fn write_test_emission_with_nobs(path: &Path, rows: &[(&str, &str, f64, f64, bool, u32)]) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("transcript_id", DataType::Utf8, false),
             Field::new("gene_id", DataType::Utf8, false),
             Field::new("is_polyA_competent", DataType::Boolean, false),
             Field::new("mu_logPAL", DataType::Float64, false),
             Field::new("sigma2_logPAL", DataType::Float64, false),
+            Field::new("n_cohort_flnc", DataType::UInt32, false),
         ]));
         let mut tx_b = StringBuilder::new();
         let mut gene_b = StringBuilder::new();
         let mut comp_b = BooleanBuilder::new();
         let mut mu_b = Float64Builder::new();
         let mut s2_b = Float64Builder::new();
-        for &(tx, gene, mu, sigma2, is_competent) in rows {
+        let mut nobs_b = UInt32Builder::new();
+        for &(tx, gene, mu, sigma2, is_competent, nobs) in rows {
             tx_b.append_value(tx);
             gene_b.append_value(gene);
             comp_b.append_value(is_competent);
             mu_b.append_value(mu);
             s2_b.append_value(sigma2);
+            nobs_b.append_value(nobs);
         }
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -2040,6 +2188,7 @@ mod tests {
                 Arc::new(comp_b.finish()),
                 Arc::new(mu_b.finish()),
                 Arc::new(s2_b.finish()),
+                Arc::new(nobs_b.finish()),
             ],
         )
         .unwrap();
@@ -2325,6 +2474,7 @@ mod tests {
                     sigma2_cohort: 0.04,
                     sigma2: 0.04,
                     alpha,
+                    is_imputed: false, // test fixture: every row is anchored
                 })
             })
             .collect();
@@ -5071,6 +5221,7 @@ mod tests {
                     sigma2_cohort: sigma2,
                     sigma2,
                     alpha: 0.5,
+                    is_imputed: false, // test fixture: every row is anchored
                 })
             })
             .collect();
@@ -5417,6 +5568,140 @@ mod tests {
     /// asserting 0 here is what documents that the gap is known rather than
     /// accidental.
     #[test]
+    /// The `padded-padded ambiguity` split, and the partition it claims.
+    ///
+    /// DESIGN NOTE, because it is the whole point: this does NOT try to
+    /// hand-craft a read that is degenerate in one bucket and not the other.
+    /// Doing that would mean tuning alphas until one posterior crossed
+    /// H = 0.70, and a fixture tuned that finely is a fixture whose
+    /// assertion can be made to pass for the wrong reason.
+    ///
+    /// Instead it runs the SAME fixture twice, changing ONE column -- the
+    /// `n_cohort_flnc` marker -- and requires the split to follow it:
+    ///
+    ///   run A: every row has n_cohort_flnc == 0  => every degenerate read is
+    ///          padded-padded
+    ///   run B: every row has n_cohort_flnc == 10 => every degenerate read is
+    ///          real competition
+    ///
+    /// Each run also asserts the partition holds, which is the invariant the
+    /// CLI comment relies on. A classifier that ignored `is_imputed`, or that
+    /// put everything in one bucket, fails one of the two runs. A classifier
+    /// that reported 0 for both would pass the partition check alone -- the
+    /// `> 0` assertions are what stop that, which is why they are here.
+    #[test]
+    fn test_degenerate_tie_split_partitions_the_degenerate_reads() {
+        let log_pal = (100.0_f32).log2();
+
+        // Four candidates, identical mu/sigma2 and identical AS, so the
+        // posterior is exactly uniform: H = ln 4 = 1.386 nats, comfortably
+        // above the 0.70 degenerate bound. Four rather than three so the
+        // fixture is not sitting on the boundary of its own threshold.
+        // A per-call counter in every fixture path. `scratch()` already keys on
+        // the process id, which is constant for all tests in one binary -- so
+        // two tests (or two definitions of one test) that pick the same fixture
+        // name would share a file and truncate each other's parquet while
+        // running in parallel. This test failed exactly that way once, during
+        // development, with an empty parquet, and did not reproduce; the fix is
+        // to remove the collision class rather than to leave a test whose
+        // failure I cannot explain.
+        let call = std::sync::atomic::AtomicUsize::new(0);
+        let run = |nobs: u32, tag: &str| {
+            let uniq = call.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let emission = local_scratch(&format!("degen_split_{tag}_{uniq}_emission.parquet"));
+            let profile = local_scratch(&format!("degen_split_{tag}_{uniq}_profile.parquet"));
+            write_test_emission_with_nobs(
+                &emission,
+                &[
+                    ("tx0", "gene0", 7.0, 0.04, true, nobs),
+                    ("tx1", "gene0", 7.0, 0.04, true, nobs),
+                    ("tx2", "gene0", 7.0, 0.04, true, nobs),
+                    ("tx3", "gene0", 7.0, 0.04, true, nobs),
+                ],
+            );
+            let sz = std::fs::metadata(&emission).map(|m| m.len()).unwrap_or(0);
+            assert!(
+                sz > 8,
+                "FIXTURE NOT WRITTEN: {} is {} bytes right after writing",
+                emission.display(),
+                sz
+            );
+            let graph = FlatEvidenceGraph {
+                molecules: vec![MoleculeEvidence {
+                    read_id: "FLAT".into(),
+                    log_pal,
+                    candidate_offset: 0,
+                    candidate_count: 4,
+                }],
+                candidate_nm: vec![0; 4],
+                candidate_mapq: vec![60; 4],
+                candidate_as: vec![900; 4],
+                candidate_5p_gap: vec![0; 4],
+                candidate_pool: vec![0, 1, 2, 3],
+                transcript_names: (0..4).map(|i| format!("tx{i}")).collect(),
+                poly_a_is_placeholder: false,
+            };
+            let stats = solve_and_write_profile(
+                graph,
+                &emission,
+                "TEST",
+                &profile,
+                1e-6,
+                1,
+                20.0,
+                FIVE_PRIME_OFF,
+                POLY_A_ON,
+                FIVE_PRIME_WINDOW,
+                PRUNE_MAX_DELTA_AS,
+                MIN_WEIGHT,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            (stats, emission, profile)
+        };
+
+        // Cleanup AFTER both runs, not inside the closure: a solve that failed
+        // would otherwise have already deleted the fixture it was reading.
+        let (all_imputed, e1, p1) = run(0, "imputed");
+
+        // Guard: the fixture must actually produce a degenerate read, or both
+        // of the assertions below are about zero.
+        let (all_imputed, _e1, _p1) = run(0, "imputed");
+        assert!(
+            all_imputed.n_entropy_degenerate > 0,
+            "FIXTURE IS BROKEN: four identical candidates must give H = ln 4 > 0.70, \
+             but n_entropy_degenerate == 0"
+        );
+        assert_eq!(
+            all_imputed.n_degenerate_all_imputed + all_imputed.n_degenerate_with_anchored,
+            all_imputed.n_entropy_degenerate,
+            "the split must PARTITION the degenerate reads, not overlap or leave a remainder"
+        );
+        assert_eq!(
+            all_imputed.n_degenerate_all_imputed, all_imputed.n_entropy_degenerate,
+            "every candidate carries n_cohort_flnc == 0, so every degenerate read is \
+             padded-padded ambiguity"
+        );
+
+        let (all_anchored, e2, p2) = run(10, "anchored");
+
+        for f in [e1, p1, e2, p2] {
+            let _ = std::fs::remove_file(f);
+        }
+        assert_eq!(
+            all_anchored.n_degenerate_all_imputed + all_anchored.n_degenerate_with_anchored,
+            all_anchored.n_entropy_degenerate,
+            "the split must partition here too"
+        );
+        assert_eq!(
+            all_anchored.n_degenerate_with_anchored, all_anchored.n_entropy_degenerate,
+            "the SAME fixture with n_cohort_flnc == 10 must move every degenerate read to \
+             real competition. If this fails, the classifier is not reading the marker."
+        );
+    }
+
     fn test_drop_taxonomy_attributes_every_lost_read_to_exactly_one_cause() {
         let log_pal = (100.0_f32).log2();
         let emission = scratch("drop_taxonomy_emission.parquet");
