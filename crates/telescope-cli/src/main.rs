@@ -655,7 +655,21 @@ fn main() -> Result<()> {
             );
             std::fs::write(&prov_path, prov)
                 .with_context(|| format!("Failed to write provenance sidecar {:?}", prov_path))?;
-            eprintln!("[telescope]  provenance sidecar: {}", prov_path.display());
+            eprintln!("[telescope]  provenance JSON : {}", prov_path.display());
+            // The PER-TRANSCRIPT sidecar is the one `summarize --provenance`
+            // consumes, and it is a different file from the JSON above. Both are
+            // printed because they are easy to confuse and the confusion is
+            // silent: handing the JSON to `--provenance` fails as a missing
+            // parquet column, which reads like a corrupt build rather than
+            // like the wrong argument.
+            eprintln!(
+                "[telescope]  provenance table: {}",
+                tiers.provenance_path.display()
+            );
+            eprintln!(
+                "[telescope]    (pass THIS to `summarize --provenance`; the JSON above \
+                 is a human-readable run header)"
+            );
             eprintln!("[telescope] done.");
             Ok(())
         }
