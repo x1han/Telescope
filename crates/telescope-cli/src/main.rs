@@ -1042,10 +1042,17 @@ fn main() -> Result<()> {
             let led = &stats.ledger;
             eprintln!("[telescope]    candidate ledger (every candidate, one terminal fate):");
             eprintln!(
-                "[telescope]      candidates off the graph          : {}",
+                "[telescope]      candidates on the graph (LHS)     : {}",
                 led.total_candidates
             );
-            eprintln!("[telescope]      -- contested, decided by the E-step:");
+            // The census tests these four in this order and `continue`s, so a
+            // candidate that is BOTH pruned and emission-less is counted ONLY
+            // as pruned. The `no emission row` line is not a count of
+            // candidates lacking an emission row; it is a count of candidates
+            // that got past the prune and then had none.
+            eprintln!(
+                "[telescope]      -- contested, decided by the E-step (tested in this order):"
+            );
             eprintln!(
                 "[telescope]         pruned by delta-AS            : {}",
                 led.pruned_delta_as
@@ -1088,14 +1095,18 @@ fn main() -> Result<()> {
                 "[telescope]         rows emitted                  : {}",
                 led.unambig_emitted
             );
+            // Both of these can only ever print 0: solve_and_write_profile
+            // asserts them and returns Err before the CLI is reached. They are
+            // a CONFIRMATION that the assert ran, not independent evidence of
+            // closure -- do not cite the printed 0 as the measurement.
             eprintln!(
-                "[telescope]      UNACCOUNTED DEFICIT             : {}   (must be exactly 0; \
-                 the run aborts above if it is not)",
+                "[telescope]      UNACCOUNTED DEFICIT             : {}   (asserted == 0 in \
+                 solve_and_write_profile; this line only confirms the assert ran)",
                 led.deficit()
             );
             eprintln!(
-                "[telescope]      census vs E-step disagreement   : {}   (must be 0; these are \
-                 two implementations of one predicate)",
+                "[telescope]      census vs E-step disagreement   : {}   (same condition as the \
+                 deficit, not an independent one; kept because it names the cause)",
                 led.census_vs_estep_deficit()
             );
             let n_ambig = stats.n_ambiguous.max(1) as f64;

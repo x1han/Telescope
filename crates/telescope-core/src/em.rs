@@ -1348,32 +1348,48 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
     // binary checks is an invariant the test suite never exercises.
     //
     // What a non-zero value means, stated because the failure mode is
-    // misattribution: it means a class of candidate reached no terminal bucket,
-    // which is exactly the state the ledger was in before `ΔAS`-pruned
-    // candidates were counted (HC2: a 4,535,230 deficit, 20.10%). It does NOT
-    // mean candidates are being lost from the profile. `min_weight` is a
-    // caller-supplied cutoff and a fifth of a six-way contested read falling
-    // below 0.01 posterior is an ordinary, expected shape; that mass belongs in
-    // `pruned_min_weight`, which is precisely what makes `deficit()` 0.
+    // misattribution. It means one of exactly two things, and the message
+    // names both rather than guessing:
+    //
+    //   (a) the census and the E-step have drifted apart, so a class of
+    //       candidate reached no terminal bucket -- the state the ledger was in
+    //       before `ΔAS`-pruned candidates were counted (HC2: 4,535,230, 20.10%);
+    //   (b) a candidate produced a non-finite posterior, so `filter(ll > -inf)`
+    //       dropped it while the census counted it live. NOT reachable from
+    //       `build-emission`, which floors `sigma2` at
+    //       `INSTRUMENTAL_PAL_NOISE_FLOOR` in both writers, but a HAND-BUILT
+    //       emission parquet can carry `sigma2 <= 0` and make the Gaussian NaN.
+    //
+    // It does NOT mean candidates are being lost from the profile. `min_weight`
+    // is a caller-supplied cutoff and a fifth of a six-way contested read
+    // falling below 0.01 posterior is an ordinary, expected shape; that mass
+    // belongs in `pruned_min_weight`, which is precisely what makes
+    // `deficit()` 0.
     anyhow::ensure!(
         ledger.deficit() == 0,
         "candidate ledger does not close: deficit {} (candidates {} vs terminal fates {}). \
-         This is an instrumentation defect -- some class of candidate reached no bucket -- \
-         NOT lost reads. The profile at {:?} was written in full and is intact; keep it and \
-         use it to find the unaccounted class. Per-bucket ledger: {:?}",
+         Either the census and the E-step have drifted apart, or a candidate produced a \
+         non-finite posterior (a hand-built emission parquet with sigma2 <= 0 will do it). \
+         NOT lost reads -- `min_weight` culling is accounted for. \
+         The profile at {:?} was written in full and is intact; keep it and use it to find \
+         the unaccounted class. Per-bucket ledger: {:?}",
         ledger.deficit(),
         ledger.total_candidates,
         ledger.terminal_sum(),
         output_profile_path.as_ref(),
         ledger,
     );
+    // Same condition as the assert above, not an independent one -- see
+    // `CandidateLedger::census_vs_estep_deficit`. Kept because when it fires it
+    // names WHICH quantity disagreed, and `deficit()` alone reports the symptom.
     anyhow::ensure!(
         ledger.census_vs_estep_deficit() == 0,
         "candidate census disagrees with the E-step by {} candidates: the census replayed \
          {} live candidates but the E-step carried {} into `weights`. These are two \
          implementations of one predicate (max_as, the saturating_sub, the strict `>`) and \
          they have drifted apart. Do NOT loosen this assert -- the census is a reimplementation \
-         and the drift, not the assert, is the bug. Ledger: {:?}",
+         and the drift, not the assert, is the bug. NOTE: algebraically the same condition \
+         `deficit()` checks, kept because it names the cause. Ledger: {:?}",
         ledger.census_vs_estep_deficit(),
         ledger.live_candidates,
         ledger.live_candidates_entered,
@@ -1901,17 +1917,27 @@ impl CandidateLedger {
         self.total_candidates as i64 - self.terminal_sum() as i64
     }
 
-    /// `live_candidates` minus `live_candidates_entered`, i.e. 0 when the
-    /// census's replay of the E-step's filter agrees with the E-step itself.
+    /// `live_candidates` minus `live_candidates_entered`.
     ///
-    /// This is a SECOND, independent identity, and it is the only thing that
-    /// can catch drift between `candidate_availability` and the E-step. Those
-    /// two are separate implementations of the same predicate — the census
-    /// re-derives `max_as`, the `saturating_sub` and the strict `>` itself, and
-    /// they agreed by inspection when this was written. Agreement by inspection
-    /// is not agreement, and the census has already silently diverged from the
-    /// E-step once (`params.get` vs `params[]`, documented below). This number
-    /// is what turns that class of bug from a wrong number into a crash.
+    /// **This is NOT an independent check on `deficit()`.** It is algebraically
+    /// the same condition, and the first version of this doc comment claimed
+    /// otherwise, which was wrong. Given the census partitions each contested
+    /// read's candidates and `weights.len() == n_live`:
+    ///
+    /// ```text
+    /// deficit() == 0  <=>  live_candidates == live_candidates_entered
+    /// ```
+    ///
+    /// The unambiguous arm cancels identically (one candidate in, one of three
+    /// buckets out), so it cannot break the tie either. Both tripwires fire on
+    /// exactly one event.
+    ///
+    /// It is kept anyway, and kept for a narrower reason than independence:
+    /// when it fires, it says *which* quantity disagreed, and the census and
+    /// the E-step being two implementations of one predicate (`max_as`, the
+    /// `saturating_sub`, the strict `>`) is the reason that disagreement is
+    /// possible at all. `deficit()` reports the symptom; this names the cause.
+    /// Deleting it would be defensible; calling it a second identity is not.
     pub fn census_vs_estep_deficit(&self) -> i64 {
         self.live_candidates as i64 - self.live_candidates_entered as i64
     }
@@ -2979,6 +3005,88 @@ mod tests {
         assert_eq!(l.pruned_min_weight, 0, "w < 0.0 is never true");
         assert_eq!(l.deficit(), 0, "ledger: {l:?}");
         assert_eq!(l.rows_emitted, 2, "both contested candidates emit");
+    }
+
+    /// `incompetent` is the one death cause the conservation law alone cannot
+    /// police, and this pins it end to end.
+    ///
+    /// Added 2026-10-06 after a review pass swapped the `incompetent` and
+    /// `alpha_zero` increments in the census-to-ledger accumulation and the
+    /// suite stayed **90 passed / 0 failed** -- the sum is preserved either way,
+    /// so the tripwire still read 0. That is the M24 failure class: a misfiled
+    /// bucket is invisible to a total-only assertion.
+    ///
+    /// WHY `alpha_zero` IS NOT PINNED HERE, having been tried and removed. It is
+    /// **structurally unreachable through the solver**, and this module already
+    /// says so: a transcript reaches `alpha == 0` only by winning no posterior
+    /// mass, and a transcript that wins no mass was already dead by competence
+    /// or by having no emission row. An earlier version of this test wrote an
+    /// emission row intended to have `alpha == 0` and asserted the bucket was 1.
+    /// It failed with `alpha_zero: 0` -- the M-step rewrites `alpha` from the
+    /// posterior before the census reads it, and the row's transcript simply
+    /// tied with its identical neighbours and won half the mass. That is the
+    /// fixture fighting a real property of the code, not a defect in the fixture.
+    ///
+    /// So `alpha_zero`'s own bucketing is pinned where it IS reachable, by
+    /// `test_candidate_availability_keeps_four_death_causes_apart` calling
+    /// `candidate_availability` directly, and the AGGREGATION wiring is pinned
+    /// from the `incompetent` side: M25 transposes the two increments, driving
+    /// `incompetent` to 0 and turning THIS test red even though `alpha_zero` is
+    /// unreachable either way.
+    #[test]
+    fn test_candidate_ledger_attributes_an_incompetent_candidate_end_to_end() {
+        let emission = local_scratch("ledger_cause_emission.parquet");
+        let profile = local_scratch("ledger_cause_profile.parquet");
+        // r0_incomp: present, is_competent == false
+        // r0_ok / r0_ok2: present, competent, identical fit, so they tie
+        // exactly and split the posterior. r0_incomp is pushed as `-inf` by the
+        // E-step and must land in `incompetent`.
+        let graph = multi_molecule_graph(
+            10.0,
+            &[vec![("incomp", 1000, 0), ("ok", 1000, 0), ("ok2", 1000, 0)]],
+        );
+        let rows: [(&str, &str, f64, f64, bool); 3] = [
+            ("r0_incomp", "g", 7.0, 0.5, false),
+            ("r0_ok", "g", 7.0, 0.5, true),
+            ("r0_ok2", "g", 7.0, 0.5, true),
+        ];
+        write_test_emission_with_competence(&emission, &rows);
+
+        let mut params = Vec::new();
+        let stats = solve_and_write_profile(
+            graph,
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            5,
+            20.0,
+            FIVE_PRIME_OFF,
+            POLY_A_ON,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
+            None,
+            Some(&mut params),
+            None,
+        )
+        .unwrap();
+        let l = stats.ledger;
+        assert_eq!(l.deficit(), 0, "ledger: {l:?}");
+        assert_eq!(
+            l.incompetent, 1,
+            "r0_incomp: present but is_competent == false. If this reads 0, the \
+             increment was transposed with `alpha_zero` -- that is mutation M25."
+        );
+        assert_eq!(l.missing, 0, "every transcript has an emission row");
+        assert_eq!(
+            l.alpha_zero, 0,
+            "structurally unreachable through the solver; see the doc comment. \
+             Asserted explicitly so a future change that makes it non-zero is \
+             noticed rather than silently absorbed into a passing sum."
+        );
+        assert_eq!(l.live_candidates, 2, "the two competent candidates");
+        assert_eq!(l.rows_emitted, 2);
     }
 
     /// The census must COUNT a pruned candidate even though it must not
