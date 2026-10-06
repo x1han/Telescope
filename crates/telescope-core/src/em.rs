@@ -1116,36 +1116,54 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         //       tell them apart. An argmax over the empty vector would either
         //       panic or, worse, yield transcript 0.
         //   (2) `min_weight` culled everything. The read HAS a real argmax, and
-        //       it is NOT recorded: the implication above would be violated and
-        //       the join denominator would not be auditable. Absent from BOTH
-        //       tables. A 0.5/0.5 pair under `--min-weight 0.9` is reachable
-        //       directly; at the shipped 0.01 it needs a read spread over
-        //       enough survivors that all of them sit under the cutoff.
+        //       it IS now recorded, together with a profile row: the emit loop
+        //       below retains the argmax and publishes it at weight 1.0. It
+        //       used to be absent from BOTH tables, which violated the
+        //       implication above and lost the read's mass outright; the
+        //       retained row is counted as `reads_retained_by_argmax` so a
+        //       forced assignment is never mistaken for an earned one. A
+        //       0.5/0.5 pair under `--min-weight 0.9` reaches it directly; at
+        //       the shipped 0.01 it needs a read spread over enough survivors
+        //       that all of them sit under the cutoff.
         //   (3) At least one candidate survives -- recorded, with a real
         //       `top_tx_id`.
-        if want_read_assignments
-            && (weights.is_empty() || weights.iter().any(|&(_, w)| w >= min_weight))
-        {
+        // The argmax is computed ONCE, here, and unconditionally, because the
+        // output stage below needs the same answer to decide the all-culled
+        // case. A second copy of this fold would be a second, independently
+        // driftable copy of the tie-breaking rule; if the two ever disagreed
+        // about which candidate is `top`, the read would be published under a
+        // `top_tx_id` different from the row it was forced to emit, which is
+        // exactly the violation the implication documented above forbids.
+        let (top, top_w) = weights.iter().fold((None, 0.0f64), |acc, &(tx, w)| {
+            // Strict `>` (not `>=`) => on an exact tie the FIRST candidate
+            // in pool order wins, deterministically. Several fixtures in
+            // this file feed the E-step an all-equal `candidate_as`
+            // (`zero_power_probe`, the ghost fixture, ...), so ΔAS == 0
+            // ties are certainly REACHABLE; what no test pins is that the
+            // resulting posterior weights actually come out equal. Flipping
+            // this to `>=` leaves the suite green, which is how we know.
+            // Read the rule as stated, not as verified.
+            if w > acc.1 {
+                (Some(tx), w)
+            } else {
+                acc
+            }
+        });
+
+        // No case filter is needed any more, and keeping one would be a bug.
+        // The old guard admitted a read only if `weights` was empty (the ghost)
+        // OR some candidate cleared `min_weight`; the second clause existed
+        // solely to EXCLUDE the all-culled read, which is now retained and
+        // emitted. The ghost clause must stay: a ghost has no candidate to
+        // name, and dropping it from this table would make "the solver looked
+        // and could not assign it" indistinguishable from "this read was never
+        // in this run" -- the exact distinction `top_tx_id: None` exists for.
+        if want_read_assignments {
             // `weights` is pre-truncation and pre-renormalisation (it is what
             // the M-step consumed), so `top_weight` here is the RAW E-step
             // weight. The `posterior_weight` column in the profile is
             // `w / retained_sum` after the `min_weight` cutoff. Different
             // quantities on purpose; do not treat them as interchangeable.
-            let (top, top_w) = weights.iter().fold((None, 0.0f64), |acc, &(tx, w)| {
-                // Strict `>` (not `>=`) => on an exact tie the FIRST candidate
-                // in pool order wins, deterministically. Several fixtures in
-                // this file feed the E-step an all-equal `candidate_as`
-                // (`zero_power_probe`, the ghost fixture, ...), so ΔAS == 0
-                // ties are certainly REACHABLE; what no test pins is that the
-                // resulting posterior weights actually come out equal. Flipping
-                // this to `>=` leaves the suite green, which is how we know.
-                // Read the rule as stated, not as verified.
-                if w > acc.1 {
-                    (Some(tx), w)
-                } else {
-                    acc
-                }
-            });
             read_assign[mol_idx] = Some(ReadAssignment {
                 read_id: mol.read_id.clone(),
                 n_candidates_before_cutoff: ncand as usize,
@@ -1209,23 +1227,58 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         // every emitted weight bit-identical, because the same filter removes
         // it. What the filter protects is the case of a candidate pushed as
         // `-inf` that is then NOT filtered — not the choice of `-inf`.)
-        let retained_sum: f64 = weights
-            .iter()
-            .filter(|&(_, w)| *w >= min_weight)
-            .map(|&(_, w)| w)
-            .sum();
+        // THE COUPLED PREDICATE. This filter and the `w < min_weight` test in
+        // the emit loop below are two spellings of ONE decision, and they must
+        // agree. If this returned 0 while the loop still emitted the argmax,
+        // `w_norm` would be `w / 0.0` and a NaN would be written straight into
+        // `posterior_weight` and from there into every TPM in the summary --
+        // and nothing in the suite would go red, because a NaN compares false
+        // against every expectation. They are kept in lockstep deliberately;
+        // see the loop for the other half.
+        //
+        // When `min_weight` culls EVERY live candidate, the read would
+        // otherwise be emitted by nothing, i.e. vanish from both tables, which
+        // is the mass loss this branch exists to prevent. So the argmax is
+        // retained on its own and `retained_sum` collapses to its weight,
+        // which makes its `w_norm` exactly 1.0. The read keeps its unit of
+        // mass and is published under a real transcript name, at the cost of
+        // publishing a low-confidence assignment as a confident one --
+        // `reads_retained_by_argmax` counts exactly those reads so that cost
+        // is visible rather than silent.
+        let retained_sum: f64 = {
+            let s: f64 = weights
+                .iter()
+                .filter(|&(_, w)| *w >= min_weight)
+                .map(|&(_, w)| w)
+                .sum();
+            if s > 0.0 {
+                s
+            } else {
+                top_w
+            }
+        };
 
         // The census's `n_live` claims this many candidates reached `weights`.
         // Comparing the two is the only check that the census and the E-step
         // still agree; see `CandidateLedger::census_vs_estep_deficit`.
         ledger.live_candidates_entered += weights.len() as u64;
 
+        // True when `min_weight` culled the whole read, so the argmax below is
+        // being retained under protest rather than earning its row.
+        let argmax_only = weights.iter().all(|&(_, w)| w < min_weight);
+
         for (tx_id, w) in weights {
-            if w < min_weight {
+            if w < min_weight && !(argmax_only && Some(tx_id) == top) {
                 // Provably 0 at `min_weight = 0.0`: every posterior is
                 // `exp(ll - log_z) >= 0`, so `w < 0.0` is never true. A test
                 // pins that, which is a free check that this counter is wired
                 // to this branch and not to some other `continue`.
+                //
+                // The argmax is the ONE exception: it is culled from the
+                // prune count because it is NOT culled -- it is emitted, one
+                // line below. Counting a candidate as pruned while also
+                // emitting a row for it would double-count it against
+                // `terminal_sum()` and trip the conservation check.
                 ledger.pruned_min_weight += 1;
                 continue;
             }
@@ -1251,6 +1304,14 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
                 ncand_b.append_value(ncand);
                 as_ratio_b.append_value(as_ratio);
                 ledger.rows_emitted += 1;
+                if argmax_only && Some(tx_id) == top {
+                    // The read is being published under a forced argmax: every
+                    // live candidate was below `min_weight`. Counted here, at
+                    // the point the row genuinely exists, rather than where
+                    // `argmax_only` is computed, so a retained-then-dropped
+                    // argmax is not miscounted as a retained one.
+                    ledger.reads_retained_by_argmax += 1;
+                }
             } else {
                 n_dropped_output_row_competence += 1;
                 ledger.dropped_output_competence += 1;
@@ -1836,9 +1897,18 @@ fn candidate_availability(
 /// SCOPE, stated because the left and right sides do not share a denominator by
 /// construction. `total_candidates` counts every candidate of every molecule
 /// with `candidate_count >= 1`, including candidates on reads that emitted
-/// nothing at all. That is the point: a read whose every candidate was pruned
-/// or culled contributes to the left and to no row on the right, and the
-/// ledger's job is to make it visible rather than to let it vanish.
+/// nothing at all. That is the point: a read that produced no row — a ghost,
+/// or one whose every candidate was pruned — contributes to the left and to no
+/// row on the right, and the ledger's job is to make it visible rather than to
+/// let it vanish.
+///
+/// ONE SHAPE THAT USED TO BE EXEMPT NO LONGER IS. Until the argmax-retention
+/// fix, a read whose every live candidate fell below `min_weight` was absent
+/// from BOTH the profile and the read-assignments table: its candidates were
+/// counted as `pruned_min_weight` terminal fates and its mass was simply gone.
+/// It is now published under its argmax, so that read contributes a
+/// `rows_emitted` like any other. What is still absent from both tables is the
+/// GHOST read, which has no candidate to name.
 ///
 /// The two molecule populations are counted separately because they cannot die
 /// the same way. A single-candidate molecule has `max_as` equal to its own `AS`,
@@ -1866,7 +1936,12 @@ pub struct CandidateLedger {
     pub live_candidates: u64,
 
     // --- contested arm, decided at the output stage ---
-    /// Live candidates whose posterior fell below `min_weight`.
+    /// Live candidates that were culled by `min_weight` AND not emitted.
+    ///
+    /// The argmax of an all-culled read is culled-but-emitted, so it is NOT
+    /// counted here; see `reads_retained_by_argmax`. Counting both would
+    /// double-count that candidate against `terminal_sum()` and turn a
+    /// conservation pass into a `deficit() != 0` abort.
     ///
     /// Not a constant: `min_weight` is a caller-supplied parameter (CLI
     /// default 0.01), so this bucket moves when the flag moves. At
@@ -1874,6 +1949,20 @@ pub struct CandidateLedger {
     /// `exp(ll - log_z) >= 0` and `w < 0.0` is then never true. Its MAGNITUDE
     /// is not a stable baseline; only a non-zero deficit is a bug signal.
     pub pruned_min_weight: u64,
+    /// Reads whose every live candidate fell below `min_weight`, and whose
+    /// argmax was therefore retained and emitted with `posterior_weight = 1.0`
+    /// anyway.
+    ///
+    /// THIS COUNTS READS, NOT CANDIDATES, so it must NOT appear in
+    /// `terminal_sum()` -- it is a cross-cutting annotation of `rows_emitted`,
+    /// not a disjoint fate competing with it. Adding it there is the same class
+    /// of error as summing `live_candidates` (see the struct doc).
+    ///
+    /// It exists so the cost of the retention is measurable. A retained
+    /// argmax is a low-confidence assignment published as a confident one, and
+    /// without this number nothing downstream can tell a forced row from an
+    /// earned one.
+    pub reads_retained_by_argmax: u64,
     /// Passed `min_weight`, then dropped by the output stage's own
     /// `is_competent` / `params` recheck. Structurally 0 in production — the
     /// E-step already filtered both — which is the point of counting it.
@@ -1983,9 +2072,15 @@ fn posterior_entropy(weights: &[(usize, f64)]) -> f64 {
 ///
 ///   So a `Some` always has a denominator, and a `None` means "the solver
 ///   looked and could not assign", which is not the same as "this read was
-///   absent from the run". A read whose candidates ALL fell below
-///   `min_weight` has a real argmax but no profile row, so it is recorded in
-///   NEITHER table -- that is the one shape that would break the implication.
+///   absent from the run".
+///
+///   The ghost is now the ONLY shape that can break the implication. A read
+///   whose candidates all fell below `min_weight` used to be the one shape
+///   that did: it had a real argmax but no profile row, so it appeared in
+///   NEITHER table. The output stage now retains and emits its argmax instead
+///   (counted as `reads_retained_by_argmax`), which is what restores the
+///   implication -- and mass conservation with it. The converse is still not
+///   claimed: a `None` may name a ghost, and every non-ghost read has a row.
 #[derive(Debug, Clone)]
 pub struct ReadAssignment {
     pub read_id: String,
@@ -2930,13 +3025,25 @@ mod tests {
         assert_eq!(l.live_candidates, 3, "r1_a, r1_b, r2_live");
     }
 
-    /// `min_weight` culling is a terminal fate and must be on the books.
+    /// `min_weight` culling is a terminal fate and must be on the books, and an
+    /// all-culled read must still be PUBLISHED rather than silently lost.
     ///
     /// Uses `min_weight = 0.6` on a 2-way contested read whose posteriors are
-    /// 0.5/0.5, so BOTH fall below the cut and the read emits nothing. This is
-    /// the case the Round 8 deficit was most likely made of, and it is the one
-    /// bucket that moves with a caller-supplied flag — so it is pinned by
-    /// construction rather than by a baselined magnitude.
+    /// 0.5/0.5, so BOTH fall below the cut. The argmax is then retained on its
+    /// own and emitted, so the ledger must show THREE independent facts at
+    /// once, and the whole point of the test is that they do not contradict
+    /// each other:
+    ///
+    ///   * `pruned_min_weight == 1` — the LOSER is culled and not emitted. It
+    ///     is 1, not 2, because the argmax is culled-but-emitted and counting
+    ///     both would double-count it against `terminal_sum()`.
+    ///   * `rows_emitted == 1` — the read is on the books.
+    ///   * `reads_retained_by_argmax == 1` — and that row was forced, so
+    ///     nothing downstream mistakes it for an earned one.
+    ///
+    /// The separation of the first two is the load-bearing assertion: it is
+    /// what stops the retention from corrupting the conservation check. The
+    /// `deficit() == 0` below is the tripwire for getting it wrong.
     #[test]
     fn test_candidate_ledger_attributes_min_weight_culls() {
         let emission = local_scratch("ledger_mw_emission.parquet");
@@ -2967,9 +3074,63 @@ mod tests {
         .unwrap();
         let l = stats.ledger;
         assert_eq!(l.deficit(), 0, "ledger: {l:?}");
-        assert_eq!(l.pruned_min_weight, 2, "both 0.5-weight candidates");
-        assert_eq!(l.rows_emitted, 0, "the contested read emits nothing");
+        assert_eq!(
+            l.pruned_min_weight, 1,
+            "only the LOSING 0.5-weight candidate is culled-and-not-emitted; \
+             the argmax is culled-but-emitted and must not be counted here"
+        );
+        assert_eq!(l.rows_emitted, 1, "the all-culled read is still published");
+        assert_eq!(
+            l.reads_retained_by_argmax, 1,
+            "and the row it was published under is a forced one"
+        );
         assert_eq!(l.unambig_emitted, 1, "the unambiguous read is unaffected");
+    }
+
+    /// Mass conservation, pinned as its own fact. The read above is published
+    /// with `posterior_weight = 1.0`, so the profile's weight sum must equal
+    /// the number of reads that reached the output stage. If the retained
+    /// argmax were emitted with a `retained_sum` of 0 this would be `NaN`, and
+    /// a NaN compares false against every expectation -- so the sum is checked
+    /// for finiteness explicitly rather than only for equality.
+    #[test]
+    fn test_all_culled_read_publishes_unit_mass_not_nan() {
+        let emission = local_scratch("argmax_mass_emission.parquet");
+        let profile = local_scratch("argmax_mass_profile.parquet");
+        let graph = multi_molecule_graph(10.0, &[vec![("x", 1000, 0), ("y", 1000, 0)]]);
+        multi_molecule_emission(&emission, &["r0_x", "r0_y"]);
+
+        solve_and_write_profile(
+            graph,
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            5,
+            20.0,
+            FIVE_PRIME_OFF,
+            POLY_A_ON,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            0.6,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let rows: Vec<(String, f64)> = read_profile(&profile);
+        assert_eq!(rows.len(), 1, "one forced row: {rows:?}");
+        let (tx, w) = &rows[0];
+        assert!(
+            w.is_finite(),
+            "posterior_weight must never be NaN/inf; got {w} for {tx}. A NaN here \
+             would flow into every TPM in the summary without turning any test red"
+        );
+        assert_eq!(
+            *w, 1.0,
+            "the retained argmax carries the read's whole unit of mass"
+        );
     }
 
     /// At `min_weight = 0.0` the cutoff is provably inert: every posterior is
@@ -5012,11 +5173,11 @@ mod tests {
     /// this fixture usable: `CULLED` splits its weight 50/50 between tx1 and
     /// tx2, so the two receive identical emission-parameter updates and
     /// identical abundances, and the only term left to separate them is the
-    /// one that is zero for both. Re-running at `min_weight = 0.9` then culls
-    /// the read outright: both weights are below the cutoff, the emit loop
-    /// drops both, and the read produces no profile row.
+    /// one that is zero for both. Running at `min_weight = 0.9` therefore
+    /// culls BOTH of `CULLED`'s candidates — and the output stage then
+    /// retains the argmax and publishes the read under it, at weight 1.0.
     ///
-    /// `PLAIN` is in the same graph so "CULLED emitted no row" is not
+    /// `PLAIN` is in the same graph so "CULLED's row was forced" is not
     /// vacuously true of a profile that is empty for unrelated reasons.
     fn plain_and_min_weight_culled(log_pal: f32) -> FlatEvidenceGraph {
         let mut molecules = vec![
@@ -5460,29 +5621,31 @@ mod tests {
         }
     }
 
-    /// `top_tx_id == Some(..)` must IMPLY that the read has a profile row, and
-    /// nothing pinned that before: `read_assign[mol_idx]` was written in the
-    /// ambiguous branch, which runs BEFORE the emit loop's `if w < min_weight {
-    /// continue }`. A read whose every candidate fell below the cutoff
-    /// therefore carried a real `top_tx_id` while emitting ZERO profile rows —
-    /// a numerator entry with no denominator, in a table whose whole purpose is
-    /// a cross-run join.
+    /// `top_tx_id == Some(..)` must IMPLY that the read has a profile row.
     ///
-    /// This is the ONE shape that is absent from both tables. A ghost read
-    /// (empty `weights`) is also absent from the profile but is deliberately
-    /// recorded with `top_tx_id = None` — see
+    /// It now holds for BOTH non-ghost paths. Previously the all-culled path
+    /// violated it: `read_assign[mol_idx]` was written in the ambiguous branch,
+    /// which runs BEFORE the emit loop's `min_weight` filter, so a read whose
+    /// every candidate fell below the cutoff carried a real `top_tx_id` while
+    /// emitting ZERO profile rows — a numerator entry with no denominator, in
+    /// a table whose whole purpose is a cross-run join. That read is now
+    /// retained and emitted under its argmax instead, so the two tables agree.
+    ///
+    /// The assertion is the cross-run join's own invariant, stated on the data
+    /// rather than argued from the code: every read in the assignments table
+    /// has a profile row. The converse is still not claimed, and the ghost
+    /// shape is the reason — see
     /// `test_ghost_read_is_recorded_as_unassignable_and_absent_from_the_profile`.
-    /// So the claim is one-directional and the converse is not claimed.
     ///
     /// Reachable with `--min-weight 0.9` on the 0.5 / 0.5 read below. At the
     /// shipped 0.01 it needs a read spread over enough survivors that all of
     /// them sit under the cutoff, which a high-fan-out repeat region supplies
     /// (`candidate_count` is `u16`).
     ///
-    /// Mutation target: dropping the `any(w >= min_weight)` half of the
-    /// assignment's `if` makes this test red.
+    /// Mutation target: removing the `&& !(argmax_only && Some(tx_id) == top)`
+    /// exemption from the emit loop's `min_weight` test makes this red.
     #[test]
-    fn test_read_assignment_is_omitted_when_min_weight_drops_every_candidate() {
+    fn test_all_culled_read_is_published_under_its_argmax_and_joins() {
         let log_pal = (100.0_f32).log2();
         let emission = scratch("culled_emission.parquet");
         let profile = scratch("culled_profile.parquet");
@@ -5528,24 +5691,22 @@ mod tests {
         );
         assert_eq!(
             rows.len(),
-            1,
-            "only PLAIN (w = 1.0) clears min_weight = 0.9; the 0.5/0.5 read must \
-             emit no profile row at all: {rows:?}"
+            2,
+            "PLAIN clears min_weight = 0.9 on its own, and the 0.5/0.5 CULLED \
+             read is published under its forced argmax rather than vanishing: {rows:?}"
         );
-        assert_eq!(rows[0].0, "PLAIN", "the surviving row must be PLAIN's");
+        assert!(
+            rows.iter().any(|(r, ..)| r == "CULLED"),
+            "the all-culled read must appear in the profile, or its mass is lost: {rows:?}"
+        );
+        assert!(
+            stats.ledger.reads_retained_by_argmax == 1,
+            "and exactly one row was forced: {ledger:?}",
+            ledger = stats.ledger
+        );
 
         // The actual invariant, asserted on the data rather than argued from
         // the code: every read in the assignments table has a profile row.
-        assert!(
-            !assigns.iter().any(|a| a.read_id == "CULLED"),
-            "a read with no profile row must not appear in the read-assignments \
-             table — the join numerator would exceed its denominator: {assigns:#?}"
-        );
-        assert_eq!(
-            assigns.len(),
-            1,
-            "only PLAIN belongs in the table: {assigns:#?}"
-        );
         for a in &assigns {
             assert!(
                 rows.iter().any(|(r, ..)| r == &a.read_id),
@@ -5553,6 +5714,23 @@ mod tests {
                  the implication `top_tx_id == Some(..) => profile row` is what \
                  keeps the cross-run join denominator auditable: {rows:?}",
                 a.read_id
+            );
+        }
+        // The forced row and the assignment must name the SAME transcript.
+        // The argmax is folded once and shared by both paths precisely so
+        // these cannot drift; this is the assertion that would catch it if
+        // they ever did.
+        if let Some(culled) = assigns.iter().find(|a| a.read_id == "CULLED") {
+            let row_tx = rows
+                .iter()
+                .find(|(r, ..)| r == "CULLED")
+                .expect("CULLED has a profile row, asserted above");
+            assert_eq!(
+                Some(row_tx.1.as_str()),
+                culled.top_tx_id.as_deref(),
+                "the assignment's top_tx_id and the row it forced must name the \
+                 same transcript; they read the same fold, so a disagreement here \
+                 means a second argmax was introduced somewhere"
             );
         }
     }
