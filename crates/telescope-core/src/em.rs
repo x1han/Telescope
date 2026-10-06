@@ -5567,7 +5567,6 @@ mod tests {
     /// `test_candidate_availability_keeps_four_death_causes_apart` instead, and
     /// asserting 0 here is what documents that the gap is known rather than
     /// accidental.
-    #[test]
     /// The `padded-padded ambiguity` split, and the partition it claims.
     ///
     /// DESIGN NOTE, because it is the whole point: this does NOT try to
@@ -5590,6 +5589,7 @@ mod tests {
     /// that reported 0 for both would pass the partition check alone -- the
     /// `> 0` assertions are what stop that, which is why they are here.
     #[test]
+
     fn test_degenerate_tie_split_partitions_the_degenerate_reads() {
         let log_pal = (100.0_f32).log2();
 

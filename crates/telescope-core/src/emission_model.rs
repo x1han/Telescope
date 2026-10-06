@@ -1166,6 +1166,30 @@ where
 mod tests {
     use super::*;
     use arrow::array::{Int32Builder, ListBuilder, UInt32Array};
+    use std::path::PathBuf;
+
+    /// A private scratch directory that no other process can collide with.
+    ///
+    /// Two things are wrong with `temp_dir().join("telescope_test_<x>")`:
+    ///
+    /// 1. `$TMPDIR` here is `/datg/hanxi/tmp`, which is **nfs4**. A file
+    ///    written and immediately re-read under concurrent I/O can come back
+    ///    0 bytes. That already flaked a different test in this crate once
+    ///    (`EOF: Parquet file too small`); the same helper exists in `em.rs`
+    ///    as `local_scratch`.
+    /// 2. A FIXED name is shared by every concurrent `cargo test`, and each
+    ///    test `remove_dir_all`s its directory at the START. Two runs
+    ///    therefore delete each other's fixtures: measured on 2026-10-06 as
+    ///    `open provenance parquet: No such file or directory`, in a test
+    ///    that had passed minutes earlier in the same day. A test that is
+    ///    green once and red once is worse than one that is red always,
+    ///    because it trains the reader to distrust the suite.
+    ///
+    /// Local xfs `/tmp` plus the PID fixes both: distinct per process, and not
+    /// on the network filesystem.
+    fn local_scratch(name: &str) -> PathBuf {
+        PathBuf::from("/tmp").join(format!("telescope_em_{}_{}", name, std::process::id()))
+    }
 
     #[test]
     fn min_cohort_variance_value() {
@@ -1518,7 +1542,7 @@ mod tests {
             },
         ];
 
-        let tmp = std::env::temp_dir().join("telescope_test_aidrs_universal_equiv");
+        let tmp = local_scratch("telescope_test_aidrs_universal_equiv");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).expect("mkdir tmp");
 
@@ -1630,7 +1654,7 @@ mod tests {
             },
         ];
 
-        let tmp = std::env::temp_dir().join("telescope_test_3level_fallback");
+        let tmp = local_scratch("telescope_test_3level_fallback");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).expect("mkdir tmp");
 
@@ -1747,7 +1771,7 @@ mod tests {
             },
         ];
 
-        let tmp = std::env::temp_dir().join("telescope_test_em_eligible_filter");
+        let tmp = local_scratch("telescope_test_em_eligible_filter");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).expect("mkdir tmp");
 
@@ -1800,7 +1824,7 @@ mod tests {
     /// the whole suite green without this test.
     #[test]
     fn test_n_cohort_flnc_counts_observations_not_distinct_lengths() {
-        let tmp = std::env::temp_dir().join("telescope_test_ncohort_obs");
+        let tmp = local_scratch("telescope_test_ncohort_obs");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).expect("mkdir tmp");
 
@@ -1907,7 +1931,7 @@ mod tests {
             },
         ];
 
-        let tmp = std::env::temp_dir().join("telescope_test_l123_tiers");
+        let tmp = local_scratch("telescope_test_l123_tiers");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).expect("mkdir tmp");
 
@@ -2221,7 +2245,6 @@ mod tests {
     /// | `n_cohort_flnc == 0` on imputed rows | write `1` |
     /// | an anchored+universe key is emitted ONCE | `if anchored.contains(tx)` -> `if false` |
     /// | `l1+l2+l3+n_imputed == rows.len()` | count imputed rows in `l3` instead |
-    #[test]
     /// THE PROVENANCE SIDECAR IS THE ONLY PLACE THE FALLBACK LEVEL IS WRITTEN
     /// DOWN. `n_cohort_flnc` cannot recover it: L2 is decided by the GENE's
     /// pooled count, and the frozen parquet carries only the TRANSCRIPT's own
@@ -2238,8 +2261,9 @@ mod tests {
     ///   * the tier histogram reproduces `FallbackTierCounts` (the counters the
     ///     CLI prints must describe the same partition the file records).
     #[test]
+
     fn test_provenance_sidecar_agrees_with_the_emission_rows_row_by_row() {
-        let tmp = std::env::temp_dir().join("telescope_test_provenance");
+        let tmp = local_scratch("telescope_test_provenance");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).expect("mkdir tmp");
 
@@ -2364,7 +2388,7 @@ mod tests {
 
     #[test]
     fn test_padded_rows_are_cohort_fits_marked_by_a_zero_observation_count() {
-        let tmp = std::env::temp_dir().join("telescope_test_padding");
+        let tmp = local_scratch("telescope_test_padding");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).expect("mkdir tmp");
 
@@ -2482,7 +2506,7 @@ mod tests {
     /// is the difference between a warning and a wrong `total` nobody checks.
     #[test]
     fn test_anchored_transcripts_absent_from_the_universe_are_counted_not_dropped() {
-        let tmp = std::env::temp_dir().join("telescope_test_drift");
+        let tmp = local_scratch("telescope_test_drift");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).expect("mkdir tmp");
 
@@ -2536,7 +2560,7 @@ mod tests {
     /// occur while the first is possible.
     #[test]
     fn test_without_a_universe_no_row_is_imputed() {
-        let tmp = std::env::temp_dir().join("telescope_test_nopad");
+        let tmp = local_scratch("telescope_test_nopad");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).expect("mkdir tmp");
 
