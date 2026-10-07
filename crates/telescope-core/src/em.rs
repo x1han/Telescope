@@ -2401,6 +2401,20 @@ pub struct TelEmStats {
     /// single-candidate read has no pairwise odds ratio at all, so counting
     /// it would make this number ≈ 0.997 and say nothing.
     ///
+    /// ⚠️ NOT A VALIDITY METRIC, AND NOT PRINTED. This counter says only that
+    /// the M-step gave transcripts distinct `(mu, sigma2)`. It does not measure
+    /// deconvolution accuracy. Measured on HC2 the per-read poly(A) residual sd
+    /// is 0.7521 log2 against a median candidate separation of 0.1919 (per-read
+    /// SNR 0.255), and a controlled experiment at that separation scored
+    /// 54.86% against a 70.0% majority-class baseline. It was removed from
+    /// `telescope quant`'s stderr on 2026-10-07 precisely because it was being
+    /// read as the opposite of what it says; see the comment at the removal
+    /// site in `crates/telescope-cli/src/main.rs` and the test
+    /// `quant_does_not_report_polya_validity`. The field remains as INTERNAL
+    /// SOLVER MONITORING — a tripwire for parameters collapsing numerically
+    /// into one identical float — and `zero_power_probe`'s three unit tests
+    /// assert on it directly.
+    ///
     /// The mechanism is the L1 → L2 → L3 fallback: two underpowered
     /// transcripts in one gene both take the SAME shared gene fit, and two
     /// transcripts with no usable gene pool both take the SAME cohort fit.
@@ -2430,10 +2444,18 @@ pub struct TelEmStats {
     /// Do NOT divide by `n_ambiguous` -- that denominator contains the reads
     /// this metric deliberately excludes, and the ratio would silently
     /// reproduce the vacuous number.
+    ///
+    /// ⚠️ Also not printed, and for the same reason as
+    /// `n_polya_zero_power`: it is solver monitoring, not a validity metric.
+    /// It went from the CLI together with the `_all` counter because leaving it
+    /// under the header `poly(A) discriminative power:` would have preserved
+    /// the same defect.
     pub n_polya_zero_power_resolved: u64,
     /// DENOMINATOR for `n_polya_zero_power_resolved`: contested reads with at
     /// least `ZERO_POWER_MIN_EMISSION_CANDIDATES` candidates carrying an
-    /// emission row. Can legitimately be 0 on a sparse model; the CLI guards.
+    /// emission row. Can legitimately be 0 on a sparse model. No longer printed
+    /// by the CLI, so any ratio built from it must divide by this explicitly
+    /// rather than assume a rendered percentage.
     pub n_reads_multi_emission_candidate: u64,
     /// NUMERATOR for emission coverage. Counts over ALL reads with at least one
     /// candidate, not just contested ones: coverage is a property of the model's
@@ -6089,10 +6111,14 @@ mod tests {
         (graph, params)
     }
 
-    /// Direct unit test of the poly(A)-degradation predicate. The headline
-    /// number the CLI prints is `n_polya_zero_power / n_ambiguous`, and it was
-    /// computed by this function with nothing testing it: replacing the body
-    /// with `false` left the whole suite green.
+    /// Direct unit test of the poly(A)-degradation predicate. The number it
+    /// feeds, `n_polya_zero_power / n_ambiguous`, was computed by this function
+    /// with nothing testing it: replacing the body with `false` left the whole
+    /// suite green. It is no longer printed by the CLI (2026-10-07) because it
+    /// was being read as a validity metric, but the predicate is still the
+    /// tripwire that catches parameters collapsing to one identical float, and
+    /// these cases are the only thing standing between it and a second silent
+    /// regression.
     ///
     /// The cases that matter are the ones a plausible re-implementation gets
     /// wrong. A "do the mus match?" comparison alone would pass the headline

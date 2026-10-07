@@ -1210,21 +1210,16 @@ fn main() -> Result<()> {
                 stats.n_degenerate_with_anchored as f64 / stats.n_entropy_degenerate.max(1) as f64
                     * 100.0
             );
-            // Degradation telemetry. TWO zero-power metrics, because at less
-            // than full model coverage the old one is largely vacuous -- a read
-            // with one emission candidate satisfies "all candidates share one
-            // mu" without comparing anything. The old one is kept (renamed
-            // `_all`) so runs stay comparable; the new one excludes those reads
-            // from BOTH numerator and denominator.
+            // (The two zero-power counters that used to be reported here are gone; see
+            // the comment further down. The paragraph below is retained because
+            // it still governs the two lines that remain.)
             //
             // A denominator of ZERO PRINTS `n/a`, NOT `0.0%`. `0.0 / 0.0` in
             // Rust is NaN, so an unguarded line prints "NaN%" -- and a
             // `.max(1)` guard alone fixes the NaN while making "no read
             // qualified" render as a confident 0.0%. That is the same class of
             // defect as the metric this change is about: a number that looks
-            // measured and is not. `n_reads_multi_emission_candidate` is
-            // legitimately 0 on a sparse model, which is exactly the regime
-            // this metric exists for.
+            // measured and is not.
             let n_with_cand = stats.n_unambiguous + stats.n_ambiguous;
             eprintln!("[telescope]    emission model coverage (reads with >=1 candidate):");
             eprintln!(
@@ -1239,26 +1234,34 @@ fn main() -> Result<()> {
                 n_with_cand,
                 pct(stats.n_reads_single_emission_candidate, n_with_cand as u64)
             );
-            eprintln!("[telescope]    poly(A) discriminative power:");
-            eprintln!(
-                "[telescope]      zero-power_all     (identical mu/sigma2 across all \
-                 candidates that have an emission row): {} of {} ambiguous ({})",
-                stats.n_polya_zero_power,
-                stats.n_ambiguous,
-                pct(stats.n_polya_zero_power, stats.n_ambiguous as u64)
-            );
-            eprintln!(
-                "[telescope]      zero-power_resolved (same, but only over reads with \
-                 >=2 emission candidates; CONVERGED mu, not the loaded model -- \
-                 the M-step pulls every weighted transcript's mu toward its own \
-                 reads, so this trends to 0 on any run that converges): {} of {} ({})",
-                stats.n_polya_zero_power_resolved,
-                stats.n_reads_multi_emission_candidate,
-                pct(
-                    stats.n_polya_zero_power_resolved,
-                    stats.n_reads_multi_emission_candidate
-                )
-            );
+            // The two zero-power counters used to be printed here, under the
+            // header `poly(A) discriminative power:`. They are deliberately NOT
+            // printed any more, and this comment exists so the removal is not
+            // "tidied up" by a later reader who never saw the reason.
+            //
+            // WHAT WAS WRONG WITH THEM. Both counters say only that the M-step
+            // gave each transcript its own `(mu, sigma2)`. They do not measure
+            // deconvolution accuracy, and on real data they are uninformative
+            // about it: measured on HC2, the per-read poly(A) residual sd is
+            // 0.7521 log2 against a median candidate separation of 0.1919, a
+            // per-read SNR of 0.255, and a controlled experiment at that real
+            // separation scored 54.86% -- below the 70.0% majority-class
+            // baseline. So a reader seeing `zero-power_all: 99.98%` under a
+            // header reading "discriminative power" would reasonably infer the
+            // opposite of the truth. The header was the worst of it: leaving
+            // `zero-power_resolved` printed under it would have preserved the
+            // exact defect, which is why both lines went and not just the one
+            // named in the ruling.
+            //
+            // THE FIELDS STAY. `n_polya_zero_power` and
+            // `n_polya_zero_power_resolved` remain on `TelEmStats` and remain
+            // usable by `em.rs`'s three unit tests, which assert on the fields
+            // directly and cannot observe this file. They are now INTERNAL
+            // SOLVER MONITORING ONLY -- a tripwire for parameters collapsing
+            // numerically into one identical float -- and must never be cited as
+            // evidence of poly(A) validity or discriminative power.
+            // `crates/telescope-cli/tests/quant_does_not_report_polya_validity.rs`
+            // fails if either string reappears on stderr.
             if debug && !stats.em_trace.is_empty() {
                 eprintln!("[telescope]    EM trace:");
                 for (iter, ll, ent) in &stats.em_trace {
