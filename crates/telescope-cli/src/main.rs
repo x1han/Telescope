@@ -541,8 +541,11 @@ enum Cmd {
 /// The `n/a` is the whole point. `0.0 / 0.0` is `NaN` in Rust, and the usual
 /// `.max(1)` guard fixes the NaN while rendering "no read qualified" as a
 /// confident `0.0%` -- a number that looks measured and is not. That is the
-/// exact failure mode the `_all` / `_resolved` split was made to remove, so
-/// reintroducing it in the print would undo the change at the last step.
+/// exact failure mode this helper exists to prevent, and it is still live: the
+/// `_all` / `_resolved` print lines that motivated it were removed in
+/// 2026-10-07,
+/// but `pct` is still called on `n_reads_any_emission_candidate` and
+/// `n_reads_single_emission_candidate`, both legitimately 0 on a sparse model.
 ///
 /// Pinned by `pct_never_renders_a_zero_denominator_as_a_percentage`.
 fn pct(numerator: u64, denominator: u64) -> String {
@@ -1239,27 +1242,35 @@ fn main() -> Result<()> {
             // printed any more, and this comment exists so the removal is not
             // "tidied up" by a later reader who never saw the reason.
             //
-            // WHAT WAS WRONG WITH THEM. Both counters say only that the M-step
-            // gave each transcript its own `(mu, sigma2)`. They do not measure
-            // deconvolution accuracy, and on real data they are uninformative
-            // about it: measured on HC2, the per-read poly(A) residual sd is
-            // 0.7521 log2 against a median candidate separation of 0.1919, a
-            // per-read SNR of 0.255, and a controlled experiment at that real
-            // separation scored 54.86% -- below the 70.0% majority-class
-            // baseline. So a reader seeing `zero-power_all: 99.98%` under a
-            // header reading "discriminative power" would reasonably infer the
-            // opposite of the truth. The header was the worst of it: leaving
-            // `zero-power_resolved` printed under it would have preserved the
-            // exact defect, which is why both lines went and not just the one
-            // named in the ruling.
+            // WHAT WAS WRONG WITH THEM. The counter FIRES on a contested read whose
+            // candidates all share ONE identical `(mu, sigma2)` -- i.e. it fires
+            // exactly when the M-step did NOT personalise them, and the poly(A)
+            // term cancels in every pairwise odds ratio. So a LOW value means
+            // non-degenerate, and it says nothing about whether the poly(A) term
+            // can actually discriminate. On HC2 it printed
+            // `zero-power_all: 886 of 4,380,726 ambiguous (0.02%)`.
+            //
+            // THE TRAP WAS THE COMPLEMENT. 0.02% is one number away from
+            // "poly(A) discriminates on 99.98% of contested reads", and that
+            // inference is false: measured on HC2 the per-read poly(A) residual
+            // sd is 0.7521 log2 against a median candidate separation of 0.1919
+            // -- SNR 0.255 -- and a controlled experiment at that real
+            // separation scored 54.86%, BELOW the 70.0% majority-class
+            // baseline. An earlier round of notes made exactly that
+            // complement error and wrote the 99.98% claim up as a result.
+            //
+            // The header was the worst of it: leaving `zero-power_resolved`
+            // printed under "poly(A) discriminative power:" would have
+            // preserved the same defect, which is why both lines went and not
+            // just the one named in the ruling.
             //
             // THE FIELDS STAY. `n_polya_zero_power` and
-            // `n_polya_zero_power_resolved` remain on `TelEmStats` and remain
-            // usable by `em.rs`'s three unit tests, which assert on the fields
-            // directly and cannot observe this file. They are now INTERNAL
-            // SOLVER MONITORING ONLY -- a tripwire for parameters collapsing
-            // numerically into one identical float -- and must never be cited as
-            // evidence of poly(A) validity or discriminative power.
+            // `n_polya_zero_power_resolved` remain on `TelEmStats`. Nothing at
+            // runtime reads them any more -- the only consumer is `em.rs`'s
+            // unit tests, which assert on the fields directly and cannot see
+            // this file -- so they are a tripwire for parameters collapsing
+            // numerically into one identical float, and they must never be cited
+            // as evidence of poly(A) validity or discriminative power.
             // `crates/telescope-cli/tests/quant_does_not_report_polya_validity.rs`
             // fails if either string reappears on stderr.
             if debug && !stats.em_trace.is_empty() {
@@ -1463,6 +1474,10 @@ mod tests {
     /// split was created to characterise. The tempting guard is
     /// `denominator.max(1)`, which removes the `NaN` and simultaneously reports
     /// "no read qualified" as a confident `0.0%`.
+    ///
+    /// (The `_all` / `_resolved` lines no longer print — removed 2026-10-07. The
+    /// coverage counters `pct` is still called on can also be legitimately 0,
+    /// which is why this guard and this test stay.)
     ///
     /// Asserting the STRING rather than the absence of a panic is the point:
     /// a test that only checked "does not produce NaN" would still pass under

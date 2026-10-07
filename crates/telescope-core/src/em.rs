@@ -2401,19 +2401,22 @@ pub struct TelEmStats {
     /// single-candidate read has no pairwise odds ratio at all, so counting
     /// it would make this number ≈ 0.997 and say nothing.
     ///
-    /// ⚠️ NOT A VALIDITY METRIC, AND NOT PRINTED. This counter says only that
-    /// the M-step gave transcripts distinct `(mu, sigma2)`. It does not measure
-    /// deconvolution accuracy. Measured on HC2 the per-read poly(A) residual sd
-    /// is 0.7521 log2 against a median candidate separation of 0.1919 (per-read
-    /// SNR 0.255), and a controlled experiment at that separation scored
-    /// 54.86% against a 70.0% majority-class baseline. It was removed from
-    /// `telescope quant`'s stderr on 2026-10-07 precisely because it was being
-    /// read as the opposite of what it says; see the comment at the removal
-    /// site in `crates/telescope-cli/src/main.rs` and the test
-    /// `quant_does_not_report_polya_validity`. The field remains as INTERNAL
-    /// SOLVER MONITORING — a tripwire for parameters collapsing numerically
-    /// into one identical float — and `zero_power_probe`'s three unit tests
-    /// assert on it directly.
+    /// ⚠️ NOT A VALIDITY METRIC, AND NOT PRINTED. This counter FIRES when a
+    /// read's candidates all share one identical `(mu, sigma2)` — i.e. it
+    /// counts the reads the M-step did NOT personalise. A low value therefore
+    /// means non-degenerate, not discriminative. Measured on HC2 it was
+    /// 886 of 4,380,726 ambiguous (0.02%), and reading its complement as
+    /// "poly(A) discriminates on 99.98% of contested reads" is false: the
+    /// per-read poly(A) residual sd is 0.7521 log2 against a median candidate
+    /// separation of 0.1919 (SNR 0.255), and a controlled experiment at that
+    /// separation scored 54.86% against a 70.0% majority-class baseline. It was
+    /// removed from `telescope quant`'s stderr on 2026-10-07 for exactly that
+    /// reason; see the comment at the removal site in
+    /// `crates/telescope-cli/src/main.rs` and the test
+    /// `quant_does_not_report_polya_validity`. Nothing at runtime reads this
+    /// field any more; its only consumers are the three zero-power unit tests
+    /// in this module, which assert on it directly and pin it as a tripwire
+    /// for parameters collapsing numerically into one identical float.
     ///
     /// The mechanism is the L1 → L2 → L3 fallback: two underpowered
     /// transcripts in one gene both take the SAME shared gene fit, and two

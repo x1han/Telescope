@@ -3,11 +3,13 @@
 //! WHY THIS TEST EXISTS. `TelEmStats` carried two counters —
 //! `n_polya_zero_power` and `n_polya_zero_power_resolved` — which `quant`
 //! printed under the header `poly(A) discriminative power:`. Both counters were
-//! measured to be uninformative about deconvolution accuracy (they only say the
-//! M-step personalised `(mu, sigma2)` per transcript; on real data the poly(A)
-//! term's per-read SNR is 0.255), and a reader seeing `zero-power_all: 99.98%`
-//! under a header reading "discriminative power" would reasonably conclude the
-//! opposite. The expert ruling was to remove the counters from user-facing
+//! measured to be uninformative about deconvolution accuracy. The counter
+//! FIRES when a read's candidates share one identical `(mu, sigma2)`, so a low
+//! value means non-degenerate and NOT discriminative; on HC2 it read
+//! `zero-power_all: 886 of 4,380,726 ambiguous (0.02%)`. The trap was its
+//! complement — an earlier round of notes read 0.02% as "poly(A) discriminates
+//! on 99.98% of contested reads", which is false, since the poly(A) term's
+//! per-read SNR is 0.255. The expert ruling was to remove the counters from user-facing
 //! output while KEEPING them in `TelEmStats` as internal solver monitoring, so
 //! this asserts on the OUTPUT, never on the fields.
 //!
@@ -25,11 +27,12 @@
 //! in the repo to run `quant` at all.
 //!
 //! WHY THE POSITIVE PIN. A negative assertion on stderr is a tautology unless a
-//! sibling assertion proves the capture is live. `emission model coverage` is
-//! printed two lines above the deleted block and only after `solve_and_write_profile`
-//! returned `Ok`, so it proves the run reached the print zone rather than merely
-//! having started. Without it, a fixture that bailed early would leave stderr
-//! empty and both negative assertions below would pass for the wrong reason.
+//! sibling assertion proves the capture is live. `emission model coverage` was
+//! the first telemetry line of the block the removed lines sat in, and it
+//! prints only after `solve_and_write_profile` returned `Ok`, so it proves the
+//! run reached the print zone rather than merely having started. Without it, a
+//! fixture that bailed early would leave stderr empty and both negative
+//! assertions below would pass for the wrong reason.
 //!
 //! Before this test existed, `quant`'s stderr contained `zero-power_all`, so it
 //! failed on first run. That red is the evidence the fixture reaches the print
