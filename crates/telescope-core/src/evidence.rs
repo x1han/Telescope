@@ -54,8 +54,10 @@ pub struct MoleculeEvidence {
 /// them; index `candidate_pool[o + c]` and `candidate_as[o + c]` describe the
 /// same (read, transcript) pair. A MISSING `extend` in the cohort path
 /// (`resolver::pool_evidence_graphs`) desynchronises a pool from
-/// `candidate_pool` and reads it from the wrong BAM's coordinate frame; the
-/// only guard is a `debug_assert_eq!`, which is compiled out in release.
+/// `candidate_pool` and reads it from the wrong BAM's coordinate frame. Both
+/// sites are now guarded by an UNCONDITIONAL `assert_eq!` (promoted from
+/// `debug_assert_eq!` on 2026-10-08), so a desynchronised pool aborts instead
+/// of producing a wrong 5' gap in a release build.
 /// Record-level accounting for the filters in `extract_evidence_with`.
 ///
 /// WHY A LEDGER AND NOT A COUNTER
@@ -821,10 +823,19 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
 
     // Lockstep invariant: the four alignment-evidence pools are index-aligned
     // with `candidate_pool` (see `FlatEvidenceGraph`).
-    debug_assert_eq!(candidate_pool.len(), candidate_as.len());
-    debug_assert_eq!(candidate_pool.len(), candidate_nm.len());
-    debug_assert_eq!(candidate_pool.len(), candidate_mapq.len());
-    debug_assert_eq!(candidate_pool.len(), candidate_5p_gap.len());
+    //
+    // PROMOTED from `debug_assert_eq!` to `assert_eq!` by ruling 2026-10-08.
+    // The four pools and `candidate_pool` are each pushed once inside the same
+    // `for c in &entry.candidates` loop body above, so they are equal by
+    // construction on every path that reaches this point. An unconditional
+    // `assert_eq!` is already the established pattern in this function -- the
+    // ledger identity a few lines below is one -- so this adds a guard, not a
+    // new convention. As in `resolver.rs`, the failure mode is now a crash
+    // rather than silently misaligned evidence, which is the intended trade.
+    assert_eq!(candidate_pool.len(), candidate_as.len());
+    assert_eq!(candidate_pool.len(), candidate_nm.len());
+    assert_eq!(candidate_pool.len(), candidate_mapq.len());
+    assert_eq!(candidate_pool.len(), candidate_5p_gap.len());
 
     // THE LEDGER CLOSES HERE, or the library is wrong. A new drop site added
     // above without its counter, or an early `?`/`return` added between the

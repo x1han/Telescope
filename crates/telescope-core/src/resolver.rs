@@ -481,14 +481,31 @@ where
         // Every `extend` above MUST be present: omitting one leaves that pool
         // short while `candidate_pool` grows, and `candidate_5p_gap[o + c]` is
         // then read from the WRONG BAM's coordinate frame — a wrong 5' gap, not
-        // a crash. `cargo test` stays green because the only guard is a
-        // `debug_assert_eq!` on LENGTHS, and the forgotten pool is length 0 on
-        // the first BAM; the assert trips only from the second BAM onward, and
-        // not at all in a release build.
-        debug_assert_eq!(pooled.candidate_pool.len(), pooled.candidate_as.len());
-        debug_assert_eq!(pooled.candidate_pool.len(), pooled.candidate_nm.len());
-        debug_assert_eq!(pooled.candidate_pool.len(), pooled.candidate_mapq.len());
-        debug_assert_eq!(pooled.candidate_pool.len(), pooled.candidate_5p_gap.len());
+        // a crash. `cargo test` stayed green for exactly this reason: the guard
+        // was a `debug_assert_eq!` on LENGTHS, which is compiled out of a
+        // release build, so a shipped binary had no check at all.
+        //
+        // PROMOTED from `debug_assert_eq!` to `assert_eq!` by ruling 2026-10-08.
+        // The trade is explicit, not incidental: a misaligned pool now aborts
+        // the process instead of silently emitting 5' gaps from the wrong
+        // coordinate frame. Fail-fast is the right call in scientific software,
+        // where a wrong number is worse than a missing one -- but it does mean
+        // a defect of this class is now a crash rather than a bad result, and
+        // that is a deliberate change in the failure mode.
+        //
+        // Safety was traced before promoting, not assumed: the five pools are
+        // grown by five ADJACENT, UNCONDITIONAL `extend`s inside one loop
+        // iteration, and within a single BAM all five were pushed by one
+        // `for c in &entry.candidates` loop body in `extract_evidence_with`, so
+        // they are equal by construction on every path that reaches here. The
+        // paths that exit earlier (0 BAMs -> the loop body never runs; `?` and
+        // `bail!` -> `Err` returned) never reach the assert. The assert can only
+        // fire if one of the five `extend`s is deleted or made conditional,
+        // which is the defect class it exists to catch.
+        assert_eq!(pooled.candidate_pool.len(), pooled.candidate_as.len());
+        assert_eq!(pooled.candidate_pool.len(), pooled.candidate_nm.len());
+        assert_eq!(pooled.candidate_pool.len(), pooled.candidate_mapq.len());
+        assert_eq!(pooled.candidate_pool.len(), pooled.candidate_5p_gap.len());
         count += 1;
     }
     Ok((pooled, count))
@@ -514,8 +531,9 @@ mod tests {
     /// forgotten `extend` for any one of them leaves that pool short while
     /// `candidate_pool` grows, and every index `o + c` then reads the WRONG
     /// BAM's coordinate frame — a silently wrong 5' gap, not a crash. The
-    /// in-function `debug_assert_eq!` is the only other guard and it is
-    /// compiled out in release; before this test existed, deleting
+    /// in-function `assert_eq!` is the other guard (promoted from
+    /// `debug_assert_eq!` on 2026-10-08, so it now also runs in release);
+    /// before this test existed, deleting
     /// `pooled.candidate_5p_gap.extend(..)` left the ENTIRE suite green,
     /// because nothing called `pool_evidence_graphs` at all.
     ///
@@ -557,9 +575,10 @@ mod tests {
             .sum();
         assert_eq!(total, pooled.candidate_pool.len());
 
-        // Every pool must be exactly as long as `candidate_pool` — asserted
-        // unconditionally, unlike the in-function `debug_assert_eq!`, so this
-        // still bites in a release build.
+        // Every pool must be exactly as long as `candidate_pool`. This is the
+        // test-level duplicate of the in-function check, which is itself now
+        // unconditional; the test states the invariant for the two-BAM case
+        // where the frame, not just the length, is what can go wrong.
         assert_eq!(pooled.candidate_as.len(), pooled.candidate_pool.len());
         assert_eq!(pooled.candidate_nm.len(), pooled.candidate_pool.len());
         assert_eq!(pooled.candidate_mapq.len(), pooled.candidate_pool.len());
