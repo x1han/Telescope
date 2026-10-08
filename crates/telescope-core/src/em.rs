@@ -2756,6 +2756,161 @@ mod tests {
         let _ = std::fs::remove_file(&profile);
     }
 
+    /// STEP 1 and STEP 2 of the M-step, asserted as VALUES at the one setting
+    /// where they actually run. Tolerance 1e-12: this is a bit-for-bit closed
+    /// form, not a numeric estimate, so any tolerance wider than that is
+    /// buying tolerance for a bug.
+    ///
+    /// WHY THIS TEST EXISTS. Before it, the only assertion anywhere in the
+    /// repository touching `.mu` or `.sigma2` was the `is_finite()` check in
+    /// `test_poly_a_weight_zero_freezes_mu_and_sigma2...` above -- which runs
+    /// the `poly_a_weight == 0` arm, where STEPs 1 and 2 are skipped entirely
+    /// (em.rs:780). At the weight the tool actually ships, nothing pinned
+    /// either value, and no mutation in the battery touched `accum_w_y`,
+    /// `tau_0`, `p.mu =` or `p.sigma2 =`. The project's central published
+    /// formula could be rewritten to `accum_w_y / w_sum` -- dropping the prior
+    /// outright -- with every gate still green.
+    ///
+    /// WHY `max_iter = 2` AND NOT MORE. `output_emission_params` is fed from
+    /// `last_estep_params` (em.rs:1470), snapshotted at em.rs:669 -- AFTER the
+    /// E-step consumed `params` and BEFORE the M-step rewrites it. So the
+    /// exported value is the model the E-step saw, which is one M-step BEHIND
+    /// `params` itself. At `max_iter = 5` that is M-step#4: reproducing it
+    /// would mean re-deriving the whole iteration chain, and the loop exits on
+    /// `delta_avg_ll < tol` at tol = 1e-6, so any fixed-point argument holds
+    /// only to ~1e-6 and can never support a 1e-12 pin. `max_iter = 2` makes
+    /// the export M-step#1's output on EVERY exit path:
+    ///   * `prev_ll` starts at NEG_INFINITY (em.rs:463), so at iteration 0
+    ///     `delta_avg_ll` is +inf and the convergence break cannot fire;
+    ///   * iteration 1 then snapshots the post-M-step#1 state.
+    ///
+    /// A larger `max_iter` would still be deterministic, but only after
+    /// replicating every intermediate E-step -- which is a reimplementation of
+    /// the solver, and therefore a test that can agree with a broken solver.
+    ///
+    /// WHY THE EXPECTED NUMBERS LOOK ROUNDED AND ARE NOT. `y` is NOT
+    /// log2(100). The fixture computes it in f32 and em.rs widens it
+    /// (`mol.log_pal as f64`, em.rs:734), so
+    ///     y = f64(f32(log2(100))) = 6.6438560485839844
+    /// which sits 1.41e-07 BELOW the true logarithm. The f64-path decimal
+    /// 6.928772 quoted in review is 7.9e-07 from the real answer; asserting it
+    /// at 1e-12 fails, and "fixing" that by loosening to 1e-6 would destroy
+    /// the exact sensitivity this test exists to provide. The constants below
+    /// are the full-precision values of the actual computation, obtained by
+    /// evaluating the identical f64 operation sequence:
+    ///
+    ///     one read, two candidates, identical AS/NM/MAPQ/gap/mu/sigma2 and
+    ///     identical init alpha (em.rs:438-455 gives both 0.01+0.5, so
+    ///     alpha = 0.5/1.02) => exp(ll - log_z) = exp(-ln 2) = 0.5 EXACTLY
+    ///
+    ///     w_sum     = 0.5
+    ///     S1        = 0.5*y                = 3.321928024291992
+    ///     S2        = 0.5*y*y              = 22.070411597152997
+    ///     mu_cohort = 7.0,  sigma2_cohort = 0.5      (emission parquet)
+    ///     tau_0 = 2.0, nu_0 = 1.0, beta_0 = 1.0      (em.rs:460-462)
+    ///
+    ///     mu      = (S1 + tau_0*mu_cohort) / (w_sum + tau_0)
+    ///            = (3.321928024291992 + 14.0) / 2.5      = 6.928771209716797
+    ///     sq_dev  = max(S2 - 2*mu*S1 + mu^2*W, 0) = 0.5*(y-mu)^2
+    ///            = 0.040588324521667830
+    ///     sigma2  = (sq_dev + 2*beta_0*sigma2_cohort) / (w_sum + 2*nu_0 + 3)
+    ///            = (0.040588324521667830 + 1.0) / 5.5    = 0.18919787718575778
+    ///
+    /// `sq_dev` is a cancelling sum -- terms of order 22 and 48 collapsing to
+    /// 0.0406 -- and it still carries ~1e-15 relative accuracy, which is
+    /// 4 orders inside the 1e-12 absolute budget. The result is far above
+    /// INSTRUMENTAL_PAL_NOISE_FLOOR (0.04, emission_model.rs:162), so the
+    /// `.max()` clamp at em.rs:791 must NOT fire: a reported 0.04 would mean
+    /// the clamp engaged and the fixture stopped exercising the formula.
+    #[test]
+    fn test_mstep_mu_and_sigma2_match_their_closed_forms_when_poly_a_is_on() {
+        const EXPECTED_MU: f64 = 6.928_771_209_716_797;
+        const EXPECTED_SIGMA2: f64 = 0.189_197_877_185_757_78;
+        const TOL: f64 = 1e-12;
+
+        // The observation, and the cohort prior it must be shrunk TOWARD.
+        // mu_cohort != y is what gives the `tau_0 * mu_cohort` term non-zero
+        // leverage: with mu_cohort == y the closed form collapses to y for any
+        // prior weight, and deleting `tau_0` entirely would go unnoticed. Here
+        // they differ by 0.285, which is 2.8e11 tolerances.
+        let y = (100.0_f32).log2() as f64;
+        const MU_COHORT: f64 = 7.0;
+
+        let emission = scratch("mstep_closed_form_emission.parquet");
+        let profile = scratch("mstep_closed_form_profile.parquet");
+        write_test_emission(
+            &emission,
+            &[
+                ("tx0", "gene0", MU_COHORT, 0.5),
+                ("tx1", "gene1", MU_COHORT, 0.5),
+            ],
+        );
+        let cands: [(&str, i32, u32); 2] = [("tx0", 1000, 0), ("tx1", 1000, 0)];
+
+        let mut params_on = Vec::new();
+        solve_and_write_profile(
+            synth_graph_with_gaps((100.0_f32).log2(), &cands),
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            2, // max_iter -- see the note above; do NOT raise.
+            20.0,
+            FIVE_PRIME_OFF,
+            POLY_A_ON,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
+            None,
+            Some(&mut params_on),
+            None,
+        )
+        .unwrap();
+
+        for (i, tx) in ["tx0", "tx1"].iter().enumerate() {
+            let p = params_on[i]
+                .as_ref()
+                .unwrap_or_else(|| panic!("{tx} must have params"));
+
+            // The shrinkage is directional: mu must sit strictly BETWEEN the
+            // observation and the prior, equal to neither. Without this, a
+            // solver that returned the prior verbatim (data dropped) or the
+            // observation verbatim (prior dropped) could in principle still
+            // satisfy a value test against a mis-derived constant. Written
+            // against min/max rather than as `mu > y && mu < prior` so the
+            // assertion encodes the invariant instead of a guess about which
+            // endpoint is larger -- an earlier draft of this line had that
+            // guess backwards and failed on its first run.
+            assert!(
+                p.mu > y.min(MU_COHORT) && p.mu < y.max(MU_COHORT),
+                "{tx}: the empirical-Bayes shrinkage must pull mu strictly between \
+                 the observation {y} and the cohort prior {MU_COHORT}; got {}. \
+                 Equal to one endpoint means one of the two terms was dropped.",
+                p.mu
+            );
+            assert!(
+                (p.mu - EXPECTED_MU).abs() < TOL,
+                "M-STEP mu REGRESSION on {tx}: got {:.17}, expected {EXPECTED_MU:.17}. \
+                 The expected value is the f32-widened closed form derived on this \
+                 test. If the prior weight, the weights, or the placeholder moved, \
+                 re-derive it from that derivation -- do NOT widen the tolerance, \
+                 which is the one thing this test exists to prevent.",
+                p.mu
+            );
+            assert!(
+                (p.sigma2 - EXPECTED_SIGMA2).abs() < TOL,
+                "M-STEP sigma2 REGRESSION on {tx}: got {:.17}, expected \
+                 {EXPECTED_SIGMA2:.17}. A value of 0.04 means \
+                 INSTRUMENTAL_PAL_NOISE_FLOOR clamped the closed form, so this \
+                 fixture stopped exercising it.",
+                p.sigma2
+            );
+        }
+
+        let _ = std::fs::remove_file(&emission);
+        let _ = std::fs::remove_file(&profile);
+    }
+
     /// `solve_and_write_profile` is public, so the CLI's `poly_a_weight = 0`
     /// interlock is not enough: a library caller can pair a placeholder graph
     /// with a positive weight, which feeds a constant emission into the E-step
