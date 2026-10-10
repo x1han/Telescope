@@ -592,9 +592,12 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
 
                     // ln_5p_k = β if g_k ≤ window else 0 (frozen spec). `g_k` is
                     // the observed 5' gap of the read's best alignment to THIS
-                    // candidate, in this candidate's own cDNA coordinates, and
-                    // is already strand-corrected by Module 2 — there is no
-                    // strand flag to consult here and none may be inferred.
+                    // candidate, in this candidate's own cDNA coordinates, used
+                    // as-is. Module 2 does NOT strand-correct anything -- it
+                    // never reads `FLAG & 0x10`, and an earlier comment here
+                    // claiming it did described code that never existed -- but it
+                    // now refuses reverse-strand records outright, so no strand
+                    // flag can reach this point and none may be inferred.
                     //
                     // It is a PRIOR, not an EM parameter: `g_k` is fixed per
                     // (read, candidate) exactly like `AS`, so it belongs in no

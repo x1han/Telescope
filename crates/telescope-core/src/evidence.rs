@@ -160,8 +160,15 @@ pub struct FlatEvidenceGraph {
     pub candidate_mapq: Vec<u8>,
     /// Observed 5' gap `g_k` per candidate, in the candidate transcript's own
     /// cDNA coordinates: the number of transcript bases 5' of the read's 5' end
-    /// in its best alignment to that candidate. Strand-corrected at extraction
-    /// (see `extract_evidence`) so consumers never see a strand flag.
+    /// in its best alignment to that candidate.
+    ///
+    /// NO strand correction is performed, and none is needed: transcriptome
+    /// alignments are forward by construction, and `extract_evidence` now
+    /// REFUSES any reverse-strand record rather than reading it as forward. An
+    /// earlier version of this comment claimed the gap was "strand-corrected at
+    /// extraction"; no such code has ever existed in this crate -- `FLAG & 0x10`
+    /// was not read anywhere. Consumers still never see a strand flag, but the
+    /// reason is the guard, not a correction.
     ///
     /// Consumed by Module 3's 5'-anchoring term `ln_5p_k = β if g_k ≤ window`.
     /// It is FIXED per (read, candidate) — exactly like `AS` — so it is computed
@@ -397,6 +404,44 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
         if flags.is_unmapped() {
             fc.dropped_unmapped += 1;
             continue;
+        }
+        // REVERSE-STRAND GUARD (P1, 2026-10-10).
+        //
+        // Nothing downstream of this loop reads a strand flag, and nothing in
+        // `crates/` ever reads `FLAG & 0x10` -- that was checked by grep, and
+        // the only hit was a test fixture SETTING the bit. Two doc comments
+        // (here and in `em.rs`) claimed the 5' gap was "strand-corrected at
+        // extraction"; no such code exists.
+        //
+        // That has been harmless so far only because transcriptome alignments
+        // are forward by construction. Measured on HC2's full scan: mapped
+        // 37,714,800, **reverse 0**, supplementary 25,077, secondary
+        // 32,517,774. So the missing correction has never had anything to
+        // correct. That is a property of the DATA, not of the CODE, and it is
+        // exactly the kind of property that stops holding the moment someone
+        // points the tool at a genome BAM.
+        //
+        // Hence a hard failure rather than a silent pass. If a reverse record
+        // ever appears, `gap5p = start_pos - 1` on cDNA coordinates is computed
+        // from an orientation the rest of the pipeline does not model, and the
+        // resulting `g_k` would feed Module 3's 5'-anchoring term as if it were
+        // meaningful. Refusing the input is the only outcome that is correct
+        // without a strand model, and it converts a silent wrong answer into a
+        // loud stop. `is_reverse()` is `FLAG & 0x10`.
+        if flags.is_reverse_complemented() {
+            let qname = match record.name() {
+                Some(name) => String::from_utf8_lossy(name).to_string(),
+                None => "<unnamed>".to_string(),
+            };
+            bail!(
+                "reverse-strand alignment in a transcriptome BAM: record {} \
+                 (QNAME {}). Telescope computes the 5' gap `g_k` on cDNA \
+                 coordinates and applies no strand correction -- none exists in \
+                 this crate -- so a reverse record would produce a 5' gap that \
+                 means nothing. Supply a transcriptome alignment.",
+                fc.records_entered,
+                qname
+            );
         }
         // SUPPLEMENTARY (`FLAG & 2048`) records are DROPPED, not merged.
         //
@@ -2008,48 +2053,67 @@ mod tests {
         assert_eq!(gap_of("f20"), 20, "forward start 21 ⇒ g_k = 20 exactly");
     }
 
-    /// Strand is a KNOWN GAP, not a handled case, and this test exists so the
-    /// gap stays visible instead of being quietly closed by a future edit.
+    /// Strand is a REFUSED input, not a handled case.
     ///
-    /// The frozen spec `g_k = s_k − 1` was validated on a FORWARD-ONLY
-    /// population (the prototype skips reverse records), and the reverse
-    /// fraction is 0.0000 across 200,000 mapped records in each of the three
-    /// BAMs this project runs. An earlier version branched to `T_k − ref_end`
-    /// for reverse records; that was removed because the strand-blind TES
-    /// filter forces `T_k − ref_end <= tes_slack` for every surviving reverse
-    /// read, collapsing the term into a 20-of-35 bp band, and the definition
-    /// would have been unvalidated besides.
+    /// HISTORY, because this test used to assert the opposite contract. It
+    /// asserted `g_k = 0` for a reverse record -- reverse alignments were
+    /// ACCEPTED and given the forward formula -- and said so explicitly as a
+    /// tripwire ("if this ever becomes strand-aware, this assertion is the
+    /// tripwire"). That was a deliberate "keep the gap visible" design: the
+    /// frozen spec `g_k = s_k − 1` was validated on a forward-only population,
+    /// and an earlier version had branched to `T_k − ref_end` and been removed
+    /// because the strand-blind TES filter collapses that to a 20-of-35 bp band.
     ///
-    /// So a reverse record now gets the forward formula. If the Bambu/IsoQuant
-    /// general path (Phase F1/F2) ever carries antisense alignments, the right
-    /// answer is a separately validated definition -- this assertion is where
-    /// that decision must be made deliberately, not as an inline guess.
+    /// The expert ruling of 2026-10-10 supersedes it: refuse the input. The
+    /// swap preserves what the old test was FOR -- a guard that fails if someone
+    /// changes strand handling -- by transposing it. The old tripwire watched
+    /// the formula; the new one watches the refusal. What is lost is only the
+    /// ability to observe a reverse record's `g_k` at all, which is the point:
+    /// no such value is now reachable, so there is nothing to validate until a
+    /// separately validated strand definition exists.
+    ///
+    /// The forward population is unaffected: the control at the end runs the
+    /// same fixture without the reverse record and requires it to succeed.
+    /// Without that, `expect_err` would also be satisfied by any unrelated
+    /// failure to read the file -- this test would pass against a `extract_evidence`
+    /// broken in any way whatsoever.
     #[test]
-    fn test_reverse_alignment_uses_the_forward_formula_as_a_documented_gap() {
+    fn test_reverse_alignment_is_refused_rather_than_given_the_forward_formula() {
         let path = write_synthetic_bam(
-            "strand_gap",
+            "strand_refused",
             vec![
-                // reverse record, start 1 on an 800 nt reference
+                // reverse record: start 1 on the fixture's REF_LEN (2000) nt reference,
+                // ending 30 bases SHORT of the 3' end. See REF_LEN.
                 synth_record_with_gap("rev", 0, 30, true, Some(800), 1, 60),
             ],
         );
-
-        let graph = extract_evidence(&path, 35).unwrap();
+        let err = extract_evidence(&path, 35).expect_err(
+            "a reverse-strand record must be refused: this crate reads no strand \
+             flag and applies no strand correction, so `g_k = start_pos - 1` on a \
+             reverse alignment is not a value anything downstream can use",
+        );
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("reverse-strand") && msg.contains("rev"),
+            "the error must NAME the condition and the offending read, so an \
+             operator can tell this apart from the other hard errors \
+             extract_evidence raises. Got: {msg}"
+        );
         let _ = std::fs::remove_file(&path);
 
-        let mol = graph
-            .molecules
-            .iter()
-            .find(|m| m.read_id == "rev")
-            .expect("rev must be in the graph");
-        let gap = graph.candidate_5p_gap[mol.candidate_offset as usize];
-
-        // start_pos = 1 ⇒ g_k = 0, i.e. the formula does NOT branch on strand.
-        // If this ever becomes strand-aware, this assertion is the tripwire.
-        assert_eq!(
-            gap, 0,
-            "g_k is computed as start_pos - 1 regardless of strand; a change here \
-             means a new definition was adopted and must be re-validated"
+        // CONTROL. The same fixture, forward only, must still be read.
+        let fwd = write_synthetic_bam(
+            "strand_forward_control",
+            vec![synth_record_with_gap("fwd", 0, 30, false, Some(800), 1, 60)],
+        );
+        let graph = extract_evidence(&fwd, 35).expect(
+            "the forward population is the validated one and must keep working; \
+             if this fails the guard is not what rejected the reverse fixture",
+        );
+        let _ = std::fs::remove_file(&fwd);
+        assert!(
+            graph.molecules.iter().any(|m| m.read_id == "fwd"),
+            "control: the forward read must be in the graph"
         );
     }
 
