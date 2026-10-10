@@ -36,6 +36,23 @@ use rayon::prelude::*;
 use crate::emission_model::INSTRUMENTAL_PAL_NOISE_FLOOR;
 use crate::evidence::{FlatEvidenceGraph, MoleculeEvidence};
 
+/// Shape parameter of the Inverse-Gamma prior on σ².
+pub const NU_0: f64 = 1.0;
+/// Scale multiplier of the Inverse-Gamma prior on σ².
+pub const BETA_0: f64 = 1.0;
+/// MAP pseudo-count damping for the μ update (spec v0.2.6 §F2).
+///
+/// WHY THESE ARE `pub const` AND NOT LOCAL `let`s (2026-10-11). They were
+/// function-local bindings inside `solve_and_write_profile`, which made them
+/// unreachable from a test AND unreachable from the mutation battery — the
+/// battery could only mutate the lines that *consume* them. Nothing in the
+/// tree asserted that `TAU_0` was 2.0: changing it to 2.1 turned no test red.
+/// A prior strength that no test pins is a prior strength that can drift
+/// silently, and every M-step conclusion downstream is conditional on it.
+/// Hoisting them changes no arithmetic; it makes the value assertable.
+/// Pinned by `test_m_step_prior_constants_are_pinned`.
+pub const TAU_0: f64 = 2.0;
+
 /// Per-transcript parameters loaded from `telescope.emission.parquet`.
 #[derive(Debug, Clone)]
 pub struct TranscriptParam {
@@ -457,9 +474,10 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
     }
 
     // 3. TEL-EM loop (only iterates over ambiguous reads).
-    let nu_0 = 1.0_f64;
-    let beta_0 = 1.0_f64;
-    let tau_0 = 2.0_f64; // MAP pseudo-count damping for μ update (spec v0.2.6 §F2).
+    use crate::em::{BETA_0, NU_0, TAU_0};
+    let nu_0 = NU_0;
+    let beta_0 = BETA_0;
+    let tau_0 = TAU_0;
     let mut prev_ll = f64::NEG_INFINITY;
     let mut final_weights: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n_ambiguous];
     let mut n_em_iter = 0_usize;
@@ -2506,6 +2524,39 @@ mod tests {
     use arrow::array::{Array, BooleanBuilder, Int64Array, UInt32Builder};
 
     use crate::evidence::MoleculeEvidence;
+
+    /// The M-step's three prior constants are pinned BY VALUE.
+    ///
+    /// They were function-local `let`s until 2026-10-11, which is why nothing
+    /// asserted them and the mutation battery could only mutate their
+    /// consumers. Every claim about the M-step — including the simulation
+    /// oracle's verdict on which model to ship — is conditional on these
+    /// numbers, so a silent edit to any of them must go red here.
+    ///
+    /// Exact equality, not approximate: these are hyper-parameters, not
+    /// measurements. A tolerance would let a drift hide inside it.
+    #[test]
+    fn test_m_step_prior_constants_are_pinned() {
+        assert_eq!(
+            NU_0, 1.0,
+            "NU_0 changed; the InvGamma shape enters the sigma2 denominator"
+        );
+        assert_eq!(
+            BETA_0, 1.0,
+            "BETA_0 changed; it multiplies sigma2_cohort in the sigma2 numerator"
+        );
+        assert_eq!(
+            TAU_0, 2.0,
+            "TAU_0 changed; it is the pseudo-count damping on the mu update \
+             AND the kappa_0 of the mu|v conditional prior in the sigma2 \
+             numerator. Changing it moves every shrinkage in the model."
+        );
+        assert_eq!(
+            INSTRUMENTAL_PAL_NOISE_FLOOR, 0.04,
+            "the sigma2 floor changed; it silently truncates every small-variance \
+             transcript and the oracle ranks models against it"
+        );
+    }
 
     /// Output-stage truncation threshold mirrored from `solve_and_write_profile`.
     const MIN_WEIGHT: f64 = 0.01;
