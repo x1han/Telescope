@@ -2822,6 +2822,93 @@ mod tests {
     /// INSTRUMENTAL_PAL_NOISE_FLOOR (0.04, emission_model.rs:162), so the
     /// `.max()` clamp at em.rs:791 must NOT fire: a reported 0.04 would mean
     /// the clamp engaged and the fixture stopped exercising the formula.
+    /// Round 44. The shrinkage prior `mu_cohort` is loaded once, from
+    /// `emission.parquet:mu_logPAL` (`load_emission_parameters`, em.rs:139),
+    /// and is the fixed point the M-step pulls `mu` TOWARD:
+    ///
+    ///     p.mu = (accum_w_y[i] + tau_0 * p.mu_cohort) / (w_sum + tau_0)
+    ///
+    /// If the M-step also WROTE `p.mu_cohort`, the prior would chase the
+    /// current iterate and the shrinkage would collapse toward a fixed point
+    /// with no data in it -- the classic empirical-Bayes self-anchoring
+    /// failure, and one that would not raise, not log, and not change any
+    /// emitted weight's sign.
+    ///
+    /// WHY THIS TEST EXISTS. It did not, until Round 44. Measured: adding
+    /// `p.mu_cohort = p.mu;` immediately after the update turns **zero** of
+    /// the 108 tests red (`cargo test --release --workspace`, all six
+    /// binaries `ok`), and `mutation_battery.sh` cannot see it either -- its
+    /// only `mu_cohort` occurrence is inside m27's mutation string, which
+    /// edits the formula that READS the prior, not the field itself. So the
+    /// immutability invariant was asserted by no test and by no mutation.
+    ///
+    /// The second assertion is what stops this from passing vacuously: it
+    /// requires `mu` to have actually MOVED off the prior. Without it, a
+    /// solver that never updated `mu` at all would satisfy "prior unchanged"
+    /// trivially, and this test would guard nothing.
+    #[test]
+    fn test_mu_cohort_is_immutable_across_em_iterations() {
+        const MU_COHORT: f64 = 7.0;
+        let y = (100.0_f32).log2() as f64;
+
+        let emission = scratch("mu_cohort_frozen_emission.parquet");
+        let profile = scratch("mu_cohort_frozen_profile.parquet");
+        write_test_emission(
+            &emission,
+            &[
+                ("tx0", "gene0", MU_COHORT, 0.5),
+                ("tx1", "gene1", MU_COHORT, 0.5),
+            ],
+        );
+        let cands: [(&str, i32, u32); 2] = [("tx0", 1000, 0), ("tx1", 1000, 0)];
+
+        let mut params = Vec::new();
+        solve_and_write_profile(
+            synth_graph_with_gaps(y as f32, &cands),
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            2,
+            20.0,
+            FIVE_PRIME_OFF,
+            POLY_A_ON,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
+            None,
+            Some(&mut params),
+            None,
+        )
+        .unwrap();
+
+        for (i, tx) in ["tx0", "tx1"].iter().enumerate() {
+            let p = params[i]
+                .as_ref()
+                .unwrap_or_else(|| panic!("{tx} must have params"));
+
+            // VACUITY GUARD: the prior must be a real shrinkage target, i.e.
+            // the data must have moved `mu` away from it. Equal values would
+            // make the immutability assertion below true for free.
+            assert!(
+                (p.mu - MU_COHORT).abs() > 1e-9,
+                "{tx}: mu ({}) must differ from the prior ({MU_COHORT}) for this \
+                 test to mean anything; equal values make the next assertion \
+                 vacuous",
+                p.mu
+            );
+
+            assert_eq!(
+                p.mu_cohort, MU_COHORT,
+                "{tx}: mu_cohort MUTATED during the EM run (prior={MU_COHORT}, \
+                 now={}). The shrinkage target must stay frozen at the loaded \
+                 value for every iteration; a prior that chases the current \
+                 iterate turns the M-step into a self-anchoring fixed point.",
+                p.mu_cohort
+            );
+        }
+    }
+
     #[test]
     fn test_mstep_mu_and_sigma2_match_their_closed_forms_when_poly_a_is_on() {
         const EXPECTED_MU: f64 = 6.928_771_209_716_797;
