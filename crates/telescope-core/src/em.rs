@@ -4546,6 +4546,240 @@ mod tests {
         );
     }
 
+    /// Two copies of every molecule, laid out so each copy owns its own slice
+    /// of the candidate pool. Read ids get a suffix because the profile writer
+    /// keys rows by them.
+    ///
+    /// The candidate slices are re-walked per molecule rather than assumed
+    /// contiguous, so this stays correct for any `candidate_offset` layout.
+    fn duplicate_every_molecule(g: &FlatEvidenceGraph) -> FlatEvidenceGraph {
+        let mut molecules = Vec::with_capacity(2 * g.molecules.len());
+        let mut candidate_pool = Vec::with_capacity(2 * g.candidate_pool.len());
+        let mut candidate_as = Vec::with_capacity(2 * g.candidate_as.len());
+        let mut candidate_nm = Vec::with_capacity(2 * g.candidate_nm.len());
+        let mut candidate_mapq = Vec::with_capacity(2 * g.candidate_mapq.len());
+        let mut candidate_5p_gap = Vec::with_capacity(2 * g.candidate_5p_gap.len());
+        let slice = |off: u32, cnt: u16| {
+            let (o, n) = (off as usize, cnt as usize);
+            (o, o + n)
+        };
+        for copy in 0..2u32 {
+            for m in &g.molecules {
+                let (o, e) = slice(m.candidate_offset, m.candidate_count);
+                let offset = candidate_pool.len() as u32;
+                candidate_pool.extend_from_slice(&g.candidate_pool[o..e]);
+                candidate_as.extend_from_slice(&g.candidate_as[o..e]);
+                candidate_nm.extend_from_slice(&g.candidate_nm[o..e]);
+                candidate_mapq.extend_from_slice(&g.candidate_mapq[o..e]);
+                candidate_5p_gap.extend_from_slice(&g.candidate_5p_gap[o..e]);
+                molecules.push(MoleculeEvidence {
+                    read_id: if copy == 0 {
+                        m.read_id.clone()
+                    } else {
+                        format!("{}_dup", m.read_id)
+                    },
+                    log_pal: m.log_pal,
+                    candidate_offset: offset,
+                    candidate_count: m.candidate_count,
+                });
+            }
+        }
+        FlatEvidenceGraph {
+            molecules,
+            candidate_pool,
+            candidate_as,
+            candidate_nm,
+            candidate_mapq,
+            candidate_5p_gap,
+            transcript_names: g.transcript_names.clone(),
+            poly_a_is_placeholder: g.poly_a_is_placeholder,
+            stats: g.stats.clone(),
+        }
+    }
+
+    /// The abundance estimate is a PER-MOLECULE quantity: the M-step divides
+    /// each transcript's accumulated weight by the TOTAL molecule count, so
+    /// `alpha_k = W_k / N`. Both the numerator and the denominator therefore
+    /// double when every read is duplicated, and
+    ///
+    ///     alpha_k(2x) = 2 W_k / 2 N = alpha_k(x)
+    ///
+    /// The solution must not depend on how many molecules the run happened to
+    /// contain. This is a statement about the ESTIMATOR, not about any
+    /// particular divisor: it is what makes a sample's abundances comparable
+    /// to another sample's, and it is why the divisor is the total count rather
+    /// than the count of molecules carrying that transcript.
+    ///
+    /// The tightness, and what limits it. The one-shot quotient is EXACTLY
+    /// invariant -- `2 W_k / 2 N` is the same f64 division -- but `alpha` is a
+    /// FIXED POINT of EM, not a one-shot value: `W_k` is itself a sum of
+    /// posteriors that depend on `alpha`. And the fixed point is not exactly
+    /// duplication-invariant either, because none of the prior terms scale with
+    /// the data: `tau_0 * mu_cohort`, `beta_0 * sigma2_cohort` and the Laplace
+    /// `0.01` all stay put while the data doubles, so the two runs settle at
+    /// slightly different abundances. Measured on this fixture: 3.4e-6.
+    ///
+    /// That is the number the tolerance is set against, and it is quoted here
+    /// so the next reader can see the margin rather than re-derive it. A divisor
+    /// that is not a common factor of the count moves `alpha` by 8.6e-2 on the
+    /// same fixture -- `N/(N-5)` against `2N/(2N-5)`, 1.1724 against 1.0794 --
+    /// so the tolerance below sits ~30x above the clean spread and ~860x below
+    /// the defect. An earlier draft of this comment claimed the two runs agree
+    /// to exactly 0.0; that was true of the algebra and false of the solver,
+    /// and it is why the claim is now a measured number with its tolerance
+    /// derived from it.
+    ///
+    /// WHY NOT `alpha`'s EFFECT ON THE POSTERIORS. A uniform rescaling of the
+    /// alpha vector is invisible to a softmax -- `ln c` is common to every
+    /// candidate -- so no test that only reads posteriors can see this
+    /// denominator change at all, at any scale. That is a real property of the
+    /// model, not a gap in the test, and it is why the assertion reads `alpha`
+    /// itself. What duplication adds is that it compares NON-uniform rescalings:
+    /// `N -> N-5` rescales every component identically, whereas `N -> 2N` is a
+    /// genuine change of normaliser, and only the latter separates a correct
+    /// denominator from a merely-proportional one.
+    ///
+    /// `mu` and `sigma2` are deliberately NOT asserted here: they are not
+    /// duplication-invariant. The prior term `tau_0 * mu_cohort` does not scale
+    /// with the data, so the shrinkage `(S1 + tau_0 mu_cohort) / (W + tau_0)`
+    /// moves by O(tau_0 (k-1)(S1 - W mu_cohort) / ((kW+tau_0)(W+tau_0)))` --
+    /// order 1e-3 here. Asserting them would force a tolerance four orders
+    /// looser than the one this defect needs, which is how a guard stops
+    /// guarding anything.
+    #[test]
+    fn test_alpha_is_invariant_to_duplicating_every_molecule() {
+        let log_pal = (100.0_f32).log2();
+        let emission = scratch("alpha_scale_emission.parquet");
+        let profile = scratch("alpha_scale_profile.parquet");
+        write_test_emission(
+            &emission,
+            &[
+                ("tx0", "gene0", log_pal as f64, 0.04),
+                ("tx1", "gene1", log_pal as f64, 0.04),
+            ],
+        );
+
+        let once = prior_biased_graph();
+        let twice = duplicate_every_molecule(&once);
+
+        // GUARD. If the duplication were a no-op -- empty pool, a wrong
+        // candidate_count, a slice that does not get appended -- the two runs
+        // would be identical by construction and the invariance below would be
+        // true no matter what the M-step computes.
+        assert_eq!(
+            once.molecules.len() * 2,
+            twice.molecules.len(),
+            "duplication produced {} molecules, expected {}",
+            twice.molecules.len(),
+            once.molecules.len() * 2
+        );
+        assert_eq!(2 * once.candidate_pool.len(), twice.candidate_pool.len());
+        for (i, m) in twice.molecules.iter().enumerate() {
+            let (o, e) = (
+                m.candidate_offset as usize,
+                m.candidate_offset as usize + m.candidate_count as usize,
+            );
+            assert!(
+                e <= twice.candidate_pool.len(),
+                "molecule {i} points at candidates {o}..{e} of {}",
+                twice.candidate_pool.len()
+            );
+            // The duplication is two consecutive passes over the original, so
+            // molecule i of copy c corresponds to original i % n.
+            let orig = &once.molecules[i % once.molecules.len()];
+            assert_eq!(m.log_pal, orig.log_pal, "the copy changed log_pal");
+            assert_eq!(
+                m.candidate_count, orig.candidate_count,
+                "the copy lost candidates"
+            );
+        }
+
+        let mut params_once = Vec::new();
+        solve_and_write_profile(
+            once,
+            &emission,
+            "TEST",
+            &profile,
+            1e-9,
+            5,
+            100.0,
+            FIVE_PRIME_OFF,
+            POLY_A_ON,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
+            None,
+            Some(&mut params_once),
+            None,
+        )
+        .unwrap();
+        let mut params_twice = Vec::new();
+        solve_and_write_profile(
+            twice,
+            &emission,
+            "TEST",
+            &profile,
+            1e-9,
+            5,
+            100.0,
+            FIVE_PRIME_OFF,
+            POLY_A_ON,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
+            None,
+            Some(&mut params_twice),
+            None,
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(&emission);
+        let _ = std::fs::remove_file(&profile);
+
+        // No type annotations: the out-param's element type is inferred, so
+        // this reads the field rather than restating a signature that could
+        // drift.
+        let mut once_a: Vec<f64> = Vec::new();
+        let mut twice_a: Vec<f64> = Vec::new();
+        assert_eq!(
+            params_once.len(),
+            params_twice.len(),
+            "duplication changed the number of transcripts with parameters"
+        );
+        for i in 0..params_once.len() {
+            once_a.push(
+                params_once[i]
+                    .as_ref()
+                    .expect("both transcripts are in the emission")
+                    .alpha,
+            );
+            twice_a.push(
+                params_twice[i]
+                    .as_ref()
+                    .expect("both transcripts are in the emission")
+                    .alpha,
+            );
+        }
+
+        // 1e-4: ~30x the measured clean spread (3.4e-6) and ~860x below what a
+        // wrong divisor produces (8.6e-2). Both numbers are in the doc comment.
+        const TOL: f64 = 1e-4;
+        for (k, (a, b)) in once_a.iter().zip(&twice_a).enumerate() {
+            assert!(
+                (a - b).abs() <= TOL,
+                "alpha is a PER-MOLECULE quantity and must not depend on how many \
+                 molecules the run contained. Duplicating every read moved \
+                 transcript {k} from {a:.17} to {b:.17} (delta {:.3e}, tol {TOL:e}).\n  \
+                 alpha_k = W_k / N, and both W_k and N double, so the quotient is \
+                 unchanged up to the prior's fixed weight (3.4e-6 measured). A \
+                 divisor that is not a common factor of the total count -- \
+                 `N - 5.0` gives {once_a:?} against {twice_a:?} here, an 8.6e-2 \
+                 shift -- rescales every component by N/(N-5) against 2N/(2N-5) \
+                 and moves abundances with sequencing depth.",
+                (a - b).abs()
+            );
+        }
+    }
+
     /// The abundance prior `ln alpha` is the MIXTURE prior, not part of the
     /// poly(A) emission, so it must survive `poly_a_weight = 0`.
     ///
