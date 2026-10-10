@@ -3199,7 +3199,40 @@ mod tests {
     #[test]
     fn test_mstep_mu_and_sigma2_match_their_closed_forms_when_poly_a_is_on() {
         const EXPECTED_MU: f64 = 6.928_771_209_716_797;
-        const EXPECTED_SIGMA2: f64 = 0.189_197_877_185_757_78;
+        // sigma^2 for the SAME fixture, under the joint MAP with the numerator's
+        // conditional-mean-prior term restored. Full derivation, so the next
+        // person can check it rather than trust it:
+        //
+        //   The fixture is one molecule with two SYMMETRIC candidates, so the
+        //   posterior is exactly (0.5, 0.5) and each transcript sees
+        //       W = 0.5,  S1 = 0.5*y,  S2 = 0.5*y^2,  y = (100f32).log2() as f64
+        //                                   = 6.6438560485839844
+        //   => S1 = 3.3219280242919922, S2 = 22.070411597152997
+        //
+        //   mu = (S1 + tau_0*mu_cohort)/(W + tau_0)
+        //      = (3.3219280242919922 + 2*7.0)/(0.5 + 2)
+        //      = 6.9287712097167971                       [= EXPECTED_MU]
+        //
+        //   S(mu) = S2 - 2*mu*S1 + mu^2*W
+        //         = 22.070411597152997 - 2*6.9287712097167971*3.3219280242919922
+        //           + 6.9287712097167971^2 * 0.5
+        //         = 0.040588324521667829
+        //
+        //   numerator = S(mu) + tau_0*(mu - mu_cohort)^2 + 2*beta_0*sigma2_cohort
+        //             = 0.040588324521667829
+        //             + 2*(6.9287712097167971 - 7.0)^2          = 0.010147081130417013
+        //             + 2*1.0*0.5                              = 1.0
+        //             = 1.0507354056520848
+        //
+        //   denominator = W + 2*nu_0 + 3 = 0.5 + 2*1.0 + 3 = 5.5
+        //
+        //   sigma2 = 1.0507354056520848 / 5.5 = 0.19104280102765178
+        //
+        // The value this replaced was 0.18919787718575778 = the same expression
+        // WITHOUT the `tau_0*(mu - mu_cohort)^2` term, and it reproduces bit for
+        // bit, which is what makes the delta above trustworthy rather than
+        // asserted. Spec: crates/telescope-core/MSTEP-PRIOR-SPEC-v1.0.md
+        const EXPECTED_SIGMA2: f64 = 0.191_042_801_027_651_78;
         const TOL: f64 = 1e-12;
 
         // The observation, and the cohort prior it must be shrunk TOWARD.
