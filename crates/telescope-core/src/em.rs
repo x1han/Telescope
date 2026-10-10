@@ -2517,6 +2517,285 @@ mod tests {
     /// them into one number.
     const PRUNE_OFF: i32 = i32::MAX;
 
+    /// A MULTI-molecule `FlatEvidenceGraph`. `synth_graph_with_gaps` hardcodes
+    /// a single `MoleculeEvidence`, so no fixture could be built with a known
+    /// (W, S1, S2) until this existed -- which is why every pre-existing M-step
+    /// test runs on a single ambiguous molecule.
+    ///
+    /// Transcript ids are interned in first-seen order, so `params[i]` is the
+    /// parameters of the i-th DISTINCT transcript named, not the i-th molecule.
+    fn synth_graph_multi(mols: &[(f32, Vec<(&str, i32, u32)>)]) -> FlatEvidenceGraph {
+        let mut molecules = Vec::new();
+        let (mut candidate_pool, mut candidate_as, mut candidate_5p_gap) =
+            (Vec::new(), Vec::new(), Vec::new());
+        let (mut candidate_nm, mut candidate_mapq) = (Vec::new(), Vec::new());
+        let mut transcript_names: Vec<String> = Vec::new();
+        for (i, (log_pal, cands)) in mols.iter().enumerate() {
+            let offset = candidate_pool.len() as u32;
+            for &(tx, as_, gap) in cands {
+                let id = match transcript_names.iter().position(|n| n == tx) {
+                    Some(p) => p,
+                    None => {
+                        transcript_names.push(tx.to_string());
+                        transcript_names.len() - 1
+                    }
+                };
+                candidate_pool.push(id as u32);
+                candidate_as.push(as_);
+                candidate_5p_gap.push(gap);
+                candidate_nm.push(0);
+                candidate_mapq.push(60);
+            }
+            molecules.push(MoleculeEvidence {
+                read_id: format!("r{}", i + 1),
+                log_pal: *log_pal,
+                candidate_offset: offset,
+                candidate_count: cands.len() as u16,
+            });
+        }
+        FlatEvidenceGraph {
+            molecules,
+            candidate_pool,
+            candidate_as,
+            candidate_nm,
+            candidate_mapq,
+            candidate_5p_gap,
+            transcript_names,
+            poly_a_is_placeholder: false,
+            stats: crate::evidence::FilterCounts::default(),
+        }
+    }
+
+    /// Joint log-posterior of the NIG prior specified in
+    /// `crates/telescope-core/MSTEP-PRIOR-SPEC-v1.0.md` §2:
+    ///
+    ///     Q = -(W/2) ln(2 pi v) - S(mu)/(2v) - (nu_0+1) ln v - beta_0/v
+    ///         - 0.5 ln v - kappa_0 (mu - mu_cohort)^2 / (2v)
+    ///
+    /// The `-0.5 ln v` is the normalising factor of the conditional prior
+    /// `mu | v ~ N(mu_cohort, v/kappa_0)`; it is what puts the `+1` into the
+    /// sigma^2 denominator. Written out longhand rather than reusing any helper
+    /// from the M-step, so a production change cannot silently follow this
+    /// function's mistakes.
+    fn nig_joint_logpost(
+        mu: f64,
+        v: f64,
+        w: f64,
+        s1: f64,
+        s2: f64,
+        mu_cohort: f64,
+        kappa_0: f64,
+        nu_0: f64,
+        beta_0: f64,
+        sigma2_cohort: f64,
+    ) -> f64 {
+        let s_mu = s2 - 2.0 * mu * s1 + mu * mu * w;
+        -(w / 2.0) * (2.0 * std::f64::consts::PI * v).ln() - s_mu / (2.0 * v)
+            - (nu_0 + 1.0) * v.ln()
+            // The Inverse-Gamma SCALE is `beta_0 * sigma2_cohort`, not `beta_0`.
+            // Writing `beta_0` here makes the argmax come out at 0.9036 where the
+            // real optimum is 0.7786 -- a 16% error that looks like a production
+            // defect and is not one. It is the coefficient, not the exponent:
+            // InvGamma(a, b) has density v^{-(a+1)} exp(-b/v), and `em.rs` puts
+            // `beta_0 * sigma2_cohort` in the exponent so the prior's scale
+            // tracks the cohort's own variance.
+            - beta_0 * sigma2_cohort / v
+            - 0.5 * v.ln()
+            - kappa_0 * (mu - mu_cohort).powi(2) / (2.0 * v)
+    }
+
+    /// Golden-section maximisation of a unimodal 1-D function. This stalls at
+    /// the f64 representation limit (~2.5e-8 absolute on a log-posterior of
+    /// magnitude ~3), which is why the caller asserts on the OBJECTIVE VALUE
+    /// rather than on the argmax's coordinates: the objective is smooth and
+    /// well conditioned where the coordinates are not.
+    fn golden_max<F: Fn(f64) -> f64>(f: F, mut lo: f64, mut hi: f64, iters: usize) -> f64 {
+        let inv_phi = 0.618_033_988_749_894_9_f64;
+        for _ in 0..iters {
+            let a = hi - (hi - lo) * inv_phi;
+            let b = lo + (hi - lo) * inv_phi;
+            if f(a) < f(b) {
+                lo = a;
+            } else {
+                hi = b;
+            }
+        }
+        0.5 * (lo + hi)
+    }
+
+    /// The M-step must be the argmax of the joint NIG log-posterior -- not a
+    /// transcription of some closed form, which is what the existing
+    /// `EXPECTED_SIGMA2` golden constant had become.
+    ///
+    /// WHY A NEW FIXTURE. Three properties are needed at once and no existing
+    /// helper provides them:
+    ///
+    /// 1. **Exact, iteration-independent accumulators.** A molecule with
+    ///    `candidate_count == 1` is routed to `unambiguous_indices`
+    ///    (`em.rs:424-428`) and accumulates `accum_w += 1.0` unconditionally --
+    ///    the likelihood never touches the weight. So (W, S1, S2) is exactly
+    ///    what the fixture says, on every iteration, for ever.
+    /// 2. **The M-step must actually execute.** `solve_and_write_profile`
+    ///    computes `delta_avg_ll` over AMBIGUOUS molecules only, so an
+    ///    all-unambiguous graph gives `n_ambig == 0`, `delta_avg_ll == 0.0`,
+    ///    and `break`s ~65 lines BEFORE the M-step (`em.rs:707-712`). The
+    ///    parameters would then still hold their emission values and the test
+    ///    would fail forever -- correctly, and for the wrong reason. Hence the
+    ///    decoy molecule: it contributes `n_ambig = 1` and nothing else,
+    ///    because accumulators are indexed by `tx_id` and this one touches only
+    ///    tx1/tx2.
+    /// 3. **The defect must be visible.** The missing term is
+    ///    `kappa_0 (mu_MAP - mu_cohort)^2`, and shrinkage drives `mu_MAP`
+    ///    TOWARD `mu_cohort` as W grows -- so a large-W, tightly-clustered
+    ///    fixture hides it. Measured on this defect: W=3 clustered gives
+    ///    +0.33%, W=5 clustered gives +0.0025%, and this fixture (W=3 with
+    ///    `mu_cohort` far from the data) gives **+43.4%**. A tolerance anywhere
+    ///    near 1% separates them by five orders of magnitude.
+    ///
+    /// The assertion is on the OBJECTIVE VALUE, not on the argmax's
+    /// coordinates: golden-section maximisation of a log-posterior of magnitude
+    /// ~3 stalls at ~2.5e-8 absolute in f64, so coordinate assertions would
+    /// need a tolerance four orders looser than the defect-detection margin.
+    /// `Q(production) - Q(argmax)` is smooth and well conditioned instead.
+    #[test]
+    fn test_mstep_sigma2_matches_joint_map_objective() {
+        const KAPPA_0: f64 = 2.0; // em.rs `tau_0`
+        const NU_0: f64 = 1.0; // em.rs `nu_0`
+        const BETA_0: f64 = 1.0; // em.rs `beta_0`
+        const MU_COHORT: f64 = 8.5; // deliberately NOT near the observations
+        const SIGMA2_COHORT: f64 = 0.5;
+        const FLOOR: f64 = crate::emission_model::INSTRUMENTAL_PAL_NOISE_FLOOR;
+
+        // Single-candidate molecules -> unambiguous -> w = 1.0 each.
+        let lens: [f32; 3] = [64.0, 100.0, 256.0];
+        let mut mols: Vec<(f32, Vec<(&str, i32, u32)>)> = lens
+            .iter()
+            .map(|&l| (l.log2(), vec![("tx0", 1000, 0u32)]))
+            .collect();
+        // The decoy. Never asserted on; it exists only so n_ambig >= 1.
+        mols.push((256.0f32.log2(), vec![("tx1", 1000, 0), ("tx2", 1000, 0)]));
+
+        // The accumulators the production code will build, computed here from
+        // the SAME f32 -> f64 path it uses (`mol.log_pal as f64`).
+        let ys: Vec<f64> = lens.iter().map(|&l| l.log2() as f64).collect();
+        let w: f64 = ys.len() as f64;
+        let s1: f64 = ys.iter().sum();
+        let s2: f64 = ys.iter().map(|&y| y * y).sum();
+
+        // Feasibility, stated so a future fixture edit cannot silently make the
+        // variance term negative (which would `.max(0.0)` it away).
+        assert!(
+            w * s2 - s1 * s1 > 0.0,
+            "fixture must have real data variance: W*S2 - S1^2 = {}",
+            w * s2 - s1 * s1
+        );
+
+        let emission = scratch("mstep_objective_emission.parquet");
+        let profile = scratch("mstep_objective_profile.parquet");
+        write_test_emission(
+            &emission,
+            &[
+                ("tx0", "gene0", MU_COHORT, SIGMA2_COHORT),
+                ("tx1", "gene1", 7.0, SIGMA2_COHORT),
+                ("tx2", "gene2", 7.0, SIGMA2_COHORT),
+            ],
+        );
+
+        let mut params = Vec::new();
+        solve_and_write_profile(
+            synth_graph_multi(&mols),
+            &emission,
+            "TEST",
+            &profile,
+            1e-9,
+            3,
+            20.0,
+            FIVE_PRIME_OFF,
+            POLY_A_ON,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
+            None,
+            Some(&mut params),
+            None,
+        )
+        .unwrap();
+
+        let p = params[0].as_ref().expect("tx0 must have params");
+        let (mu_prod, v_prod) = (p.mu, p.sigma2);
+
+        // GUARD, not decoration: if the M-step never ran, mu still equals
+        // mu_cohort and sigma2 still equals sigma2_cohort. Say so, instead of
+        // letting the objective assertion below report a mystery.
+        assert!(
+            (mu_prod - MU_COHORT).abs() > 1e-6,
+            "the M-step did not run: mu is still the emission value {MU_COHORT}. \
+             The fixture must supply at least one AMBIGUOUS molecule, or the \
+             convergence check breaks before the M-step is ever reached."
+        );
+        assert!(
+            (v_prod - SIGMA2_COHORT).abs() > 1e-9,
+            "the M-step did not run: sigma2 is still the emission value \
+             {SIGMA2_COHORT}."
+        );
+
+        // Neither engineering clamp may bind here, or this fixture stops
+        // exercising the closed form and the comparison below stops meaning
+        // what it says.
+        assert!(
+            v_prod > FLOOR * 10.0,
+            "sigma2 = {v_prod} is near INSTRUMENTAL_PAL_NOISE_FLOOR ({FLOOR}); the \
+             floor is clamping and this fixture no longer tests the closed form."
+        );
+
+        // Numeric argmax: golden-section on mu, with v optimised inside.
+        let q = |mu: f64, v: f64| {
+            nig_joint_logpost(
+                mu,
+                v,
+                w,
+                s1,
+                s2,
+                MU_COHORT,
+                KAPPA_0,
+                NU_0,
+                BETA_0,
+                SIGMA2_COHORT,
+            )
+        };
+        let best_v_for = |mu: f64| golden_max(|v| q(mu, v), 1e-9, 1e2, 300);
+        let mu_star = golden_max(
+            |mu| {
+                let v = best_v_for(mu);
+                q(mu, v)
+            },
+            ys.iter().cloned().fold(f64::INFINITY, f64::min) - 1.0,
+            ys.iter()
+                .cloned()
+                .fold(f64::NEG_INFINITY, f64::max)
+                .max(MU_COHORT)
+                + 1.0,
+            300,
+        );
+        let v_star = best_v_for(mu_star);
+
+        let q_prod = q(mu_prod, v_prod);
+        let q_best = q(mu_star, v_star);
+        assert!(
+            q_prod >= q_best - 1e-12,
+            "the production M-step is not at the joint-MAP optimum.\n  \
+             production (mu, sigma2) = ({mu_prod:.17}, {v_prod:.17})\n  \
+             numeric argmax (mu, sigma2) = ({mu_star:.17}, {v_star:.17})\n  \
+             Q(production) = {q_prod:.17}\n  Q(argmax)      = {q_best:.17}\n  \
+             deficit = {:.3e}  (production must not be worse than the argmax).\n\
+             Spec: crates/telescope-core/MSTEP-PRIOR-SPEC-v1.0.md",
+            q_prod - q_best
+        );
+
+        let _ = std::fs::remove_file(&emission);
+        let _ = std::fs::remove_file(&profile);
+    }
+
     #[test]
     fn test_poly_a_length_round_trip() {
         // log2(120) ≈ 6.9069, exp2 = 120
