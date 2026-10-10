@@ -786,8 +786,16 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
                     let s1 = accum_w_y[i];
                     let s2 = accum_w_y2[i];
                     let sq_dev_new = (s2 - 2.0 * p.mu * s1 + p.mu * p.mu * w_sum).max(0.0);
-                    p.sigma2 =
-                        (sq_dev_new + 2.0 * beta_0 * p.sigma2_cohort) / (w_sum + 2.0 * nu_0 + 3.0);
+                    // The joint MAP's NUMERATOR carries the conditional mean
+                    // prior's deviation term, kappa_0 * (mu - mu_cohort)^2, with
+                    // kappa_0 = tau_0. It was missing: the denominator was already
+                    // correct (its `+3` is the `-0.5 ln v` of the mu|v prior's
+                    // normaliser plus the InvGamma shape), but the matching
+                    // numerator term was not written. Spec and full derivation:
+                    // crates/telescope-core/MSTEP-PRIOR-SPEC-v1.0.md
+                    let sq_dev_prior = tau_0 * (p.mu - p.mu_cohort).powi(2);
+                    p.sigma2 = (sq_dev_new + sq_dev_prior + 2.0 * beta_0 * p.sigma2_cohort)
+                        / (w_sum + 2.0 * nu_0 + 3.0);
                     p.sigma2 = p.sigma2.max(INSTRUMENTAL_PAL_NOISE_FLOOR);
                 }
 
