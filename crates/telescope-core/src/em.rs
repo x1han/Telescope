@@ -4123,6 +4123,61 @@ mod tests {
         let _ = std::fs::remove_file(&sidecar);
     }
 
+    /// THE SIDECAR IS NOT A RE-LOADABLE MODEL — AND THE CLI HELP USED TO SAY IT
+    /// WAS, which is how a reader would have gone looking for a round trip that
+    /// does not exist.
+    ///
+    /// The gap is one column. The writer emits five of the six columns
+    /// `load_emission_parameters` requires (`transcript_id`, `gene_id`,
+    /// `is_polyA_competent`, `mu_logPAL`, `sigma2_logPAL`) plus its own audit
+    /// columns, but never `n_cohort_flnc`. The loader reads that column as
+    /// REQUIRED on purpose — the comment above the read says so, so that a
+    /// hand-built model cannot silently classify every row as anchored — which
+    /// means the round trip dies there instead of producing a plausible number.
+    ///
+    /// This test asserts the FAILURE, which is an odd thing to pin and is the
+    /// whole point: the defect was a *docstring* claiming a capability, and a
+    /// docstring cannot be made to go red. If someone ever adds `n_cohort_flnc`
+    /// to the sidecar this test goes red, and the message tells them that the
+    /// help text AND the prior-reanchoring hazard have to be re-decided
+    /// together — because a successful load would silently re-anchor both
+    /// shrinkage priors to the already-fitted values and apply τ₀ and 2β₀ a
+    /// second time.
+    #[test]
+    fn test_the_sidecar_cannot_be_reloaded_as_an_emission_model() {
+        let sidecar = scratch("reload_probe_sidecar.parquet");
+        let rows_in: Vec<Option<TranscriptParam>> = vec![Some(TranscriptParam {
+            transcript_id: "tA".into(),
+            gene_id: "gA".into(),
+            is_competent: true,
+            mu_cohort: 7.0,
+            mu: 6.5,
+            sigma2_cohort: 0.5,
+            sigma2: 0.25,
+            alpha: 0.25,
+            em_accum_weight: 0.5,
+            em_finalized: true,
+            is_imputed: false,
+        })];
+
+        write_emission_params_parquet(&rows_in, &sidecar).expect("writer must succeed");
+
+        let err = load_emission_parameters(&sidecar).err().expect(
+            "loading a sidecar as an emission model must FAIL. If this now \
+                 succeeds, `n_cohort_flnc` reached the sidecar: the CLI help text \
+                 at `--dump-emission-params` and the prior-reanchoring hazard it \
+                 describes both have to be re-decided before this is turned back on.",
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("n_cohort_flnc"),
+            "the round trip must die on the REQUIRED `n_cohort_flnc` column, so the \
+             help text names the right reason; got: {msg}"
+        );
+
+        let _ = std::fs::remove_file(&sidecar);
+    }
+
     /// WEAK BY CONSTRUCTION, and labelled so. `alpha` is DEFINED as W divided
     /// by the total molecule count, so this identity holds for ANY
     /// proportionally-wrong W — including W scaled by 1/1000. It is a

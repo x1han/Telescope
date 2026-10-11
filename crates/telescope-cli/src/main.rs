@@ -425,18 +425,30 @@ enum Cmd {
         /// run the M-step has moved μ and the loaded value is wrong, whether or
         /// not the run converged.
         ///
-        /// The file is loader-compatible with `--emission` (`transcript_id`,
-        /// `gene_id`, `is_polyA_competent`, `mu_logPAL`, `sigma2_logPAL`), so a
-        /// converged fit can be fed back in to measure the converged state
-        /// without re-deriving it. `mu_cohort` is carried as its own column so
-        /// the shrinkage prior stays auditable: re-loading this file re-anchors
-        /// BOTH priors to the fitted values (`load_emission_parameters` sets
-        /// `mu_cohort = mu_logPAL` and `sigma2_cohort = sigma2_logPAL`), so a
-        /// second pass applies τ₀=2 and 2β₀ a second time. Compare those columns
-        /// before trusting a re-loaded fit.
+        /// This is a DIAGNOSTIC / AUDIT SNAPSHOT. It is NOT a re-loadable
+        /// model, and the previous version of this help text said it was --
+        /// wrongly. Do not pass it back as `--emission`.
         ///
-        /// This is a DIAGNOSTIC sidecar. The published profile and
-        /// read-assignments schemas are unchanged.
+        /// Why it cannot be re-loaded: the writer emits five of the six columns
+        /// `load_emission_parameters` requires (`transcript_id`, `gene_id`,
+        /// `is_polyA_competent`, `mu_logPAL`, `sigma2_logPAL`) plus its own
+        /// audit columns, but it does NOT emit `n_cohort_flnc`. The loader reads
+        /// that column as REQUIRED (`.context("Missing 'n_cohort_flnc'")?`, on
+        /// purpose, so a hand-built model cannot silently classify every row as
+        /// anchored), so the round trip dies there rather than producing a
+        /// number. Pinned by
+        /// `test_the_sidecar_cannot_be_reloaded_as_an_emission_model`, which
+        /// fails if `n_cohort_flnc` is ever added -- at which point this text
+        /// and the prior-reanchoring hazard below have to be re-decided.
+        ///
+        /// And re-loading would be wrong even if it parsed. `load_emission_
+        /// parameters` sets `mu_cohort = mu_logPAL` and `sigma2_cohort =
+        /// sigma2_logPAL`, so a second pass would re-anchor BOTH shrinkage
+        /// priors to the already-fitted values and apply τ₀ and 2β₀ a second
+        /// time. The columns are present so an analyst can SEE that; do not
+        /// feed them back in.
+        ///
+        /// The published profile and read-assignments schemas are unchanged.
         #[arg(long)]
         dump_emission_params: Option<PathBuf>,
     },
