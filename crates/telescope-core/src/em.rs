@@ -68,6 +68,28 @@ pub struct TranscriptParam {
     pub sigma2: f64,
     /// Mixing proportion π_k (initialized at iter 0, updated each M-step).
     pub alpha: f64,
+    /// The M-step's W for this transcript: the E-step weight sum the M-step
+    /// consumed, PRE-truncation and PRE-renormalisation.
+    ///
+    /// W is the sum of the posterior weights the E-step assigned to this
+    /// transcript over every molecule that has it as a candidate — exactly 1.0
+    /// for an unambiguous read whose single candidate is present, and the read's
+    /// posterior where it is contested. It is the numerator `alpha` is divided
+    /// by the total molecule count to form, so `alpha` alone cannot recover it:
+    /// the divisor is not recorded in either parquet, and the weight the profile
+    /// parquet stores per read is the POSTERIOR, not W.
+    ///
+    /// That distinction has a body count. On 2026-10-11 an analysis summed the
+    /// profile parquet's per-read weight column, mistook the sum for W, and
+    /// published a median of 1.36 against a true 16.27 (11.9x low) — a join
+    /// across three parquet files plus a ghost count would have avoided it, and
+    /// writing W here avoids it entirely. The two quantities are unrelated by
+    /// anything but a name.
+    ///
+    /// It is 0.0 until the first M-step completes, and it is the LAST E-step's
+    /// W that a reader sees, for the same snapshot-lag reason `mu` is: the
+    /// sidecar is fed from `last_estep_params`, not from the live `params`.
+    pub accum_w: f64,
     /// TRUE when this row was IMPUTED to reach the reference universe, i.e.
     /// `n_cohort_flnc == 0` in the emission parquet. It carries the cohort
     /// fit rather than a fit of its own, so every imputed row of one build
@@ -167,7 +189,8 @@ pub fn load_emission_parameters<P: AsRef<Path>>(
                     mu,
                     sigma2_cohort,
                     sigma2: sigma2_cohort,
-                    alpha: 0.0, // initialized in solve_and_write_profile
+                    alpha: 0.0,   // initialized in solve_and_write_profile
+                    accum_w: 0.0, // set by the first M-step; see the field doc
                     is_imputed: nobs_col.value(i) == 0,
                 },
             );
@@ -797,6 +820,19 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         for i in 0..num_transcripts {
             if let Some(ref mut p) = params[i] {
                 let w_sum = accum_w[i];
+
+                // STEP 0: record W itself, OUTSIDE the poly(A) guard below and
+                // beside STEP 3, for the same reason STEP 3 is outside it: at
+                // `poly_a_weight == 0` W is still what `alpha` is built from,
+                // and a W column that empties itself on the "none" arm would
+                // make the sidecar silently unreadable on exactly the
+                // configuration that most needs inspecting.
+                //
+                // This is `p.accum_w`, NOT the `accum_w` local above — the
+                // field carries the SUM out of the loop, the local is read-only
+                // here. Same name, different scopes; the compiler would catch a
+                // mix-up, the reader should not have to.
+                p.accum_w = w_sum;
 
                 if poly_a_weight > 0.0 {
                     // STEP 1: μ update — weak empirical Bayes shrinkage (τ₀=2).
@@ -2214,6 +2250,30 @@ pub fn write_read_assignments_parquet(
 /// - `alpha` — the mixture weight the last E-step used.
 /// - `state` — which iterate this row holds, `e_step_final`. A file that cannot
 ///   say which state it carries cannot be checked against the defect.
+///
+/// Three columns were added on 2026-10-11, in this order:
+///
+/// - `accum_w` — the M-step's W, the E-step weight sum it consumed. Before
+///   this, W existed only as a local, and recovering it downstream meant a
+///   join across three parquet files plus a ghost count. On 2026-10-11 an
+///   analysis took the profile parquet's per-read weight column for W and
+///   published a median 11.9x low; the column removes the reconstruction and
+///   with it the confusion.
+/// - `mu_fitted`, `sigma2_fitted` — ALIASES of `mu_logPAL` / `sigma2_logPAL`,
+///   same values, same iteration. Pure duplication, kept deliberately: the
+///   first five columns are frozen because `load_emission_parameters` reads
+///   exactly those names, so a reader who wants "the fitted value" has to
+///   adopt the emission schema's name for it, and the two names mean different
+///   things elsewhere in the pipeline (`mu_cohort` here is the shrinkage prior;
+///   `sigma2_cohort` the emission fit). The aliases are appended, so existing
+///   readers that select by name keep working unchanged.
+///
+/// NOTE for anyone writing a new consumer: `accum_w` and `alpha` come from the
+/// SAME M-step — both are snapshotted together into `last_estep_params` before
+/// the M-step rewrites them — but that requires at least one M-step to have
+/// run. `max_iter = 1` and an all-unambiguous BAM (`n_ambig == 0`, which breaks
+/// at iteration 0) both write `sum(alpha) == 1` with `sum(accum_w) == 0`, the
+/// Laplace initialisation.
 pub fn write_emission_params_parquet(
     params: &[Option<TranscriptParam>],
     path: &std::path::Path,
@@ -2230,6 +2290,9 @@ pub fn write_emission_params_parquet(
     let mut cohort_b = Float64Builder::new();
     let mut alpha_b = Float64Builder::new();
     let mut state_b = StringBuilder::new();
+    let mut accum_w_b = Float64Builder::new();
+    let mut mu_fit_b = Float64Builder::new();
+    let mut s2_fit_b = Float64Builder::new();
 
     // A transcript with NO emission row is `None` and gets NO row here, exactly
     // as in the emission parquet. Writing a placeholder `mu` would invent a
@@ -2243,6 +2306,9 @@ pub fn write_emission_params_parquet(
         cohort_b.append_value(p.mu_cohort);
         alpha_b.append_value(p.alpha);
         state_b.append_value("e_step_final");
+        accum_w_b.append_value(p.accum_w);
+        mu_fit_b.append_value(p.mu);
+        s2_fit_b.append_value(p.sigma2);
     }
 
     let schema = Arc::new(Schema::new(vec![
@@ -2254,6 +2320,9 @@ pub fn write_emission_params_parquet(
         Field::new("mu_cohort", DataType::Float64, false),
         Field::new("alpha", DataType::Float64, false),
         Field::new("state", DataType::Utf8, false),
+        Field::new("accum_w", DataType::Float64, false),
+        Field::new("mu_fitted", DataType::Float64, false),
+        Field::new("sigma2_fitted", DataType::Float64, false),
     ]));
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -2266,6 +2335,9 @@ pub fn write_emission_params_parquet(
             Arc::new(cohort_b.finish()),
             Arc::new(alpha_b.finish()),
             Arc::new(state_b.finish()),
+            Arc::new(accum_w_b.finish()),
+            Arc::new(mu_fit_b.finish()),
+            Arc::new(s2_fit_b.finish()),
         ],
     )
     .context("Failed to build emission-params RecordBatch")?;
@@ -3093,6 +3165,18 @@ mod tests {
              abundance prior, not a poly(A) term"
         );
 
+        // The same argument applies to W, the quantity alpha is built from, and
+        // this arm is the ONLY place it can be seen. Every sidecar test runs at
+        // `poly_a_weight > 0`, where the guard is unconditionally true, so a W
+        // write moved inside that guard would pass all of them and leave the
+        // `none` arm reporting a W of 0 next to a live alpha.
+        let accum_w_off = params_off[0].as_ref().unwrap().accum_w;
+        assert!(
+            accum_w_off > 0.0,
+            "W must still accumulate at poly_a_weight = 0: it is the weight sum \
+             alpha is divided by, and it is NOT a poly(A) term. Got {accum_w_off}."
+        );
+
         let _ = std::fs::remove_file(&emission);
         let _ = std::fs::remove_file(&profile);
     }
@@ -3372,6 +3456,483 @@ mod tests {
         let _ = std::fs::remove_file(&profile);
     }
 
+    /// Re-read a sidecar written by `write_emission_params_parquet`: the
+    /// column NAMES in file order, plus one entry per emitted row holding the
+    /// transcript id and every OTHER column's value looked up BY NAME.
+    ///
+    /// A column that is absent, or present but not Float64, reports `None` for
+    /// every row rather than panicking. That is deliberate: the point of a
+    /// schema assertion is that the schema is wrong, and a helper that panicked
+    /// on the missing column would report it as a panic instead of a failure
+    /// naming the column.
+    #[allow(clippy::type_complexity)]
+    fn read_sidecar(path: &Path) -> (Vec<String>, Vec<(String, Vec<(String, Option<f64>)>)>) {
+        let file = File::open(path).expect("sidecar file must exist");
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .expect("sidecar must be readable as parquet")
+            .with_batch_size(8192)
+            .build()
+            .expect("sidecar reader must build");
+
+        let mut names: Vec<String> = Vec::new();
+        let mut rows: Vec<(String, Vec<(String, Option<f64>)>)> = Vec::new();
+        for batch in reader {
+            let batch = batch.expect("sidecar batch must read");
+            if names.is_empty() {
+                names = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect();
+            }
+            let tr = batch
+                .column_by_name("transcript_id")
+                .expect("sidecar must carry transcript_id")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("transcript_id must be Utf8");
+            for i in 0..batch.num_rows() {
+                let mut cells = Vec::new();
+                for (idx, field) in batch.schema().fields().iter().enumerate() {
+                    if field.name() == "transcript_id" {
+                        continue;
+                    }
+                    let v = batch
+                        .column(idx)
+                        .as_any()
+                        .downcast_ref::<Float64Array>()
+                        .map(|a| a.value(i));
+                    cells.push((field.name().clone(), v));
+                }
+                rows.push((tr.value(i).to_string(), cells));
+            }
+        }
+        (names, rows)
+    }
+
+    /// One Float64 cell of a `read_sidecar` row, by column name.
+    fn sidecar_cell(row: &(String, Vec<(String, Option<f64>)>), col: &str) -> Option<f64> {
+        row.1.iter().find(|(n, _)| n == col).and_then(|(_, v)| *v)
+    }
+
+    /// THE `accum_w` COLUMN IS THE M-STEP'S W, IN MOLECULES, NOT A SHARE.
+    ///
+    /// WHY THE FIXTURE HAS A SECOND MOLECULE. The obvious fixture is the
+    /// symmetric single-molecule one the closed-form M-step test already uses,
+    /// and it is VACUOUS here: with one molecule in the graph, `alpha` is W
+    /// divided by 1, so W and the written alpha are the same float and a
+    /// column carrying the share instead of the sum cannot be told apart from
+    /// one carrying the sum. Two molecules make the two columns differ by
+    /// exactly the factor under test — alpha 0.25 against W 0.5 — which is
+    /// what makes the assertion below able to fail.
+    ///
+    /// WHY W IS EXACTLY 0.5, derivable rather than asserted:
+    ///
+    ///   molecule r0 has two candidates, both present in the emission parquet,
+    ///   with identical (mu_cohort, sigma2_cohort), identical alignment
+    ///   evidence and identical 5' gaps. The Laplace init (eps = 0.01) gives
+    ///   each of them 0.01 + 1/2 = 0.51 and the solo transcript 0.01 + 1, so
+    ///   `alpha` comes out identical for the pair; equal alpha, equal mu,
+    ///   equal sigma2 and equal every other term make the two log-likelihoods
+    ///   bit-identical, hence `log_z = ll + ln 2` and each posterior
+    ///   `exp(ll - log_z) = exp(-ln 2)`, which is 0.5 exactly in f64 (the
+    ///   rounding of ln 2 is 2.3e-17 below the true value, a third of the
+    ///   1.11e-16 spacing at 0.5, so the exponential rounds back to 0.5).
+    ///
+    ///   W for each of the pair is therefore 0.5, and for the solo molecule it
+    ///   is 1.0 (an unambiguous read contributes exactly its weight of 1).
+    ///
+    /// `max_iter = 2` for the same reason the closed-form test uses it: the
+    /// sidecar is fed from the pre-M-step snapshot, so the run must complete an
+    /// M-step for W to exist at all, and two iterations is the least that does.
+    #[test]
+    fn test_sidecar_accum_w_is_the_m_step_weight_sum_in_molecules() {
+        const TOL: f64 = 1e-12;
+        const EXPECTED_W: f64 = 0.5;
+        // `alpha` = W / n_total_molecules with n_total_molecules = 2. Asserted
+        // so that a column carrying the share instead of the sum cannot pass
+        // the W assertion: it would report 0.25 where 0.5 is required.
+        const EXPECTED_ALPHA: f64 = 0.25;
+
+        let emission = scratch("accum_w_emission.parquet");
+        let profile = scratch("accum_w_profile.parquet");
+        let sidecar = scratch("accum_w_sidecar.parquet");
+
+        let graph = multi_molecule_graph(
+            (100.0_f32).log2(),
+            &[
+                vec![("tx0", 1000, 0), ("tx1", 1000, 0)],
+                vec![("solo", 1000, 0)],
+            ],
+        );
+        multi_molecule_emission(&emission, &["r0_tx0", "r0_tx1", "r1_solo"]);
+
+        let mut params = Vec::new();
+        solve_and_write_profile(
+            graph,
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            2, // max_iter -- see the note above; do NOT lower to 1.
+            20.0,
+            FIVE_PRIME_OFF,
+            POLY_A_ON,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
+            None,
+            Some(&mut params),
+            None,
+        )
+        .unwrap();
+
+        write_emission_params_parquet(&params, &sidecar).expect("sidecar must write");
+        let (_, rows) = read_sidecar(&sidecar);
+        assert_eq!(rows.len(), 3, "every emitted transcript gets a row");
+
+        for tx in ["r0_tx0", "r0_tx1"] {
+            let row = rows
+                .iter()
+                .find(|(id, _)| id == tx)
+                .unwrap_or_else(|| panic!("{tx} must have a sidecar row"));
+            let w = sidecar_cell(row, "accum_w")
+                .unwrap_or_else(|| panic!("{tx}: sidecar must carry an accum_w column"));
+            let alpha = sidecar_cell(row, "alpha").unwrap();
+
+            // The headline assertion comes FIRST so that a column carrying the
+            // abundance share fails on the value itself rather than on the
+            // guard below explaining why the value would have been vacuous.
+            assert!(
+                (w - EXPECTED_W).abs() < TOL,
+                "{tx}: accum_w REGRESSION: got {w:.17}, expected {EXPECTED_W}. \
+                 accum_w is the E-step weight sum the M-step consumed, in \
+                 MOLECULE weight units -- not alpha, not the per-read posterior \
+                 the profile parquet stores. Derivation is on this test."
+            );
+            // VACUITY GUARD: W and alpha must be distinguishable numbers on this
+            // fixture, or the assertion above is satisfied by the share as well.
+            assert!(
+                (w - alpha).abs() > 1e-6,
+                "{tx}: accum_w ({w}) and alpha ({alpha}) are the same number, so \
+                 this fixture cannot tell W from the abundance share and the \
+                 assertion above proved nothing"
+            );
+            assert!(
+                (alpha - EXPECTED_ALPHA).abs() < TOL,
+                "{tx}: alpha REGRESSION: got {alpha}, expected {EXPECTED_ALPHA} \
+                 (W 0.5 over 2 molecules). If this fails the fixture no longer \
+                 separates W from the share."
+            );
+        }
+
+        let solo = rows
+            .iter()
+            .find(|(id, _)| id == "r1_solo")
+            .expect("the unambiguous transcript must have a row");
+        assert!(
+            (sidecar_cell(solo, "accum_w").unwrap() - 1.0).abs() < TOL,
+            "an unambiguous read whose only candidate is present contributes \
+             exactly 1.0 to W; got {:?}",
+            sidecar_cell(solo, "accum_w")
+        );
+
+        let _ = std::fs::remove_file(&emission);
+        let _ = std::fs::remove_file(&profile);
+        let _ = std::fs::remove_file(&sidecar);
+    }
+
+    /// THE WRITER EMITS THE NEW COLUMNS, AND DROPS NOTHING ELSE.
+    ///
+    /// `write_emission_params_parquet` had no test at all before this: the
+    /// three new columns are appended rather than inserted so existing
+    /// name-selecting readers keep working, the `None`-row omission is a
+    /// documented contract of this function and not of the solver, and both are
+    /// properties of the WRITER that no end-to-end solve can distinguish from
+    /// the solver's own behaviour. Driven directly with a hand-built vector so
+    /// the expected numbers are the ones written, not re-derived by the code
+    /// under test.
+    #[test]
+    fn test_write_emission_params_parquet_emits_new_columns_and_omits_none_rows() {
+        let sidecar = scratch("writer_sidecar.parquet");
+        let rows_in: Vec<Option<TranscriptParam>> = vec![
+            Some(TranscriptParam {
+                transcript_id: "tA".into(),
+                gene_id: "gA".into(),
+                is_competent: true,
+                mu_cohort: 7.0,
+                mu: 6.5,
+                sigma2_cohort: 0.5,
+                sigma2: 0.25,
+                alpha: 0.25,
+                accum_w: 0.5,
+                is_imputed: false,
+            }),
+            // A transcript with no emission row. It must produce NO row here:
+            // writing a placeholder would invent a parameter for a transcript
+            // the model never scored.
+            None,
+            Some(TranscriptParam {
+                transcript_id: "tB".into(),
+                gene_id: "gB".into(),
+                is_competent: false,
+                mu_cohort: 7.0,
+                mu: 7.25,
+                sigma2_cohort: 0.5,
+                sigma2: 0.125,
+                alpha: 0.75,
+                accum_w: 1.5,
+                is_imputed: true,
+            }),
+        ];
+
+        write_emission_params_parquet(&rows_in, &sidecar).expect("writer must succeed");
+        let (names, rows) = read_sidecar(&sidecar);
+
+        for col in ["accum_w", "mu_fitted", "sigma2_fitted"] {
+            assert!(
+                names.iter().any(|n| n == col),
+                "the sidecar must carry a `{col}` column; it has {names:?}"
+            );
+        }
+        // Back-compat: the five columns `load_emission_parameters` reads, and
+        // the two diagnostic columns already in the file, are still there.
+        for col in [
+            "transcript_id",
+            "gene_id",
+            "is_polyA_competent",
+            "mu_logPAL",
+            "sigma2_logPAL",
+            "mu_cohort",
+            "alpha",
+            "state",
+        ] {
+            assert!(
+                names.iter().any(|n| n == col),
+                "the sidecar must keep its pre-existing `{col}` column; it has \
+                 {names:?}"
+            );
+        }
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "the `None` transcript must get NO row: a row for it would invent a \
+             parameter the model never scored. Read back: {:?}",
+            rows.iter().map(|(id, _)| id).collect::<Vec<_>>()
+        );
+
+        // Written values, checked by column name against the literal above. The
+        // three numbers are pairwise distinct on purpose: a writer that
+        // mis-ordered its builders, or aliased the wrong field, cannot pass.
+        for (tx, accum_w, alpha, mu, sigma2) in
+            [("tA", 0.5, 0.25, 6.5, 0.25), ("tB", 1.5, 0.75, 7.25, 0.125)]
+        {
+            let row = rows
+                .iter()
+                .find(|(id, _)| id == tx)
+                .unwrap_or_else(|| panic!("{tx} must have a row"));
+            for (col, want) in [
+                ("accum_w", accum_w),
+                ("alpha", alpha),
+                ("mu_fitted", mu),
+                ("sigma2_fitted", sigma2),
+                // The frozen first five: `mu_fitted` is an ALIAS, not a
+                // replacement, so both names must carry the same fit.
+                ("mu_logPAL", mu),
+                ("sigma2_logPAL", sigma2),
+            ] {
+                assert_eq!(
+                    sidecar_cell(row, col),
+                    Some(want),
+                    "{tx}: column `{col}` must carry the value written"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_file(&sidecar);
+    }
+
+    /// WEAK BY CONSTRUCTION, and labelled so. `alpha` is DEFINED as W divided
+    /// by the total molecule count, so this identity holds for ANY
+    /// proportionally-wrong W — including W scaled by 1/1000. It is a
+    /// consistency check between two columns, NOT a proof that either carries
+    /// the right value; `test_sidecar_accum_w_is_the_m_step_weight_sum_in_molecules`
+    /// is the test that pins the value.
+    ///
+    /// What this one does add is the reading every downstream consumer will
+    /// actually perform — and one thing the value test structurally cannot
+    /// see: it is written down against a fixture with MORE THAN ONE ambiguous
+    /// molecule, so `alpha` and W are not both derived from a single read, and
+    /// a future change that writes one column from a different iteration than
+    /// the other breaks it even when both columns are individually well-formed.
+    ///
+    /// It cannot catch W landing inside the poly(A) guard: this fixture runs
+    /// with the weight ON, where that guard is unconditionally true. That is
+    /// the `poly_a_weight = 0` arm of
+    /// `test_poly_a_weight_zero_freezes_mu_and_sigma2_but_still_updates_alpha`,
+    /// and the only place it can be seen.
+    ///
+    /// `max_iter` must be >= 2 for the same snapshot-lag reason throughout: with
+    /// one iteration the file carries the Laplace initialisation (alpha summing
+    /// to 1, W summing to 0) and this identity is not merely weak but FALSE.
+    #[test]
+    fn test_sidecar_accum_w_is_consistent_with_alpha_times_the_molecule_count() {
+        const TOL: f64 = 1e-12;
+
+        let emission = scratch("accum_w_identity_emission.parquet");
+        let profile = scratch("accum_w_identity_profile.parquet");
+        let sidecar = scratch("accum_w_identity_sidecar.parquet");
+
+        let graph = multi_molecule_graph(
+            (100.0_f32).log2(),
+            &[
+                vec![("tx0", 1000, 0), ("tx1", 1000, 0)],
+                vec![("solo", 1000, 0)],
+                vec![("a", 1000, 0), ("b", 1000, 0)],
+            ],
+        );
+        multi_molecule_emission(&emission, &["r0_tx0", "r0_tx1", "r1_solo", "r2_a", "r2_b"]);
+
+        let mut params = Vec::new();
+        solve_and_write_profile(
+            graph,
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            2, // max_iter -- >= 2 so an M-step has run; see the note above.
+            20.0,
+            FIVE_PRIME_OFF,
+            POLY_A_ON,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
+            None,
+            Some(&mut params),
+            None,
+        )
+        .unwrap();
+        write_emission_params_parquet(&params, &sidecar).expect("sidecar must write");
+
+        let (_, rows) = read_sidecar(&sidecar);
+        let sum_w: f64 = rows
+            .iter()
+            .map(|r| sidecar_cell(r, "accum_w").unwrap())
+            .sum();
+        let sum_alpha: f64 = rows.iter().map(|r| sidecar_cell(r, "alpha").unwrap()).sum();
+        // `n_total_molecules` is every row of the input graph, candidates and
+        // all: 3 molecules here, and the graph's own count is not recoverable
+        // from the sidecar -- which is half of why W is worth writing down.
+        let n_total_molecules = 3.0_f64;
+
+        assert!(
+            (sum_w - n_total_molecules * sum_alpha).abs() < TOL,
+            "sum(accum_w) = {sum_w} but n_total_molecules * sum(alpha) = {}; \
+             the two columns come from the same M-step and must agree",
+            n_total_molecules * sum_alpha
+        );
+        // ... and the sides must be non-degenerate, or the assertion above is
+        // satisfied by a file whose W never ran.
+        assert!(
+            sum_w > 1.0 && (sum_alpha - 1.0).abs() < TOL,
+            "non-degenerate guard: sum(accum_w) = {sum_w}, sum(alpha) = {sum_alpha}"
+        );
+
+        let _ = std::fs::remove_file(&emission);
+        let _ = std::fs::remove_file(&profile);
+        let _ = std::fs::remove_file(&sidecar);
+    }
+
+    /// CONSERVATION, WHICH THE IDENTITY ABOLE STRUCTURALLY CANNOT SEE.
+    ///
+    /// A molecule all of whose candidates are missing from the emission
+    /// parquet contributes NOTHING to W -- it has no parameter to be scored
+    /// against -- while still counting in `n_total_molecules`. So `sum(alpha)`
+    /// falls below 1 and `sum(accum_w)` falls below the molecule count, and
+    /// neither quantity is wrong. This is the same caveat the alpha
+    /// normalisation test records in prose; it is asserted here because the
+    /// conservation is now visible in a FILE, and a reader of that file will
+    /// check it.
+    ///
+    /// The magnitude on real HC2 data is `sum(alpha) = 0.859201`, i.e. 14.08%
+    /// of molecule weight invisible to W. That number is a COMMENT and not an
+    /// assertion: HC2 is not in this repository, so there is nothing to assert
+    /// it against, and a fixture scaled to look like it would be a number
+    /// nobody computed.
+    #[test]
+    fn test_sidecar_accum_w_drops_molecules_whose_candidates_are_all_missing() {
+        let emission = scratch("accum_w_gap_emission.parquet");
+        let profile = scratch("accum_w_gap_profile.parquet");
+        let sidecar = scratch("accum_w_gap_sidecar.parquet");
+
+        // r0 is contested and both its candidates are present, so the loop
+        // runs an M-step and the sidecar carries a real W. r1's only candidate
+        // is absent from the emission parquet: the molecule is counted, scored
+        // against nothing, and its weight vanishes.
+        let graph = multi_molecule_graph(
+            10.0,
+            &[
+                vec![("a", 1000, 0), ("b", 1000, 0)],
+                vec![("gone", 1000, 0)],
+            ],
+        );
+        multi_molecule_emission(&emission, &["r0_a", "r0_b"]);
+
+        let mut params = Vec::new();
+        solve_and_write_profile(
+            graph,
+            &emission,
+            "TEST",
+            &profile,
+            1e-6,
+            2,
+            20.0,
+            FIVE_PRIME_OFF,
+            POLY_A_ON,
+            FIVE_PRIME_WINDOW,
+            PRUNE_MAX_DELTA_AS,
+            MIN_WEIGHT,
+            None,
+            Some(&mut params),
+            None,
+        )
+        .unwrap();
+        write_emission_params_parquet(&params, &sidecar).expect("sidecar must write");
+
+        let (_, rows) = read_sidecar(&sidecar);
+        let sum_w: f64 = rows
+            .iter()
+            .map(|r| sidecar_cell(r, "accum_w").unwrap())
+            .sum();
+        let sum_alpha: f64 = rows.iter().map(|r| sidecar_cell(r, "alpha").unwrap()).sum();
+        let n_total_molecules = 2.0_f64;
+
+        assert!(
+            sum_w < n_total_molecules,
+            "a molecule whose every candidate is missing from the emission \
+             parquet contributes 0 to W while still counting in \
+             n_total_molecules, so sum(accum_w) ({sum_w}) MUST fall short of {n_total_molecules}"
+        );
+        assert!(
+            (sum_w - 1.0).abs() < 1e-12 && sum_alpha < 1.0,
+            "exactly r0's weight survives: sum(accum_w) = {sum_w}, \
+             sum(alpha) = {sum_alpha}"
+        );
+        // The molecule is not silently dropped from the count; it is dropped
+        // from the WEIGHT. Were it dropped from both, this file would look
+        // normal to a reader comparing against the BAM.
+        assert!(
+            n_total_molecules > sum_w,
+            "the missing-candidate molecule still counts as a molecule"
+        );
+
+        let _ = std::fs::remove_file(&emission);
+        let _ = std::fs::remove_file(&profile);
+        let _ = std::fs::remove_file(&sidecar);
+    }
+
     /// `solve_and_write_profile` is public, so the CLI's `poly_a_weight = 0`
     /// interlock is not enough: a library caller can pair a placeholder graph
     /// with a positive weight, which feeds a constant emission into the E-step
@@ -3522,6 +4083,7 @@ mod tests {
                     sigma2_cohort: 0.04,
                     sigma2: 0.04,
                     alpha,
+                    accum_w: 0.0,      // fixture never runs an M-step
                     is_imputed: false, // test fixture: every row is anchored
                 })
             })
@@ -6957,6 +7519,7 @@ mod tests {
                     sigma2_cohort: sigma2,
                     sigma2,
                     alpha: 0.5,
+                    accum_w: 0.5,      // fixture never runs an M-step
                     is_imputed: false, // test fixture: every row is anchored
                 })
             })
