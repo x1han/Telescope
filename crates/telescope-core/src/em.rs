@@ -86,10 +86,33 @@ pub struct TranscriptParam {
     /// writing W here avoids it entirely. The two quantities are unrelated by
     /// anything but a name.
     ///
-    /// It is 0.0 until the first M-step completes, and it is the LAST E-step's
-    /// W that a reader sees, for the same snapshot-lag reason `mu` is: the
-    /// sidecar is fed from `last_estep_params`, not from the live `params`.
-    pub accum_w: f64,
+    /// It is stamped after the EM loop from the FINAL E-step's weights, not from
+    /// the M-step's own assignment: the sidecar is fed from
+    /// `last_estep_params`, whose snapshot is taken before the M-step, so the
+    /// M-step's value is one iteration behind the weights the profile parquet
+    /// was written from. It is 0.0 only when the loop never ran an E-step.
+    pub em_accum_weight: f64,
+    /// TRUE when at least one M-step completed, so `alpha`, `mu` and `sigma2`
+    /// in this row are an M-step's output rather than the Laplace
+    /// initialisation.
+    ///
+    /// It exists because the two exits leave different states. Convergence
+    /// breaks BEFORE the M-step (:770, reached from the check at :766), so a
+    /// run that converges on its first iteration exports `sum(alpha) == 1`
+    /// with `mu == mu_cohort` and `sigma2 == sigma2_cohort` — the
+    /// initialisation, not a fit. Reading those rows as fitted parameters is
+    /// the mistake this column prevents. `max_iter` exhaustion runs the
+    /// M-step last, so it finalises; `max_iter == 1` also finalises, which is
+    /// why this is not derived from `n_em_iter` (see the flag's declaration).
+    ///
+    /// `em_accum_weight` is NOT gated on it. W describes the weights the
+    /// profile was built from, and those exist on the converge-immediately
+    /// path too; `alpha` and `em_accum_weight` therefore disagree exactly when
+    /// this flag is FALSE, which is the intended signal rather than a defect.
+    ///
+    /// Per-row but constant within a file: it describes the run, and parquet
+    /// has nowhere else to put a run-level fact.
+    pub em_finalized: bool,
     /// TRUE when this row was IMPUTED to reach the reference universe, i.e.
     /// `n_cohort_flnc == 0` in the emission parquet. It carries the cohort
     /// fit rather than a fit of its own, so every imputed row of one build
@@ -189,8 +212,9 @@ pub fn load_emission_parameters<P: AsRef<Path>>(
                     mu,
                     sigma2_cohort,
                     sigma2: sigma2_cohort,
-                    alpha: 0.0,   // initialized in solve_and_write_profile
-                    accum_w: 0.0, // set by the first M-step; see the field doc
+                    alpha: 0.0,           // initialized in solve_and_write_profile
+                    em_accum_weight: 0.0, // stamped after the EM loop; see the field doc
+                    em_finalized: false,  // set after the EM loop
                     is_imputed: nobs_col.value(i) == 0,
                 },
             );
@@ -532,6 +556,14 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
     // construction rather than by two independent correct-looking reads.
     let mut last_estep_params: Vec<Option<TranscriptParam>> = Vec::new();
 
+    // "Did an M-step actually execute?" -- set where the M-step runs, NOT
+    // inferred from `n_em_iter`. The inference `n_em_iter >= 2` is wrong on
+    // exactly the case this flag exists to expose: `max_iter == 1` runs one
+    // E-step, does not converge, runs the M-step, and ends the loop with
+    // `n_em_iter == 1`. That is the `--max-iter 1` ablation arm, and a rule
+    // that calls it "not finalised" reports the initialisation as a fit.
+    let mut m_step_ran = false;
+
     for iter in 0..max_iter {
         // E-step: parallel over ambiguous reads. Compute log-sum-exp normalized weights,
         // per-read log-likelihood, and per-read posterior entropy.
@@ -767,35 +799,16 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         // transcript. The σ² deviation Σ w·(y − μ_new)² is reconstructed
         // algebraically AFTER μ is updated — avoiding the v0.2.4 bug of
         // squaring deviations around an old μ that contradicts the new one.
-        let mut accum_w = vec![0.0_f64; num_transcripts];
-        let mut accum_w_y = vec![0.0_f64; num_transcripts]; // S1
-        let mut accum_w_y2 = vec![0.0_f64; num_transcripts]; // S2
-
-        // Unambiguous: w=1.0 always.
-        for &idx in &unambiguous_indices {
-            let mol = &graph.molecules[idx];
-            let tx_id = graph.candidate_pool[mol.candidate_offset as usize] as usize;
-            let y = mol.log_pal as f64;
-            if params[tx_id].is_some() {
-                accum_w[tx_id] += 1.0;
-                accum_w_y[tx_id] += y;
-                accum_w_y2[tx_id] += y * y;
-            }
-        }
-
-        // Ambiguous: use current weights.
-        for (i, weights) in final_weights.iter().enumerate() {
-            let mol_idx = ambiguous_indices[i];
-            let mol = &graph.molecules[mol_idx];
-            let y = mol.log_pal as f64;
-            for &(tx_id, w) in weights {
-                if params[tx_id].is_some() {
-                    accum_w[tx_id] += w;
-                    accum_w_y[tx_id] += w * y;
-                    accum_w_y2[tx_id] += w * y * y;
-                }
-            }
-        }
+        m_step_ran = true; // see the declaration above: this, not `n_em_iter`,
+                           // is what "an M-step ran" means
+        let (accum_w, accum_w_y, accum_w_y2) = accumulate_mstep_suffstats(
+            &params,
+            &graph,
+            &unambiguous_indices,
+            &ambiguous_indices,
+            &final_weights,
+            num_transcripts,
+        );
 
         // 3-step update: μ → σ² (around μ_new) → π. Order is locked (spec §F2).
         //
@@ -828,11 +841,11 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
                 // make the sidecar silently unreadable on exactly the
                 // configuration that most needs inspecting.
                 //
-                // This is `p.accum_w`, NOT the `accum_w` local above — the
+                // This is `p.em_accum_weight`, NOT the `accum_w` local above — the
                 // field carries the SUM out of the loop, the local is read-only
                 // here. Same name, different scopes; the compiler would catch a
                 // mix-up, the reader should not have to.
-                p.accum_w = w_sum;
+                p.em_accum_weight = w_sum;
 
                 if poly_a_weight > 0.0 {
                     // STEP 1: μ update — weak empirical Bayes shrinkage (τ₀=2).
@@ -867,6 +880,61 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
                 } else {
                     0.0
                 };
+            }
+        }
+    }
+
+    // STAMP THE RUN'S ACTUAL W AND FINALISATION STATE INTO THE SNAPSHOT
+    // (2026-10-11). Read the comments in order; this is the fix for a column
+    // that was already written once and was silently one iteration stale on
+    // EVERY exit path.
+    //
+    // (1) WHY THE M-STEP'S OWN ASSIGNMENT IS NOT ENOUGH. The M-step sets
+    //     `p.em_accum_weight = w_sum` (:829) from ITS `final_weights`. But the
+    //     snapshot the sidecar is written from is taken at :728, BEFORE the
+    //     M-step runs, and on convergence the loop `break`s at :770 -- also
+    //     before the M-step. So on the normal production path the final
+    //     iteration never reaches the assignment at all, and the snapshot
+    //     carries the PREVIOUS iteration's W, while the profile it accompanies
+    //     was written from the FINAL iteration's weights. `alpha` and
+    //     `em_accum_weight` stayed mutually consistent (both one M-step
+    //     behind), so `sum(em_accum_weight) == N * sum(alpha)` still held and
+    //     nothing went red -- while the column silently described weights that
+    //     are not the ones in the file next to it.
+    //
+    // (2) WHY IT MATTERS. The column exists so an analyst can read W directly
+    //     instead of reconstructing it as `alpha * n_total_molecules` across
+    //     three parquet files. A column one iteration stale is worse than no
+    //     column: it looks like the answer and is a different quantity.
+    //
+    // (3) WHY IT IS SAFE HERE. `accumulate_mstep_suffstats` is a pure function
+    //     of (`params` presence, the graph, the indices, `final_weights`), and
+    //     `final_weights` is exactly what the profile writer consumes a few
+    //     hundred lines below. This recompute therefore makes the sidecar's W
+    //     describe the SAME weights that produced that profile -- which is the
+    //     sidecar's existing contract for `mu`/`sigma2`/`alpha` (see the
+    //     `last_estep_params` declaration comment: one snapshot, two
+    //     consumers, so both describe the same state by construction).
+    //
+    //     IT DOES NOT DEPEND ON THE LOOP EXIT. The convergence `break` fills
+    //     `final_weights` before breaking (:776-778), so the recompute is
+    //     correct on that path too; that is why the W is stamped whether or not
+    //     an M-step ran. What the exit DOES change is whether `mu`/`sigma2`/
+    //     `alpha` in the same row are a fit or the Laplace initialisation, and
+    //     that is what `em_finalized` reports.
+    {
+        let (final_w, _, _) = accumulate_mstep_suffstats(
+            &params,
+            &graph,
+            &unambiguous_indices,
+            &ambiguous_indices,
+            &final_weights,
+            num_transcripts,
+        );
+        for (i, slot) in last_estep_params.iter_mut().enumerate() {
+            if let Some(ref mut p) = slot {
+                p.em_accum_weight = final_w[i];
+                p.em_finalized = m_step_ran;
             }
         }
     }
@@ -2174,6 +2242,62 @@ pub struct ReadAssignment {
 /// `top_tx_id` is written as a nullable string rather than an index: the whole
 /// purpose of this table is to be joined against another run's table, and a
 /// pool index only means something relative to one run's `transcript_names`.
+/// Per-transcript sufficient statistics (W, S1, S2) for one E-step's weights.
+///
+/// EXTRACTED (2026-10-11) so it has exactly ONE definition and is called from
+/// two places. The second caller is the post-loop recompute that stamps
+/// `em_accum_weight` into the snapshot; see that call site for why it exists.
+///
+/// It is one function and not two copies for a reason that is not tidiness: the
+/// mutation battery's patcher requires each of its search strings to occur
+/// EXACTLY ONCE per file. Duplicating these six lines would make `accum_w[tx_id]
+/// += 1.0;` ambiguous and abort m4 as a patch failure, which reads like a
+/// battery defect rather than like what it is.
+///
+/// Only transcripts with a fitted parameter accumulate (`params[tx].is_some()`),
+/// so a molecule whose every candidate is missing from the emission parquet
+/// contributes 0 while still counting in `n_total_molecules`. That shortfall is
+/// real and is what makes `sum(alpha) < 1` on real data; it is not a bug.
+fn accumulate_mstep_suffstats(
+    params: &[Option<TranscriptParam>],
+    graph: &FlatEvidenceGraph,
+    unambiguous_indices: &[usize],
+    ambiguous_indices: &[usize],
+    final_weights: &[Vec<(usize, f64)>],
+    num_transcripts: usize,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let mut accum_w = vec![0.0_f64; num_transcripts];
+    let mut accum_w_y = vec![0.0_f64; num_transcripts]; // S1
+    let mut accum_w_y2 = vec![0.0_f64; num_transcripts]; // S2
+
+    // Unambiguous: w=1.0 always.
+    for &idx in unambiguous_indices {
+        let mol = &graph.molecules[idx];
+        let tx_id = graph.candidate_pool[mol.candidate_offset as usize] as usize;
+        let y = mol.log_pal as f64;
+        if params[tx_id].is_some() {
+            accum_w[tx_id] += 1.0;
+            accum_w_y[tx_id] += y;
+            accum_w_y2[tx_id] += y * y;
+        }
+    }
+
+    // Ambiguous: use current weights.
+    for (i, weights) in final_weights.iter().enumerate() {
+        let mol_idx = ambiguous_indices[i];
+        let mol = &graph.molecules[mol_idx];
+        let y = mol.log_pal as f64;
+        for &(tx_id, w) in weights {
+            if params[tx_id].is_some() {
+                accum_w[tx_id] += w;
+                accum_w_y[tx_id] += w * y;
+                accum_w_y2[tx_id] += w * y * y;
+            }
+        }
+    }
+    (accum_w, accum_w_y, accum_w_y2)
+}
+
 pub fn write_read_assignments_parquet(
     rows: &[ReadAssignment],
     path: &std::path::Path,
@@ -2253,12 +2377,13 @@ pub fn write_read_assignments_parquet(
 ///
 /// Three columns were added on 2026-10-11, in this order:
 ///
-/// - `accum_w` — the M-step's W, the E-step weight sum it consumed. Before
-///   this, W existed only as a local, and recovering it downstream meant a
-///   join across three parquet files plus a ghost count. On 2026-10-11 an
-///   analysis took the profile parquet's per-read weight column for W and
-///   published a median 11.9x low; the column removes the reconstruction and
-///   with it the confusion.
+/// - `em_accum_weight` — the E-step weight sum W, in molecule weight units,
+///   stamped from the FINAL E-step's weights after the loop. Before this, W
+///   existed only as a local, and recovering it downstream meant a join across
+///   three parquet files plus a ghost count. On 2026-10-11 an analysis took the
+///   profile parquet's per-read weight column for W and published a median
+///   11.9x low; the column removes the reconstruction and with it the
+///   confusion.
 /// - `mu_fitted`, `sigma2_fitted` — ALIASES of `mu_logPAL` / `sigma2_logPAL`,
 ///   same values, same iteration. Pure duplication, kept deliberately: the
 ///   first five columns are frozen because `load_emission_parameters` reads
@@ -2267,13 +2392,17 @@ pub fn write_read_assignments_parquet(
 ///   things elsewhere in the pipeline (`mu_cohort` here is the shrinkage prior;
 ///   `sigma2_cohort` the emission fit). The aliases are appended, so existing
 ///   readers that select by name keep working unchanged.
+/// - `em_finalized` — whether an M-step ran at all. See below; the W column
+///   alone cannot say.
 ///
-/// NOTE for anyone writing a new consumer: `accum_w` and `alpha` come from the
-/// SAME M-step — both are snapshotted together into `last_estep_params` before
-/// the M-step rewrites them — but that requires at least one M-step to have
-/// run. `max_iter = 1` and an all-unambiguous BAM (`n_ambig == 0`, which breaks
-/// at iteration 0) both write `sum(alpha) == 1` with `sum(accum_w) == 0`, the
-/// Laplace initialisation.
+/// NOTE for anyone writing a new consumer: `em_accum_weight` and `alpha` are
+/// the two sides of `alpha == W / n_total_molecules` (`:860`), so they agree
+/// whenever `em_finalized` is TRUE. When it is FALSE — convergence on the
+/// first iteration, e.g. an all-unambiguous BAM where `n_ambig == 0` — `alpha`
+/// is the Laplace initialisation instead, and need not equal W / N; it can
+/// still coincide on a fixture where the smoothing is uniform, so the flag is
+/// NOT recoverable from the numeric columns. Filter on `em_finalized` before
+/// treating a row as a fit.
 pub fn write_emission_params_parquet(
     params: &[Option<TranscriptParam>],
     path: &std::path::Path,
@@ -2291,6 +2420,7 @@ pub fn write_emission_params_parquet(
     let mut alpha_b = Float64Builder::new();
     let mut state_b = StringBuilder::new();
     let mut accum_w_b = Float64Builder::new();
+    let mut finalized_b = BooleanBuilder::new();
     let mut mu_fit_b = Float64Builder::new();
     let mut s2_fit_b = Float64Builder::new();
 
@@ -2306,7 +2436,8 @@ pub fn write_emission_params_parquet(
         cohort_b.append_value(p.mu_cohort);
         alpha_b.append_value(p.alpha);
         state_b.append_value("e_step_final");
-        accum_w_b.append_value(p.accum_w);
+        accum_w_b.append_value(p.em_accum_weight);
+        finalized_b.append_value(p.em_finalized);
         mu_fit_b.append_value(p.mu);
         s2_fit_b.append_value(p.sigma2);
     }
@@ -2320,7 +2451,8 @@ pub fn write_emission_params_parquet(
         Field::new("mu_cohort", DataType::Float64, false),
         Field::new("alpha", DataType::Float64, false),
         Field::new("state", DataType::Utf8, false),
-        Field::new("accum_w", DataType::Float64, false),
+        Field::new("em_accum_weight", DataType::Float64, false),
+        Field::new("em_finalized", DataType::Boolean, false),
         Field::new("mu_fitted", DataType::Float64, false),
         Field::new("sigma2_fitted", DataType::Float64, false),
     ]));
@@ -2336,6 +2468,7 @@ pub fn write_emission_params_parquet(
             Arc::new(alpha_b.finish()),
             Arc::new(state_b.finish()),
             Arc::new(accum_w_b.finish()),
+            Arc::new(finalized_b.finish()),
             Arc::new(mu_fit_b.finish()),
             Arc::new(s2_fit_b.finish()),
         ],
@@ -3170,7 +3303,7 @@ mod tests {
         // `poly_a_weight > 0`, where the guard is unconditionally true, so a W
         // write moved inside that guard would pass all of them and leave the
         // `none` arm reporting a W of 0 next to a live alpha.
-        let accum_w_off = params_off[0].as_ref().unwrap().accum_w;
+        let accum_w_off = params_off[0].as_ref().unwrap().em_accum_weight;
         assert!(
             accum_w_off > 0.0,
             "W must still accumulate at poly_a_weight = 0: it is the weight sum \
@@ -3516,7 +3649,47 @@ mod tests {
         row.1.iter().find(|(n, _)| n == col).and_then(|(_, v)| *v)
     }
 
-    /// THE `accum_w` COLUMN IS THE M-STEP'S W, IN MOLECULES, NOT A SHARE.
+    /// The `em_finalized` column as `(transcript_id, value)` pairs.
+    ///
+    /// `read_sidecar` keeps only Float64 cells, so a Boolean column reads back
+    /// as `None` there by design — that helper's contract is "the column is
+    /// absent, or present but not Float64". Widening its row type for the sake
+    /// of one assertion would put a variant in front of every other caller, so
+    /// this reopens the file instead. It also *panics* on a missing or
+    /// non-Boolean column rather than reporting `None`: a schema mistake is
+    /// exactly what the caller is asserting about, and a panic names it.
+    fn sidecar_finalized(path: &Path) -> Vec<(String, bool)> {
+        let file = File::open(path).expect("sidecar file must exist");
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .expect("sidecar must be readable as parquet")
+            .with_batch_size(8192)
+            .build()
+            .expect("sidecar reader must build");
+
+        let mut out = Vec::new();
+        for batch in reader {
+            let batch = batch.expect("sidecar batch must read");
+            let tr = batch
+                .column_by_name("transcript_id")
+                .expect("sidecar must carry transcript_id")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("transcript_id must be Utf8");
+            let fin = batch
+                .column_by_name("em_finalized")
+                .expect("the sidecar must carry an `em_finalized` column")
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .expect("em_finalized must be Boolean, not another type");
+            for i in 0..batch.num_rows() {
+                out.push((tr.value(i).to_string(), fin.value(i)));
+            }
+        }
+        assert!(!out.is_empty(), "sidecar must emit at least one row");
+        out
+    }
+
+    /// THE `em_accum_weight` COLUMN IS THE E-STEP'S W, IN MOLECULES, NOT A SHARE.
     ///
     /// WHY THE FIXTURE HAS A SECOND MOLECULE. The obvious fixture is the
     /// symmetric single-molecule one the closed-form M-step test already uses,
@@ -3543,11 +3716,11 @@ mod tests {
     ///   W for each of the pair is therefore 0.5, and for the solo molecule it
     ///   is 1.0 (an unambiguous read contributes exactly its weight of 1).
     ///
-    /// `max_iter = 2` for the same reason the closed-form test uses it: the
-    /// sidecar is fed from the pre-M-step snapshot, so the run must complete an
-    /// M-step for W to exist at all, and two iterations is the least that does.
+    /// `max_iter = 2` for the reason the closed-form test uses it: the M-step must
+    /// have run for `alpha` to be a fit rather than the Laplace initialisation.
+    /// W itself is stamped either way — see the post-loop stamping block.
     #[test]
-    fn test_sidecar_accum_w_is_the_m_step_weight_sum_in_molecules() {
+    fn test_sidecar_em_accum_weight_is_the_estep_weight_sum_in_molecules() {
         const TOL: f64 = 1e-12;
         const EXPECTED_W: f64 = 0.5;
         // `alpha` = W / n_total_molecules with n_total_molecules = 2. Asserted
@@ -3592,13 +3765,29 @@ mod tests {
         let (_, rows) = read_sidecar(&sidecar);
         assert_eq!(rows.len(), 3, "every emitted transcript gets a row");
 
+        // Two iterations with a contested molecule means an M-step ran, so the
+        // row is a fit and the W/alpha identity is allowed to hold. Asserted
+        // here rather than assumed: if `em_finalized` ever reports false for
+        // this fixture the EXPECTED_ALPHA assertions below would be measuring
+        // the Laplace initialisation while claiming to measure the fit.
+        let fin = sidecar_finalized(&sidecar);
+        assert!(
+            fin.iter().all(|(_, v)| *v),
+            "max_iter = 2 with a contested molecule MUST run an M-step, so every \
+             row must be em_finalized; got {:?}",
+            fin.iter()
+                .filter(|(_, v)| !*v)
+                .map(|(t, _)| t)
+                .collect::<Vec<_>>()
+        );
+
         for tx in ["r0_tx0", "r0_tx1"] {
             let row = rows
                 .iter()
                 .find(|(id, _)| id == tx)
                 .unwrap_or_else(|| panic!("{tx} must have a sidecar row"));
-            let w = sidecar_cell(row, "accum_w")
-                .unwrap_or_else(|| panic!("{tx}: sidecar must carry an accum_w column"));
+            let w = sidecar_cell(row, "em_accum_weight")
+                .unwrap_or_else(|| panic!("{tx}: sidecar must carry an em_accum_weight column"));
             let alpha = sidecar_cell(row, "alpha").unwrap();
 
             // The headline assertion comes FIRST so that a column carrying the
@@ -3606,8 +3795,8 @@ mod tests {
             // guard below explaining why the value would have been vacuous.
             assert!(
                 (w - EXPECTED_W).abs() < TOL,
-                "{tx}: accum_w REGRESSION: got {w:.17}, expected {EXPECTED_W}. \
-                 accum_w is the E-step weight sum the M-step consumed, in \
+                "{tx}: em_accum_weight REGRESSION: got {w:.17}, expected \
+                 {EXPECTED_W}. em_accum_weight is the E-step weight sum, in \
                  MOLECULE weight units -- not alpha, not the per-read posterior \
                  the profile parquet stores. Derivation is on this test."
             );
@@ -3615,9 +3804,9 @@ mod tests {
             // fixture, or the assertion above is satisfied by the share as well.
             assert!(
                 (w - alpha).abs() > 1e-6,
-                "{tx}: accum_w ({w}) and alpha ({alpha}) are the same number, so \
-                 this fixture cannot tell W from the abundance share and the \
-                 assertion above proved nothing"
+                "{tx}: em_accum_weight ({w}) and alpha ({alpha}) are the same \
+                 number, so this fixture cannot tell W from the abundance share \
+                 and the assertion above proved nothing"
             );
             assert!(
                 (alpha - EXPECTED_ALPHA).abs() < TOL,
@@ -3632,10 +3821,10 @@ mod tests {
             .find(|(id, _)| id == "r1_solo")
             .expect("the unambiguous transcript must have a row");
         assert!(
-            (sidecar_cell(solo, "accum_w").unwrap() - 1.0).abs() < TOL,
+            (sidecar_cell(solo, "em_accum_weight").unwrap() - 1.0).abs() < TOL,
             "an unambiguous read whose only candidate is present contributes \
              exactly 1.0 to W; got {:?}",
-            sidecar_cell(solo, "accum_w")
+            sidecar_cell(solo, "em_accum_weight")
         );
 
         let _ = std::fs::remove_file(&emission);
@@ -3666,7 +3855,8 @@ mod tests {
                 sigma2_cohort: 0.5,
                 sigma2: 0.25,
                 alpha: 0.25,
-                accum_w: 0.5,
+                em_accum_weight: 0.5,
+                em_finalized: true,
                 is_imputed: false,
             }),
             // A transcript with no emission row. It must produce NO row here:
@@ -3682,7 +3872,8 @@ mod tests {
                 sigma2_cohort: 0.5,
                 sigma2: 0.125,
                 alpha: 0.75,
-                accum_w: 1.5,
+                em_accum_weight: 1.5,
+                em_finalized: true,
                 is_imputed: true,
             }),
         ];
@@ -3690,7 +3881,12 @@ mod tests {
         write_emission_params_parquet(&rows_in, &sidecar).expect("writer must succeed");
         let (names, rows) = read_sidecar(&sidecar);
 
-        for col in ["accum_w", "mu_fitted", "sigma2_fitted"] {
+        for col in [
+            "em_accum_weight",
+            "em_finalized",
+            "mu_fitted",
+            "sigma2_fitted",
+        ] {
             assert!(
                 names.iter().any(|n| n == col),
                 "the sidecar must carry a `{col}` column; it has {names:?}"
@@ -3724,9 +3920,9 @@ mod tests {
         );
 
         // Written values, checked by column name against the literal above. The
-        // three numbers are pairwise distinct on purpose: a writer that
-        // mis-ordered its builders, or aliased the wrong field, cannot pass.
-        for (tx, accum_w, alpha, mu, sigma2) in
+        // numbers are pairwise distinct on purpose: a writer that mis-ordered
+        // its builders, or aliased the wrong field, cannot pass.
+        for (tx, em_accum_weight, alpha, mu, sigma2) in
             [("tA", 0.5, 0.25, 6.5, 0.25), ("tB", 1.5, 0.75, 7.25, 0.125)]
         {
             let row = rows
@@ -3734,7 +3930,7 @@ mod tests {
                 .find(|(id, _)| id == tx)
                 .unwrap_or_else(|| panic!("{tx} must have a row"));
             for (col, want) in [
-                ("accum_w", accum_w),
+                ("em_accum_weight", em_accum_weight),
                 ("alpha", alpha),
                 ("mu_fitted", mu),
                 ("sigma2_fitted", sigma2),
@@ -3750,6 +3946,31 @@ mod tests {
                 );
             }
         }
+
+        // `em_finalized` is Boolean, so `read_sidecar` cannot see it at all (it
+        // keeps only Float64 cells) and asserting it here is the only place the
+        // writer's Boolean branch is exercised. Both rows are `true` in the
+        // fixture; the FALSE branch is the solver's, and it is pinned by
+        // `test_em_finalized_is_false_when_the_run_never_reaches_an_m_step`.
+        let fin: std::collections::HashMap<_, _> =
+            sidecar_finalized(&sidecar).into_iter().collect();
+        assert_eq!(
+            fin.get("tA"),
+            Some(&true),
+            "tA: em_finalized must be written"
+        );
+        assert_eq!(
+            fin.get("tB"),
+            Some(&true),
+            "tB: em_finalized must be written"
+        );
+        assert_eq!(
+            fin.len(),
+            2,
+            "only the two `Some` transcripts get a row, so the None one must \
+             contribute no em_finalized entry either; got {:?}",
+            fin.keys().collect::<Vec<_>>()
+        );
 
         let _ = std::fs::remove_file(&sidecar);
     }
@@ -3819,7 +4040,7 @@ mod tests {
         let (_, rows) = read_sidecar(&sidecar);
         let sum_w: f64 = rows
             .iter()
-            .map(|r| sidecar_cell(r, "accum_w").unwrap())
+            .map(|r| sidecar_cell(r, "em_accum_weight").unwrap())
             .sum();
         let sum_alpha: f64 = rows.iter().map(|r| sidecar_cell(r, "alpha").unwrap()).sum();
         // `n_total_molecules` is every row of the input graph, candidates and
@@ -3827,9 +4048,20 @@ mod tests {
         // from the sidecar -- which is half of why W is worth writing down.
         let n_total_molecules = 3.0_f64;
 
+        // Gated on `em_finalized`, which is the whole reason that column
+        // exists: the identity is a claim about a row whose `alpha` is an
+        // M-step's output. An un-finalised row carries the Laplace
+        // initialisation for `alpha` and MUST disagree, so asserting the
+        // identity without this guard would be asserting the flag is true.
+        assert!(
+            sidecar_finalized(&sidecar).iter().all(|(_, v)| *v),
+            "this fixture has contested molecules and max_iter = 2, so an \
+             M-step ran and every row must be em_finalized"
+        );
+
         assert!(
             (sum_w - n_total_molecules * sum_alpha).abs() < TOL,
-            "sum(accum_w) = {sum_w} but n_total_molecules * sum(alpha) = {}; \
+            "sum(em_accum_weight) = {sum_w} but n_total_molecules * sum(alpha) = {}; \
              the two columns come from the same M-step and must agree",
             n_total_molecules * sum_alpha
         );
@@ -3837,7 +4069,7 @@ mod tests {
         // satisfied by a file whose W never ran.
         assert!(
             sum_w > 1.0 && (sum_alpha - 1.0).abs() < TOL,
-            "non-degenerate guard: sum(accum_w) = {sum_w}, sum(alpha) = {sum_alpha}"
+            "non-degenerate guard: sum(em_accum_weight) = {sum_w}, sum(alpha) = {sum_alpha}"
         );
 
         let _ = std::fs::remove_file(&emission);
@@ -3850,7 +4082,7 @@ mod tests {
     /// A molecule all of whose candidates are missing from the emission
     /// parquet contributes NOTHING to W -- it has no parameter to be scored
     /// against -- while still counting in `n_total_molecules`. So `sum(alpha)`
-    /// falls below 1 and `sum(accum_w)` falls below the molecule count, and
+    /// falls below 1 and `sum(em_accum_weight)` falls below the molecule count, and
     /// neither quantity is wrong. This is the same caveat the alpha
     /// normalisation test records in prose; it is asserted here because the
     /// conservation is now visible in a FILE, and a reader of that file will
@@ -3862,7 +4094,7 @@ mod tests {
     /// it against, and a fixture scaled to look like it would be a number
     /// nobody computed.
     #[test]
-    fn test_sidecar_accum_w_drops_molecules_whose_candidates_are_all_missing() {
+    fn test_sidecar_em_accum_weight_drops_molecules_whose_candidates_are_all_missing() {
         let emission = scratch("accum_w_gap_emission.parquet");
         let profile = scratch("accum_w_gap_profile.parquet");
         let sidecar = scratch("accum_w_gap_sidecar.parquet");
@@ -3904,7 +4136,7 @@ mod tests {
         let (_, rows) = read_sidecar(&sidecar);
         let sum_w: f64 = rows
             .iter()
-            .map(|r| sidecar_cell(r, "accum_w").unwrap())
+            .map(|r| sidecar_cell(r, "em_accum_weight").unwrap())
             .sum();
         let sum_alpha: f64 = rows.iter().map(|r| sidecar_cell(r, "alpha").unwrap()).sum();
         let n_total_molecules = 2.0_f64;
@@ -3913,11 +4145,11 @@ mod tests {
             sum_w < n_total_molecules,
             "a molecule whose every candidate is missing from the emission \
              parquet contributes 0 to W while still counting in \
-             n_total_molecules, so sum(accum_w) ({sum_w}) MUST fall short of {n_total_molecules}"
+             n_total_molecules, so sum(em_accum_weight) ({sum_w}) MUST fall short of {n_total_molecules}"
         );
         assert!(
             (sum_w - 1.0).abs() < 1e-12 && sum_alpha < 1.0,
-            "exactly r0's weight survives: sum(accum_w) = {sum_w}, \
+            "exactly r0's weight survives: sum(em_accum_weight) = {sum_w}, \
              sum(alpha) = {sum_alpha}"
         );
         // The molecule is not silently dropped from the count; it is dropped
@@ -3931,6 +4163,312 @@ mod tests {
         let _ = std::fs::remove_file(&emission);
         let _ = std::fs::remove_file(&profile);
         let _ = std::fs::remove_file(&sidecar);
+    }
+
+    /// `em_finalized` HAS TO BE FALSE ON SOME RUNS, AND THE RULE FOR WHICH RUNS
+    /// IS NOT `n_em_iter >= 2`.
+    ///
+    /// The convergence `break` (:770, reached from the check at :766) fires
+    /// BEFORE the M-step. With `n_ambig == 0` the per-molecule delta is defined
+    /// as 0.0, so `0.0 < tol` on the very first iteration and the loop breaks
+    /// having run zero M-steps — an all-unambiguous BAM, which is 99.7% of real
+    /// reads. Those rows carry the Laplace initialisation, and without this
+    /// column a reader cannot tell them from a fit.
+    ///
+    /// `max_iter == 1` is the arm that pins the rule. One E-step runs,
+    /// `prev_ll` is `-inf` so the delta is `inf` and no convergence is claimed,
+    /// the M-step runs, the loop ends — and `n_em_iter` is 1. So
+    /// `finalized = n_em_iter >= 2` calls a completed M-step an initialisation.
+    /// That is not a hypothetical: `--max-iter 1` is the ablation arm the
+    /// snapshot-lag bug was maximal on (see `last_estep_params`).
+    ///
+    /// The two arms are also each other's falsifier: a flag hard-wired to
+    /// `true` fails arm A, `false` fails arm B.
+    ///
+    /// Arm A additionally pins that W is NOT gated on the flag. An
+    /// unambiguous molecule's weight is a real 1.0 whether or not an M-step ran,
+    /// and zeroing it on the un-finalised path would make the column answer a
+    /// question nobody asked.
+    #[test]
+    fn test_em_finalized_is_false_when_the_run_never_reaches_an_m_step() {
+        const TOL: f64 = 1e-12;
+
+        // ---- ARM A: all-unambiguous, converges on iteration 0 ----------------
+        {
+            let emission = scratch("finalized_a_emission.parquet");
+            let profile = scratch("finalized_a_profile.parquet");
+            let sidecar = scratch("finalized_a_sidecar.parquet");
+
+            let graph = multi_molecule_graph(
+                10.0,
+                &[
+                    vec![("a", 1000, 0)],
+                    vec![("b", 1000, 0)],
+                    vec![("c", 1000, 0)],
+                ],
+            );
+            multi_molecule_emission(&emission, &["r0_a", "r1_b", "r2_c"]);
+
+            let mut params = Vec::new();
+            solve_and_write_profile(
+                graph,
+                &emission,
+                "TEST",
+                &profile,
+                1e-6,
+                5, // max_iter -- generous, so a FALSE here cannot be blamed on it
+                20.0,
+                FIVE_PRIME_OFF,
+                POLY_A_ON,
+                FIVE_PRIME_WINDOW,
+                PRUNE_MAX_DELTA_AS,
+                MIN_WEIGHT,
+                None,
+                Some(&mut params),
+                None,
+            )
+            .unwrap();
+            write_emission_params_parquet(&params, &sidecar).expect("sidecar must write");
+
+            let fin = sidecar_finalized(&sidecar);
+            assert_eq!(fin.len(), 3, "three transcripts, three sidecar rows");
+            assert!(
+                fin.iter().all(|(_, v)| !*v),
+                "n_ambig == 0 makes delta_avg_ll 0.0, so the loop breaks at \
+                 iteration 0 with NO M-step: every row is the Laplace \
+                 initialisation and must be em_finalized = false. Got {:?}",
+                fin.iter()
+                    .filter(|(_, v)| *v)
+                    .map(|(t, _)| t)
+                    .collect::<Vec<_>>()
+            );
+
+            let (_, rows) = read_sidecar(&sidecar);
+            let sum_w: f64 = rows
+                .iter()
+                .map(|r| sidecar_cell(r, "em_accum_weight").unwrap())
+                .sum();
+            assert!(
+                (sum_w - 3.0).abs() < TOL,
+                "W is NOT gated on em_finalized: each unambiguous molecule \
+                 contributes exactly 1.0, so sum(em_accum_weight) = 3 even \
+                 though no M-step ran. Got {sum_w}"
+            );
+            let sum_alpha: f64 = rows.iter().map(|r| sidecar_cell(r, "alpha").unwrap()).sum();
+            assert!(
+                (sum_alpha - 1.0).abs() < TOL,
+                "and the alpha in those same rows is still the Laplace \
+                 initialisation, which is exactly what em_finalized = false \
+                 is warning about; sum(alpha) = {sum_alpha}"
+            );
+
+            let _ = std::fs::remove_file(&emission);
+            let _ = std::fs::remove_file(&profile);
+            let _ = std::fs::remove_file(&sidecar);
+        }
+
+        // ---- ARM B: contested, max_iter == 1, M-step DID run ------------------
+        {
+            let emission = scratch("finalized_b_emission.parquet");
+            let profile = scratch("finalized_b_profile.parquet");
+            let sidecar = scratch("finalized_b_sidecar.parquet");
+
+            let graph = multi_molecule_graph(10.0, &[vec![("a", 1000, 0), ("b", 1000, 0)]]);
+            multi_molecule_emission(&emission, &["r0_a", "r0_b"]);
+
+            let mut params = Vec::new();
+            solve_and_write_profile(
+                graph,
+                &emission,
+                "TEST",
+                &profile,
+                1e-6,
+                1, // max_iter -- the arm `n_em_iter >= 2` gets wrong
+                20.0,
+                FIVE_PRIME_OFF,
+                POLY_A_ON,
+                FIVE_PRIME_WINDOW,
+                PRUNE_MAX_DELTA_AS,
+                MIN_WEIGHT,
+                None,
+                Some(&mut params),
+                None,
+            )
+            .unwrap();
+            write_emission_params_parquet(&params, &sidecar).expect("sidecar must write");
+
+            let fin = sidecar_finalized(&sidecar);
+            assert_eq!(fin.len(), 2, "two candidates, two sidecar rows");
+            assert!(
+                fin.iter().all(|(_, v)| *v),
+                "a contested molecule cannot converge on iteration 0 \
+                 (prev_ll is -inf, so the delta is inf), so max_iter = 1 runs \
+                 exactly one M-step and n_em_iter is 1. A rule of \
+                 `n_em_iter >= 2` reports this fit as an initialisation. Got {:?}",
+                fin.iter()
+                    .filter(|(_, v)| !*v)
+                    .map(|(t, _)| t)
+                    .collect::<Vec<_>>()
+            );
+
+            let _ = std::fs::remove_file(&emission);
+            let _ = std::fs::remove_file(&profile);
+            let _ = std::fs::remove_file(&sidecar);
+        }
+    }
+
+    /// THE COLUMN DESCRIBES THE **FINAL** ITERATION, NOT THE ONE BEFORE IT.
+    ///
+    /// This is the only test that can see the staleness the post-loop stamping
+    /// block fixes, and it needs an ASYMMETRIC fixture to do it. The two-molecule
+    /// fixture the value test uses is symmetric by construction: r0's two
+    /// candidates are identical in every term, so their posteriors are 0.5/0.5 at
+    /// every iteration and W never moves; the solo molecule is unambiguous and
+    /// contributes exactly 1.0 whatever the parameters are. On that fixture
+    /// W(iter k-1) == W(iter k), and a column carrying the PREVIOUS iteration's
+    /// W is indistinguishable from one carrying the right one. That is why the
+    /// value test cannot be asked to catch this and this test exists.
+    ///
+    /// THE CROSS-CHECK, AND WHY IT IS NOT CIRCULAR. The sidecar's W is compared
+    /// against the PROFILE parquet's own weights, aggregated per transcript.
+    /// Two facts make that a real second data flow rather than a restatement:
+    ///   - the profile's `posterior_weight` is `w / retained_sum`, so it equals
+    ///     the raw E-step weight ONLY when nothing was truncated. Asserted, not
+    ///     assumed: the fixture has exactly two candidates and the test requires
+    ///     exactly two profile rows, so both survive, `retained_sum` is their
+    ///     softmax sum of 1.0, and the division is the identity.
+    ///   - the profile is written from `final_weights`, the same vector the
+    ///     recompute consumes, but by a different function, a different file and
+    ///     a different builder. The M-step's own assignment, by contrast, is
+    ///     consumed by nothing at all on the convergence path — which is exactly
+    ///     the bug.
+    ///
+    /// THE VACUITY GUARD. A fixture whose EM has already converged by iteration
+    /// 1 would make the previous iteration's W equal the final one and pass
+    /// whatever the column carried. So the same fixture is also solved at
+    /// `max_iter = 1`, and the two sidecars are required to DISAGREE. If EM
+    /// converges immediately the guard fails and says so, rather than the
+    /// headline assertion passing for the wrong reason.
+    #[test]
+    fn test_em_accum_weight_tracks_the_final_estep_not_the_m_step_before_it() {
+        const TOL: f64 = 1e-12;
+
+        // Solve the fixture at `max_iter` and return, per transcript and sorted
+        // by name, (a) the sidecar's W and (b) the PROFILE's own per-read weight
+        // sum. `mu_cohort` differs between the two candidates, which is what
+        // makes the posteriors move from one E-step to the next.
+        //
+        // (b) is read out of a different parquet, by a different builder, from a
+        // different function -- and calls nothing that produces (a).
+        let run = |tag: &str, max_iter: usize| -> (Vec<(String, f64)>, Vec<(String, f64)>) {
+            let emission = scratch(&format!("stale_{tag}_emission.parquet"));
+            let profile = scratch(&format!("stale_{tag}_profile.parquet"));
+            let sidecar = scratch(&format!("stale_{tag}_sidecar.parquet"));
+
+            let graph =
+                multi_molecule_graph((100.0_f32).log2(), &[vec![("x", 1000, 0), ("y", 1000, 0)]]);
+            // The read's log2(100) is ~6.644: r0_x sits above it, r0_y below.
+            write_test_emission(
+                &emission,
+                &[("r0_x", "g", 9.0, 0.5), ("r0_y", "g", 5.0, 0.5)],
+            );
+
+            let mut params = Vec::new();
+            solve_and_write_profile(
+                graph,
+                &emission,
+                "TEST",
+                &profile,
+                1e-6,
+                max_iter,
+                20.0,
+                FIVE_PRIME_OFF,
+                POLY_A_ON,
+                FIVE_PRIME_WINDOW,
+                PRUNE_MAX_DELTA_AS,
+                // `min_weight = 0`, NOT `MIN_WEIGHT`. The output stage stores
+                // `w / retained_sum`, so `retained_sum` must be 1 for the
+                // profile's number to be the raw weight the cross-check needs.
+                // At `MIN_WEIGHT` the far candidate (mu_cohort 5.0 against a
+                // read at 6.644) falls below the cutoff, is dropped, and
+                // `retained_sum` becomes the near candidate alone.
+                0.0,
+                None,
+                Some(&mut params),
+                None,
+            )
+            .unwrap();
+            write_emission_params_parquet(&params, &sidecar).expect("sidecar must write");
+
+            let mut from_profile: Vec<(String, f64)> = Vec::new();
+            for (_, tx, w) in read_profile_by_read(&profile) {
+                match from_profile.iter_mut().find(|(t, _)| *t == tx) {
+                    Some(slot) => slot.1 += w,
+                    None => from_profile.push((tx, w)),
+                }
+            }
+            from_profile.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let (_, rows) = read_sidecar(&sidecar);
+            let mut from_sidecar: Vec<(String, f64)> = rows
+                .iter()
+                .map(|row| {
+                    (
+                        row.0.clone(),
+                        sidecar_cell(row, "em_accum_weight")
+                            .unwrap_or_else(|| panic!("{} must carry em_accum_weight", row.0)),
+                    )
+                })
+                .collect();
+            from_sidecar.sort_by(|a, b| a.0.cmp(&b.0));
+
+            let _ = std::fs::remove_file(&emission);
+            let _ = std::fs::remove_file(&profile);
+            let _ = std::fs::remove_file(&sidecar);
+            (from_sidecar, from_profile)
+        };
+
+        let (sidecar_it1, _) = run("it1", 1);
+        let (sidecar_it2, profile_it2) = run("it2", 2);
+
+        // VACUITY GUARD, FIRST. Without it the headline assertion below can be
+        // satisfied by a stale column whenever the EM converges immediately.
+        let moved = sidecar_it1
+            .iter()
+            .zip(sidecar_it2.iter())
+            .any(|((a, x), (b, y))| a == b && (x - y).abs() > 1e-9);
+        assert!(
+            moved,
+            "VACUITY GUARD: this fixture must move W between its first and second \
+             E-step, or it cannot tell the final iteration's W from the previous \
+             one's. sidecar(max_iter=1) = {sidecar_it1:?}, \
+             sidecar(max_iter=2) = {sidecar_it2:?}"
+        );
+
+        // THE CROSS-CHECK. `retained_sum == 1` requires BOTH candidates to be
+        // emitted; otherwise `posterior_weight` carries `w / retained_sum` and
+        // the comparison below is between two different quantities. Two
+        // candidates in, two profile rows out.
+        assert_eq!(
+            profile_it2.len(),
+            2,
+            "both candidates must be emitted, or posterior_weight carries \
+             w/retained_sum rather than w and this cross-check is meaningless"
+        );
+        assert_eq!(sidecar_it2.len(), 2, "two candidates, two sidecar rows");
+
+        for ((tx, sidecar_w), (tx2, profile_w)) in sidecar_it2.iter().zip(profile_it2.iter()) {
+            assert_eq!(tx, tx2, "the two reads must cover the same transcripts");
+            assert!(
+                (sidecar_w - profile_w).abs() < TOL,
+                "{tx}: em_accum_weight = {sidecar_w:.17} but the profile's own \
+                 per-read weights sum to {profile_w:.17}. The sidecar is fed \
+                 from `last_estep_params`, whose snapshot predates the M-step, \
+                 so the M-step's own assignment is ONE ITERATION BEHIND the \
+                 weights this profile was written from. max_iter = 2 here, so \
+                 these are the SECOND E-step's weights."
+            );
+        }
     }
 
     /// `solve_and_write_profile` is public, so the CLI's `poly_a_weight = 0`
@@ -4083,7 +4621,8 @@ mod tests {
                     sigma2_cohort: 0.04,
                     sigma2: 0.04,
                     alpha,
-                    accum_w: 0.0,      // fixture never runs an M-step
+                    em_accum_weight: 0.0, // fixture never runs an M-step
+                    em_finalized: false,
                     is_imputed: false, // test fixture: every row is anchored
                 })
             })
@@ -7519,8 +8058,9 @@ mod tests {
                     sigma2_cohort: sigma2,
                     sigma2,
                     alpha: 0.5,
-                    accum_w: 0.5,      // fixture never runs an M-step
-                    is_imputed: false, // test fixture: every row is anchored
+                    em_accum_weight: 0.5, // fixture never runs an M-step
+                    em_finalized: false,  // ditto: this is the Laplace init
+                    is_imputed: false,    // test fixture: every row is anchored
                 })
             })
             .collect();
