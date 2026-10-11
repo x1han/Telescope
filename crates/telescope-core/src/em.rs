@@ -856,16 +856,50 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
                     let s1 = accum_w_y[i];
                     let s2 = accum_w_y2[i];
                     let sq_dev_new = (s2 - 2.0 * p.mu * s1 + p.mu * p.mu * w_sum).max(0.0);
-                    // The joint MAP's NUMERATOR carries the conditional mean
-                    // prior's deviation term, kappa_0 * (mu - mu_cohort)^2, with
-                    // kappa_0 = tau_0. It was missing: the denominator was already
-                    // correct (its `+3` is the `-0.5 ln v` of the mu|v prior's
-                    // normaliser plus the InvGamma shape), but the matching
-                    // numerator term was not written. Spec and full derivation:
+                    // MODEL A — fixed-absolute-precision prior (expert ruling
+                    // 2026-10-12, scheme (b); Round 50/51/52 A-vs-B adjudication).
+                    //
+                    // This line USED to be Model B, the joint NIG MAP:
+                    //
+                    //     let sq_dev_prior = tau_0 * (p.mu - p.mu_cohort).powi(2);
+                    //     p.sigma2 = (sq_dev_new + sq_dev_prior + 2*beta_0*sigma2_cohort)
+                    //                / (w_sum + 2*nu_0 + 3);
+                    //
+                    // Model B's numerator carries the conditional mean prior's
+                    // deviation term kappa_0*(mu - mu_cohort)^2 with kappa_0 =
+                    // tau_0, and its denominator's `+3` is that same prior's
+                    // `-0.5 ln v` normaliser plus the InvGamma shape. Model A
+                    // keeps the absolute precision fixed at tau_0 = 2: neither
+                    // the quadratic term nor the `+1` it contributes. Both
+                    // changes go together; keeping one without the other is not
+                    // a variant, it is a different estimator with a derivation
+                    // nobody wrote.
+                    //
+                    // WHY, on the numbers rather than on taste. The three pooled
+                    // estimators satisfy, pointwise and by construction,
+                    //
+                    //     sigma2_NIG >= sigma2_A > sigma2_OLD
+                    //
+                    // so the earlier "NIG beats OLD" contrast compared two
+                    // estimators that are BOTH biased — NIG overshoots from
+                    // below, OLD over-shrinks from above, and the truth sits
+                    // next to A. A vs B was never registered as a contrast in
+                    // the oracle at all. Measured on the production arms
+                    // (workspace/.../bias_vs_mae_on_measured_arms.py), A beats B
+                    // on both loss functions in both regimes, W-weighted MAE
+                    // A 0.10726 < B 0.11012 < OLD 0.11297. That is not a
+                    // landslide: ARM-MODAL holds 78.68% of the transcripts and
+                    // scores 107:55 on decided cells.
+                    //
+                    // Derivation of the closed form, from the same likelihood
+                    // with the kappa_0 quadratic absent:
+                    //   d/dv [ -(W/2)ln(2 pi v) - S(mu)/(2v) - (nu_0+1)ln v
+                    //           - beta_0*sigma2_cohort/v - 0.5 ln v ] = 0
+                    //   =>  S(mu) + 2*beta_0*sigma2_cohort = (W + 2*nu_0 + 2) * v
+                    // Spec and full derivation:
                     // crates/telescope-core/MSTEP-PRIOR-SPEC-v1.0.md
-                    let sq_dev_prior = tau_0 * (p.mu - p.mu_cohort).powi(2);
-                    p.sigma2 = (sq_dev_new + sq_dev_prior + 2.0 * beta_0 * p.sigma2_cohort)
-                        / (w_sum + 2.0 * nu_0 + 3.0);
+                    p.sigma2 =
+                        (sq_dev_new + 2.0 * beta_0 * p.sigma2_cohort) / (w_sum + 2.0 * nu_0 + 2.0);
                     p.sigma2 = p.sigma2.max(INSTRUMENTAL_PAL_NOISE_FLOOR);
                 }
 
@@ -922,6 +956,27 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
     //     an M-step ran. What the exit DOES change is whether `mu`/`sigma2`/
     //     `alpha` in the same row are a fit or the Laplace initialisation, and
     //     that is what `em_finalized` reports.
+    //
+    // (4) WHY `alpha` IS STAMPED HERE TOO, AND WHY IT WAS A DEFECT (2026-10-12).
+    //     Before this, the block wrote `em_accum_weight` and left `alpha` at
+    //     whatever the M-step last assigned it. That was not a separate column
+    //     drifting: the two columns describe the SAME quantity, because
+    //     `alpha == W / n_total_molecules` by the definition at :878. Stamping
+    //     one and not the other leaves a row whose two columns disagree, and
+    //     the sidecar's whole purpose is to let an analyst read W directly
+    //     instead of reconstructing it across three parquet files — which is
+    //     exactly the reconstruction that then disagrees with itself.
+    //
+    //     The magnitude WAS measured, on 2026-10-12, and it is large: deleting
+    //     the `alpha` restamp below makes the sidecar's two columns disagree by
+    //     ~30% on the dynamic fixture
+    //     (`test_c2_stamping_is_atomic_where_w_actually_moves_between_iterations`
+    //     — em_accum_weight 0.65404 against alpha*N 0.50164). The
+    //     `test_sidecar_accum_w_is_consistent_with_alpha_times_the_molecule_count`
+    //     fixture stayed GREEN under that same mutation, because it is already at
+    //     a fixed point on iteration 1: there, W(stamped one iteration late) ==
+    //     W(stamped now), so the staleness is arithmetically invisible. That is
+    //     why the second fixture exists.
     {
         let (final_w, _, _) = accumulate_mstep_suffstats(
             &params,
@@ -934,6 +989,14 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         for (i, slot) in last_estep_params.iter_mut().enumerate() {
             if let Some(ref mut p) = slot {
                 p.em_accum_weight = final_w[i];
+                // Same accumulator, same generation, same row. The `else` branch
+                // is the guard at :878, kept identical on purpose: a BAM with
+                // zero mapped molecules must not publish NaN here either.
+                p.alpha = if n_total_molecules > 0.0 {
+                    final_w[i] / n_total_molecules
+                } else {
+                    0.0
+                };
                 p.em_finalized = m_step_ran;
             }
         }
@@ -2833,8 +2896,15 @@ mod tests {
         }
     }
 
-    /// Joint log-posterior of the NIG prior specified in
-    /// `crates/telescope-core/MSTEP-PRIOR-SPEC-v1.0.md` §2:
+    /// Joint log-posterior of MODEL B -- the NIG prior specified in
+    /// `crates/telescope-core/MSTEP-PRIOR-SPEC-v1.0.md` §2.
+    ///
+    /// NOT A DESCRIPTION OF PRODUCTION ANY MORE. This used to be; the M-step
+    /// was Model B until 2026-10-12 and now is Model A. It is retained as an
+    /// INDEPENDENT REFERENCE for the estimator production is not using, so the
+    /// test can measure the gap in the same units rather than assert that some
+    /// golden constant happens to match. If production ever goes back to Model
+    /// B, the gap goes to zero and the test goes red.
     ///
     ///     Q = -(W/2) ln(2 pi v) - S(mu)/(2v) - (nu_0+1) ln v - beta_0/v
     ///         - 0.5 ln v - kappa_0 (mu - mu_cohort)^2 / (2v)
@@ -2890,9 +2960,22 @@ mod tests {
         0.5 * (lo + hi)
     }
 
-    /// The M-step must be the argmax of the joint NIG log-posterior -- not a
-    /// transcription of some closed form, which is what the existing
-    /// `EXPECTED_SIGMA2` golden constant had become.
+    /// THE M-STEP IS MODEL A, AND THIS IS THE TEST THAT PROVES IT.
+    ///
+    /// This test used to assert the opposite -- that production sits at the
+    /// argmax of the joint NIG log-posterior, i.e. Model B -- and it was the
+    /// right test for the code that shipped until 2026-10-12. The switch to
+    /// Model A made it fail, and failing is what it was for. The failure was
+    /// not suppressed and the test was not deleted; it was inverted, because
+    /// "production is no longer Model B, by a measurable margin" is now the
+    /// fact worth pinning. A silent revert to Model B must turn this red.
+    ///
+    /// It asserts two things, and the second is the one that carries the dual
+    /// implementation:
+    ///
+    ///   (a) production is strictly below Model B's numeric argmax;
+    ///   (b) production equals Model A's closed form, recomputed here from the
+    ///       accumulators with no shared code.
     ///
     /// WHY A NEW FIXTURE. Three properties are needed at once and no existing
     /// helper provides them:
@@ -2925,7 +3008,7 @@ mod tests {
     /// need a tolerance four orders looser than the defect-detection margin.
     /// `Q(production) - Q(argmax)` is smooth and well conditioned instead.
     #[test]
-    fn test_mstep_sigma2_matches_joint_map_objective() {
+    fn test_mstep_is_model_a_and_is_not_model_b() {
         const KAPPA_0: f64 = 2.0; // em.rs `tau_0`
         const NU_0: f64 = 1.0; // em.rs `nu_0`
         const BETA_0: f64 = 1.0; // em.rs `beta_0`
@@ -3046,17 +3129,69 @@ mod tests {
         );
         let v_star = best_v_for(mu_star);
 
+        // (a) THE SWITCH TOOK EFFECT. Production is no longer the joint-MAP
+        //     optimum of Model B, and the gap is three orders of magnitude
+        //     above any tolerance that could be argued about. This assertion
+        //     is the one that fails if someone silently restores Model B --
+        //     which is exactly the regression a switch like this can suffer.
+        //
+        //     Measured on this fixture before the switch: production and the
+        //     argmax COINCIDED to 4.4e-8 in mu. After it they do not:
+        //       production (mu, sigma2) = (7.52877120971679670, 0.62032468955049225)
+        //       Model B argmax          = (7.52877125367160716, 0.77860543647559921)
+        //       Q_B(production) - Q_B(argmax) = -1.116e-1
         let q_prod = q(mu_prod, v_prod);
         let q_best = q(mu_star, v_star);
         assert!(
-            q_prod >= q_best - 1e-12,
-            "the production M-step is not at the joint-MAP optimum.\n  \
+            q_prod < q_best - 1e-6,
+            "production is still sitting at Model B's joint-MAP optimum.\n  \
              production (mu, sigma2) = ({mu_prod:.17}, {v_prod:.17})\n  \
-             numeric argmax (mu, sigma2) = ({mu_star:.17}, {v_star:.17})\n  \
-             Q(production) = {q_prod:.17}\n  Q(argmax)      = {q_best:.17}\n  \
-             deficit = {:.3e}  (production must not be worse than the argmax).\n\
-             Spec: crates/telescope-core/MSTEP-PRIOR-SPEC-v1.0.md",
+             Model B argmax (mu, sigma2) = ({mu_star:.17}, {v_star:.17})\n  \
+             Q_B(production) - Q_B(argmax) = {:.3e}, which is not the expected \
+             NEGATIVE gap.\n  \
+             Since 2026-10-12 the production M-step is Model A: numerator \
+             without the kappa_0*(mu-mu_cohort)^2 term, denominator +2 not +3. \
+             If this fires, Model B is back.",
             q_prod - q_best
+        );
+
+        // (b) WHAT PRODUCTION IS INSTEAD: Model A's closed form, computed here
+        //     a SECOND time from the accumulators and compared.
+        //
+        //     The two derivations share no code. This block recomputes mu from
+        //     (S1, W, tau_0, mu_cohort) and sigma2 from (S(mu), W, nu_0,
+        //     beta_0, sigma2_cohort) by hand; production ran the M-step over a
+        //     synthetic graph. The workspace dual-implementation rule asks for
+        //     exactly this whenever a claim is directional, and a claim about
+        //     which estimator is live is about as directional as they come.
+        //
+        //     NOTE ON WHAT MODEL A IS NOT. Model A is not the argmax of any
+        //     joint objective written down here, and this test deliberately
+        //     does not claim it is. Dropping the kappa_0 quadratic alone would
+        //     leave the `-0.5 ln v` normaliser and give denominator +3, not
+        //     +2 -- so Model A drops both, i.e. it treats the mean prior's
+        //     precision as an absolute constant that carries no information
+        //     about v. Whether that is the right prior is a MODELLING
+        //     question, settled by the production-arm oracle, not by a unit
+        //     test. What this test pins is narrower and checkable: production
+        //     computes Model A's closed form, and does not compute Model B's.
+        let mu_indep = (s1 + KAPPA_0 * MU_COHORT) / (w + KAPPA_0);
+        let s_mu_indep = s2 - 2.0 * mu_indep * s1 + mu_indep * mu_indep * w;
+        let sigma2_model_a =
+            ((s_mu_indep + 2.0 * BETA_0 * SIGMA2_COHORT) / (w + 2.0 * NU_0 + 2.0)).max(FLOOR);
+        assert!(
+            (mu_prod - mu_indep).abs() < 1e-9,
+            "production mu {:.17} != the independent closed form {:.17}.",
+            mu_prod,
+            mu_indep
+        );
+        assert!(
+            (v_prod - sigma2_model_a).abs() <= 1e-12 * sigma2_model_a.max(1.0),
+            "production sigma2 {:.17} != Model A's independent closed form \
+             {:.17}.\n  production = (S(mu) + 2*beta_0*sigma2_cohort) / \
+             (W + 2*nu_0 + 2), floored.",
+            v_prod,
+            sigma2_model_a
         );
 
         let _ = std::fs::remove_file(&emission);
@@ -3371,8 +3506,12 @@ mod tests {
     ///            = (3.321928024291992 + 14.0) / 2.5      = 6.928771209716797
     ///     sq_dev  = max(S2 - 2*mu*S1 + mu^2*W, 0) = 0.5*(y-mu)^2
     ///            = 0.040588324521667830
-    ///     sigma2  = (sq_dev + 2*beta_0*sigma2_cohort) / (w_sum + 2*nu_0 + 3)
-    ///            = (0.040588324521667830 + 1.0) / 5.5    = 0.18919787718575778
+    ///     sigma2  = (sq_dev + 2*beta_0*sigma2_cohort) / (w_sum + 2*nu_0 + 2)
+    ///            = (0.040588324521667830 + 1.0) / 4.5    = 0.23124184989370397
+    ///
+    ///     (Model A as of 2026-10-12. The Model B form this replaced was
+    ///     `(sq_dev + tau_0*(mu-mu_cohort)^2 + 2*beta_0*sigma2_cohort) /
+    ///     (w_sum + 2*nu_0 + 3)` = 0.19104280102765178.)
     ///
     /// `sq_dev` is a cancelling sum -- terms of order 22 and 48 collapsing to
     /// 0.0406 -- and it still carries ~1e-15 relative accuracy, which is
@@ -3489,21 +3628,30 @@ mod tests {
         //           + 6.9287712097167971^2 * 0.5
         //         = 0.040588324521667829
         //
-        //   numerator = S(mu) + tau_0*(mu - mu_cohort)^2 + 2*beta_0*sigma2_cohort
-        //             = 0.040588324521667829
-        //             + 2*(6.9287712097167971 - 7.0)^2          = 0.010147081130417013
-        //             + 2*1.0*0.5                              = 1.0
-        //             = 1.0507354056520848
+        //   MODEL A (2026-10-12). No kappa_0*(mu - mu_cohort)^2 term, and the
+        //   denominator loses the `+1` that term's normaliser contributed:
         //
-        //   denominator = W + 2*nu_0 + 3 = 0.5 + 2*1.0 + 3 = 5.5
+        //   numerator   = S(mu) + 2*beta_0*sigma2_cohort
+        //               = 0.040588324521667829 + 2*1.0*0.5
+        //               = 1.040588324521667829
         //
-        //   sigma2 = 1.0507354056520848 / 5.5 = 0.19104280102765178
+        //   denominator = W + 2*nu_0 + 2 = 0.5 + 2*1.0 + 2 = 4.5
         //
-        // The value this replaced was 0.18919787718575778 = the same expression
-        // WITHOUT the `tau_0*(mu - mu_cohort)^2` term, and it reproduces bit for
-        // bit, which is what makes the delta above trustworthy rather than
-        // asserted. Spec: crates/telescope-core/MSTEP-PRIOR-SPEC-v1.0.md
-        const EXPECTED_SIGMA2: f64 = 0.191_042_801_027_651_78;
+        //   sigma2 = 1.040588324521667829 / 4.5 = 0.23124184989370397
+        //
+        // READ THIS NUMBER OFF A RUN, NOT OFF PAPER. It was produced by the
+        // f32-widened `log2` path this crate actually uses (`100.0_f32.log2()
+        // as f64`), and recomputing it in f64 from the printed operands gives
+        // 0.23124184274217108 -- agreement to eight digits, not to seventeen.
+        // The f32 widening is why these constants are pinned here at all.
+        //
+        // What it replaced, and the chain of custody: 0.19104280102765178 was
+        // Model B (numerator + tau_0*(mu - mu_cohort)^2, denominator +3);
+        // before that 0.18919787718575778 was the same expression WITHOUT the
+        // prior term, which reproduced bit for bit and is what made the first
+        // delta trustworthy rather than asserted. Spec:
+        // crates/telescope-core/MSTEP-PRIOR-SPEC-v1.0.md
+        const EXPECTED_SIGMA2: f64 = 0.231_241_849_893_703_97;
         const TOL: f64 = 1e-12;
 
         // The observation, and the cohort prior it must be shrunk TOWARD.
@@ -4075,6 +4223,205 @@ mod tests {
         let _ = std::fs::remove_file(&emission);
         let _ = std::fs::remove_file(&profile);
         let _ = std::fs::remove_file(&sidecar);
+    }
+
+    /// THE FIXTURE THAT MAKES THE C2 STAMPING NON-VACUOUS.
+    ///
+    /// The identity test above pins `sum(em_accum_weight) == n_total_molecules *
+    /// sum(alpha)` on a fixture that is ALREADY AT A FIXED POINT after one
+    /// iteration — which is precisely the gap note (4) of the stamping block
+    /// records: on that fixture W at 50 and at 500 iterations is bitwise
+    /// identical, so a column stamped one iteration stale is indistinguishable
+    /// from a column stamped correctly.
+    ///
+    /// The defect (4) fixes IS that staleness — `em_accum_weight` came from the
+    /// final E-step while `alpha` was left at whatever the M-step last wrote.
+    /// **At a fixed point the stale value equals the current value**, so the
+    /// identity above passes whether `alpha` is stamped from the final E-step
+    /// or from the previous one. A test that cannot tell those two apart is not
+    /// testing the claim it is written to support.
+    ///
+    /// So this fixture is built to MOVE. r0's two candidates carry mu 5.0 and
+    /// 8.0, straddling the read's own log2(PAL) = 6.6439, so neither is the
+    /// better explanation in advance: every M-step refit moves the E-step
+    /// posteriors, and W changes from one iteration to the next.
+    ///
+    /// WHICH RUNS, AND WHY 1 IS IN THE LIST. The stamping block runs on every
+    /// exit path (note (3) of that block), so `max_iter = 1` stamps from the
+    /// FIRST E-step and `max_iter = 2` stamps from the SECOND. Those two runs
+    /// therefore measure exactly the pair the staleness mutation disagrees
+    /// about — the mutation leaves `alpha` holding M-step#1's value while
+    /// `em_accum_weight` carries the second E-step's. Runs 3 and 4 are there to
+    /// show the movement is not one step and then a fixed point.
+    ///
+    /// The first assertion is the load-bearing one, and it is a property of the
+    /// FIXTURE rather than of the stamping: it proves W really moves here. That
+    /// is also what keeps this test honest later — an edit that made the EM jump
+    /// straight to its fixed point would turn it red instead of silently
+    /// disarming every identity assertion below it.
+    #[test]
+    fn test_c2_stamping_is_atomic_where_w_actually_moves_between_iterations() {
+        const TOL: f64 = 1e-12;
+        const N_MOLECULES: f64 = 3.0;
+        const RUNS: [usize; 4] = [1, 2, 3, 4];
+
+        let emission = scratch("c2_dynamic_emission.parquet");
+        write_test_emission(
+            &emission,
+            &[
+                ("r0_tx0", "g", 5.0, 0.5),
+                ("r0_tx1", "g", 8.0, 0.5),
+                ("r1_solo", "g", 6.5, 0.5),
+                ("r2_a", "g", 5.5, 0.5),
+                ("r2_b", "g", 7.5, 0.5),
+            ],
+        );
+
+        let build_graph = || {
+            multi_molecule_graph(
+                (100.0_f32).log2(),
+                &[
+                    // Contested, and AS-asymmetric so the split is not a tie.
+                    // The gap MUST stay under PRUNE_MAX_DELTA_AS = 50. A first
+                    // draft of this fixture used 900 / 800, and the 100-wide gap
+                    // pruned tx1 outright -- which silently demoted a contested
+                    // molecule to an unambiguous one whose posterior is pinned at
+                    // 1.0, so its W could not move no matter how the fit changed.
+                    // Nothing errored; the fixture just stopped testing what its
+                    // own name claims.
+                    vec![("tx0", 900, 0), ("tx1", 870, 0)],
+                    // Unambiguous: contributes exactly 1.0 to W, which is what
+                    // keeps the fixture non-degenerate in the unambiguous arm.
+                    vec![("solo", 1000, 0)],
+                    // Contested and AS-tied: decided only by the fitted mu.
+                    vec![("a", 1000, 0), ("b", 1000, 0)],
+                ],
+            )
+        };
+
+        // `(transcript_id, em_accum_weight, alpha, em_finalized)` read back from
+        // the out-param. That vector IS `last_estep_params` -- the same snapshot
+        // the sidecar parquet is written from (em.rs:1654) -- so this compares
+        // the shipped values rather than a re-derivation that could agree with a
+        // broken solver.
+        let stamped_at = |max_iter: usize| -> Vec<(String, f64, f64, bool)> {
+            let profile = scratch(&format!("c2_dynamic_profile_{max_iter}.parquet"));
+            let mut params: Vec<Option<TranscriptParam>> = Vec::new();
+            solve_and_write_profile(
+                build_graph(),
+                &emission,
+                "TEST",
+                &profile,
+                1e-6,
+                max_iter,
+                20.0,
+                FIVE_PRIME_OFF,
+                POLY_A_ON,
+                FIVE_PRIME_WINDOW,
+                PRUNE_MAX_DELTA_AS,
+                MIN_WEIGHT,
+                None,
+                Some(&mut params),
+                None,
+            )
+            .unwrap_or_else(|e| panic!("solve failed at max_iter={max_iter}: {e}"));
+            let _ = std::fs::remove_file(&profile);
+            let out: Vec<(String, f64, f64, bool)> = params
+                .into_iter()
+                .flatten()
+                .map(|p| (p.transcript_id, p.em_accum_weight, p.alpha, p.em_finalized))
+                .collect();
+            assert_eq!(
+                out.len(),
+                5,
+                "all five fixture transcripts must carry a parameter at \
+                 max_iter={max_iter}; got {:?}",
+                out.iter().map(|r| &r.0).collect::<Vec<_>>()
+            );
+            out
+        };
+
+        let runs: Vec<Vec<(String, f64, f64, bool)>> =
+            RUNS.iter().map(|&n| stamped_at(n)).collect();
+
+        // (1) NON-VACUITY. Compared on the RAW W column, never on alpha: alpha
+        // is W divided by a constant, so it moves whenever W does and comparing
+        // it would hide a fixture that held W still. This is the assertion that
+        // makes every assertion below worth making.
+        let mut movers: Vec<String> = Vec::new();
+        for pair in runs.windows(2) {
+            for ((id, w0, _, _), (id1, w1, _, _)) in pair[0].iter().zip(&pair[1]) {
+                assert_eq!(
+                    id, id1,
+                    "transcript order must not depend on max_iter; a reorder \
+                     would make the run-to-run comparison below meaningless"
+                );
+                if (w0 - w1).abs() > TOL {
+                    movers.push(id.clone());
+                }
+            }
+        }
+        assert!(
+            !movers.is_empty(),
+            "this fixture is supposed to be DYNAMIC, but W is identical at every \
+             max_iter in {RUNS:?}. A fixed point means W(stamped one iteration \
+             late) == W(stamped now), so the identity asserted below would hold \
+             no matter which iteration each column came from, and this test \
+             would be green against the very defect it exists to catch. Rebuild \
+             it with candidates whose mu differ from each other."
+        );
+        assert!(
+            movers.iter().any(|m| m == "r0_tx0" || m == "r0_tx1"),
+            "W must move on the AS-contested molecule specifically; only it has \
+             two candidates whose posterior the fit can actually shift. Moved: {movers:?}"
+        );
+
+        // (2) THE IDENTITY, at every stopping point. `alpha` is DEFINED as W
+        // over the molecule count, so this asserts the two columns describe ONE
+        // quantity rather than two -- which is the whole point of stamping them
+        // together.
+        for (n, run) in RUNS.iter().zip(&runs) {
+            let sum_w: f64 = run.iter().map(|(_, w, _, _)| *w).sum();
+            let sum_alpha: f64 = run.iter().map(|(_, _, a, _)| *a).sum();
+            assert!(
+                (sum_w - N_MOLECULES * sum_alpha).abs() < TOL,
+                "max_iter={n}: sum(em_accum_weight) = {sum_w} but \
+                 n_total_molecules * sum(alpha) = {}",
+                N_MOLECULES * sum_alpha
+            );
+            // Per transcript as well as on the sum: two columns that disagree
+            // in opposite directions on different rows still sum to agreement.
+            for (id, w, a, _) in run {
+                assert!(
+                    (w - N_MOLECULES * a).abs() < TOL,
+                    "max_iter={n}: {id} carries em_accum_weight = {w} and alpha = \
+                     {a} (implying {}); the two columns are the same quantity \
+                     and must be stamped from the same final E-step",
+                    N_MOLECULES * a
+                );
+                assert!(
+                    *w > 0.0,
+                    "max_iter={n}: {id} has W = {w}. A zero here would satisfy \
+                     every assertion above for the wrong reason."
+                );
+            }
+        }
+
+        // (3) `em_finalized` turns on exactly when an M-step ran, which is why
+        // max_iter = 1 is excluded from this assertion even though the stamping
+        // is not. Asserting it across all runs would be asserting two things at
+        // once, and it would fail for a reason unrelated to C2.
+        for (n, run) in RUNS.iter().zip(&runs).skip(1) {
+            for (id, _, _, finalized) in run {
+                assert!(
+                    *finalized,
+                    "max_iter={n}: {id} must be em_finalized -- max_iter = 1 was \
+                     its own run, and >= 2 means an M-step ran"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_file(&emission);
     }
 
     /// CONSERVATION, WHICH THE IDENTITY ABOLE STRUCTURALLY CANNOT SEE.
