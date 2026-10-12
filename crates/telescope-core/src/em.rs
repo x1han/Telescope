@@ -875,16 +875,32 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
                     // a variant, it is a different estimator with a derivation
                     // nobody wrote.
                     //
-                    // WHY, on the numbers rather than on taste. The three pooled
-                    // estimators satisfy, pointwise and by construction,
+                    // WHY, on the numbers rather than on taste. Of the three
+                    // pooled estimators, the historical one is strictly the
+                    // smallest at every input:
                     //
-                    //     sigma2_NIG >= sigma2_A > sigma2_OLD
+                    //     sigma2_OLD < sigma2_A     and    sigma2_OLD < sigma2_NIG
                     //
                     // so the earlier "NIG beats OLD" contrast compared two
                     // estimators that are BOTH biased — NIG overshoots from
                     // below, OLD over-shrinks from above, and the truth sits
                     // next to A. A vs B was never registered as a contrast in
                     // the oracle at all.
+                    //
+                    // A vs B, by contrast, HAS NO ORDER. The quadratic raises
+                    // the numerator and +3 raises the denominator, so which one
+                    // is larger is decided by W and by the mu shift:
+                    //
+                    //     sigma2_NIG >= sigma2_A   <=>   dev + 2*beta_0*s2c >= tau_0 * mu_shift^2 * (W + 4)
+                    //
+                    // A previous version of this comment asserted the ordering
+                    // "pointwise and by construction". That was wrong, and no
+                    // test contradicted it because none exercised it. The
+                    // counterexample is measured: at W=50, S(mu)=12.5,
+                    // mu_shift=0.5 the inequality fails. See
+                    // workspace/validation/sim/selftest_sigma2_spec.py, which
+                    // pins the identity that IS true and demonstrates this one
+                    // is not.
                     //
                     // A vs B is likewise NOT adjudicated by MAE on real arms.
                     // That comparison was removed: its "truth" was a fitted
