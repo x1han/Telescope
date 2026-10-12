@@ -1442,7 +1442,7 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
         // the emit loop below are two spellings of ONE decision, and they must
         // agree. If this returned 0 while the loop still emitted the argmax,
         // `w_norm` would be `w / 0.0` and a NaN would be written straight into
-        // `posterior_weight` and from there into every TPM in the summary --
+        // `posterior_weight` and from there into every CPM in the summary --
         // and nothing in the suite would go red, because a NaN compares false
         // against every expectation. They are kept in lockstep deliberately;
         // see the loop for the other half.
@@ -5284,7 +5284,7 @@ mod tests {
         assert!(
             w.is_finite(),
             "posterior_weight must never be NaN/inf; got {w} for {tx}. A NaN here \
-             would flow into every TPM in the summary without turning any test red"
+             would flow into every CPM in the summary without turning any test red"
         );
         assert_eq!(
             *w, 1.0,

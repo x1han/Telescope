@@ -351,7 +351,7 @@ where
         // Iterate the UNIVERSE, in the sidecar's order, so the output is the
         // full 70,511-row closure with the profile's aggregates left-joined
         // onto it. A transcript no read landed on simply has no HashMap entry
-        // and keeps the default accumulator: weight_sum, effective_n and tpm
+        // and keeps the default accumulator: weight_sum, effective_n and cpm
         // are all 0.0 by construction, not by special-casing.
         for (tx, p) in prov {
             let acc = map
@@ -395,19 +395,28 @@ where
             .then_with(|| a.1.cmp(&b.1))
     });
 
-    // TPM denominator: the sample's total posterior weight. Zero-weight rows
+    // CPM denominator: the sample's total posterior weight. Zero-weight rows
     // contribute 0 to it and receive 0.0 back, so a transcript that was never
-    // observed does not dilute the others' TPM.
+    // observed does not dilute the others' CPM.
     //
-    // tpm = 1e6 * weight_sum / SUM(weight_sum over the sample)
+    // cpm = 1e6 * weight_sum / SUM(weight_sum over the sample)
+    //
+    // There is NO transcript-length normalisation anywhere in this path, and
+    // that is correct rather than an oversight. Direct RNA sequencing samples
+    // native molecules one read per molecule; it does not shear transcripts
+    // into length-biased fragments, so the fragment-count-per-length term that
+    // defines RNA-seq TPM has no physical referent here. The column was
+    // named `tpm` until 2026-10-12 and was mislabelled: arithmetically it has
+    // always been CPM. Renamed rather than aliased so the unit in the schema
+    // matches the quantity in the formula.
     let total_weight: f64 = rows.iter().map(|r| r.3.weight_sum).sum();
-    let tpm_scale = if total_weight > 0.0 {
+    let cpm_scale = if total_weight > 0.0 {
         1.0e6 / total_weight
     } else {
         0.0
     };
 
-    // Build output parquet (11 columns).
+    // Build output parquet (12 columns).
     let mut sample_b = StringBuilder::new();
     let mut gene_b = StringBuilder::new();
     let mut tx_b = StringBuilder::new();
@@ -419,7 +428,7 @@ where
     let mut var_b = Float64Builder::new();
     let mut tier_b = StringBuilder::new();
     let mut n_anchor_b = arrow::array::UInt32Builder::new();
-    let mut tpm_b = Float64Builder::new();
+    let mut cpm_b = Float64Builder::new();
 
     for (sample_id, gene_id, tx_id, acc, tier, n_anchor) in rows {
         sample_b.append_value(&sample_id);
@@ -433,7 +442,7 @@ where
         var_b.append_value(acc.posterior_weighted_variance());
         tier_b.append_value(tier);
         n_anchor_b.append_value(n_anchor);
-        tpm_b.append_value(acc.weight_sum * tpm_scale);
+        cpm_b.append_value(acc.weight_sum * cpm_scale);
     }
 
     let schema = Arc::new(Schema::new(vec![
@@ -448,11 +457,11 @@ where
         Field::new("posterior_weighted_variance", DataType::Float64, false),
         // Added 2026-10-06. The previous 9-column schema is NOT preserved as
         // an alternative: `tier` is the whole point of the provenance work,
-        // and `tpm` is what a downstream differential pipeline consumes.
+        // and `cpm` is what a downstream differential pipeline consumes.
         // Both are described where they are produced.
         Field::new("tier", DataType::Utf8, false),
         Field::new("n_anchor", DataType::UInt32, false),
-        Field::new("tpm", DataType::Float64, false),
+        Field::new("cpm", DataType::Float64, false),
     ]));
 
     let batch = RecordBatch::try_new(
@@ -469,7 +478,7 @@ where
             Arc::new(var_b.finish()),
             Arc::new(tier_b.finish()),
             Arc::new(n_anchor_b.finish()),
-            Arc::new(tpm_b.finish()),
+            Arc::new(cpm_b.finish()),
         ],
     )
     .context("Failed to build sample_summary RecordBatch")?;
@@ -627,7 +636,7 @@ mod tests {
     }
 
     /// Read the summary parquet back as `(transcript_id, tier, weight_sum,
-    /// effective_n, tpm)`, in FILE order -- file order is the thing under test,
+    /// effective_n, cpm)`, in FILE order -- file order is the thing under test,
     /// so it must not be re-sorted on the way in.
     fn read_summary(path: &std::path::Path) -> Vec<(String, String, f64, f64, f64)> {
         let f = File::open(path).expect("open summary");
@@ -663,7 +672,7 @@ mod tests {
                 .downcast_ref::<Float64Array>()
                 .unwrap();
             let tp = b
-                .column_by_name("tpm")
+                .column_by_name("cpm")
                 .unwrap()
                 .as_any()
                 .downcast_ref::<Float64Array>()
@@ -723,7 +732,7 @@ mod tests {
             assert_eq!(r.1, "L3_imputed", "{} must keep its tier", tx);
             assert_eq!(r.2, 0.0, "{} weight_sum must be 0.0, not absent", tx);
             assert_eq!(r.3, 0.0, "{} effective_n must be 0.0, not NaN", tx);
-            assert_eq!(r.4, 0.0, "{} tpm must be 0.0", tx);
+            assert_eq!(r.4, 0.0, "{} cpm must be 0.0", tx);
         }
         // The two observed transcripts keep their real aggregates.
         assert_eq!(by_tx["tx_a"].2, 1.0);
@@ -756,13 +765,13 @@ mod tests {
         }
     }
 
-    /// TPM is a within-sample share, so the shares must sum to 1e6. Without
+    /// CPM is a within-sample share, so the shares must sum to 1e6. Without
     /// this the denominator could be anything and still look plausible.
     #[test]
-    fn test_tpm_sums_to_one_million_across_the_weighted_transcripts() {
-        let p = scratch("tpm_profile");
-        let v = scratch("tpm_prov");
-        let o = scratch("tpm_out");
+    fn test_cpm_sums_to_one_million_across_the_weighted_transcripts() {
+        let p = scratch("cpm_profile");
+        let v = scratch("cpm_prov");
+        let o = scratch("cpm_out");
         write_profile(
             &p,
             "S1",
@@ -785,7 +794,7 @@ mod tests {
         let total: f64 = rows.iter().map(|r| r.4).sum();
         assert!(
             (total - 1.0e6).abs() < 1e-6,
-            "tpm must be a partition of 1e6; got {}",
+            "cpm must be a partition of 1e6; got {}",
             total
         );
 
