@@ -884,12 +884,27 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
                     // estimators that are BOTH biased — NIG overshoots from
                     // below, OLD over-shrinks from above, and the truth sits
                     // next to A. A vs B was never registered as a contrast in
-                    // the oracle at all. Measured on the production arms
-                    // (workspace/.../bias_vs_mae_on_measured_arms.py), A beats B
-                    // on both loss functions in both regimes, W-weighted MAE
-                    // A 0.10726 < B 0.11012 < OLD 0.11297. That is not a
-                    // landslide: ARM-MODAL holds 78.68% of the transcripts and
-                    // scores 107:55 on decided cells.
+                    // the oracle at all.
+                    //
+                    // A vs B is likewise NOT adjudicated by MAE on real arms.
+                    // That comparison was removed: its "truth" was a fitted
+                    // sigma^2, i.e. the estimator that produced it would score
+                    // itself. Swapping the truth from Model B's fit to Model A's
+                    // fit alone moves P(A>B) from 0.5856 to 0.6236. Real
+                    // transcriptomes carry no sigma^2 ground truth, so no such
+                    // MAE can settle this; adjudication needs simulation.
+                    //
+                    // What real data CAN measure is model-free disagreement:
+                    // across 336,709 real transcripts A and B diverge by a
+                    // median 3.43%, decaying monotonically with read depth W
+                    // (14.0% at W < 1.6 down to 0.40% at W >= 150). Algebraic
+                    // decomposition attributes >95% of that gap to the
+                    // degrees-of-freedom denominator (+2 vs +3; median
+                    // contribution 5.46%) and only 0.23% to the quadratic
+                    // deviation term tau_0*(mu-mu_cohort)^2 — a 23.5x gap.
+                    // Reproduce: workspace/.../dseta_step0_5/ab_decompose.py
+                    // (constants parsed from this file's own prior, not
+                    // hardcoded). Neither estimator is declared better.
                     //
                     // Derivation of the closed form, from the same likelihood
                     // with the kappa_0 quadratic absent:
