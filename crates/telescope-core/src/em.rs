@@ -52,6 +52,42 @@ pub const BETA_0: f64 = 1.0;
 /// Hoisting them changes no arithmetic; it makes the value assertable.
 /// Pinned by `test_m_step_prior_constants_are_pinned`.
 pub const TAU_0: f64 = 2.0;
+/// Degrees-of-freedom offset `c` in the σ² M-step denominator
+/// `(S(mu) + 2*beta_0*sigma2_cohort) / (W + 2*nu_0 + c)`.
+///
+/// `c = 2` IS Model A, and not by convention. Model A fixes the mean prior's
+/// precision as an ABSOLUTE constant, so it drops BOTH the quadratic numerator
+/// term `kappa_0 (mu - mu_cohort)^2` AND the `-0.5 ln v` normaliser that term
+/// contributed (MSTEP-PRIOR-SPEC-v1.0.md §4). The two go together.
+///
+/// ⚠ CONSEQUENCE, MEASURED (2026-10-13, `em.rs` `#[cfg(test)]`): because this
+/// knob moves the DENOMINATOR ONLY, `c = 3` is **NOT Model B**. It is the
+/// third estimator the repo has already named twice — `+3` with Model A's
+/// numerator. On the closed-form fixture: `c = 3` gives
+/// `0.18919787718575778`, Model B gives `0.19104280102765178`. Model B needs
+/// `tau_0 * (mu - mu_cohort).powi(2)` back in the NUMERATOR as well; the `+3`
+/// alone is not enough. Do not describe a `c != 2` arm as "Model B", and do
+/// not describe `c = 3` as "Model A with the quadratic removed" — the
+/// quadratic is already gone, at every `c`.
+///
+/// So `c` is a simulation / robustness knob for the regularisation strength,
+/// NOT a model selector: the numerator stays Model A's for every `c`, and
+/// nothing here decides which model to ship. That is the production-arm
+/// oracle's call, not this constant's.
+///
+/// DEFAULT LOCKED AT 2.0, and `solve_and_write_profile` is the ONLY place this
+/// name appears — the parameterised entry point takes `c` as an argument, so
+/// there is no second default for the shipped path to drift toward.
+///
+/// NOT BOUND ON THE PYTHON SIDE (recorded, not fixed here):
+/// `reference_em.py:172` holds an independent literal `+ 2.0` in its
+/// `MODEL == "a"` branch. `ci/check_sigma2_constants.py` reads that file's
+/// `NU_0` / `BETA_0` / `TAU_0` / `INSTRUMENTAL_PAL_NOISE_FLOOR` from
+/// `sigma2_constants.toml`, but its Python-literal rule only fires on a line
+/// that STARTS with one of those names, and line 172 starts with `return` — so
+/// that `+ 2.0` is unchecked. Moving this constant off 2.0 and leaving
+/// reference_em.py alone makes the two implementations disagree silently.
+pub const SIGMA2_DOF_OFFSET: f64 = 2.0;
 
 /// Per-transcript parameters loaded from `telescope.emission.parquet`.
 #[derive(Debug, Clone)]
@@ -273,8 +309,125 @@ pub fn load_emission_parameters<P: AsRef<Path>>(
 // The 5' term and the prune bring it to 11 adjacent positional scalars, so the
 // argument-shuffling hazard that note warned about is now realised and the
 // config-struct refactor is overdue rather than merely optional.
+/// The shipped entry point: `solve_and_write_profile_impl` at the default
+/// `SIGMA2_DOF_OFFSET` (2.0, Model A).
+///
+/// This is the ONLY place that constant is named. Every one of the 52 call
+/// sites goes through here, so the shipped path has exactly one `c` and it is
+/// not a parameter any of them can reach past.
 #[allow(clippy::too_many_arguments)]
 pub fn solve_and_write_profile<P: AsRef<Path>>(
+    graph: FlatEvidenceGraph,
+    emission_path: P,
+    sample_id: &str,
+    output_profile_path: P,
+    tol: f64,
+    max_iter: usize,
+    aln_weight_lambda: f64,
+    five_prime_weight: f64,
+    poly_a_weight: f64,
+    five_prime_window: u32,
+    prune_max_delta_as: i32,
+    min_weight: f64,
+    output_em_trace: Option<&mut Vec<(usize, f64, f64)>>,
+    output_emission_params: Option<&mut Vec<Option<TranscriptParam>>>,
+    output_read_assignments: Option<&mut Vec<ReadAssignment>>,
+) -> Result<TelEmStats> {
+    solve_and_write_profile_impl(
+        graph,
+        emission_path,
+        sample_id,
+        output_profile_path,
+        tol,
+        max_iter,
+        aln_weight_lambda,
+        five_prime_weight,
+        poly_a_weight,
+        five_prime_window,
+        prune_max_delta_as,
+        min_weight,
+        output_em_trace,
+        output_emission_params,
+        output_read_assignments,
+        SIGMA2_DOF_OFFSET,
+    )
+}
+
+/// `solve_and_write_profile` with the σ² regularisation degrees-of-freedom
+/// offset `c` supplied by the caller. Same 15 arguments, in the same order,
+/// plus this one.
+///
+/// `c` is the trailing `+ c` of `(S(mu) + 2*beta_0*sigma2_cohort) /
+/// (W + 2*nu_0 + c)`. The NUMERATOR IS NOT A PARAMETER: it stays Model A's
+/// for every `c`. Raising `c` shrinks σ², i.e. sharpens the Gaussian. That is
+/// the whole of what it does — and it is why `c = 3` is NOT Model B, which also
+/// needs the quadratic term back in the numerator. Read `SIGMA2_DOF_OFFSET`
+/// before describing a `c != 2` arm as any named model.
+///
+/// NOT EXPOSED ON THE CLI, deliberately. Every other EM hyper-parameter is a
+/// flag, and none of them is one of the two numbers the simulation oracle
+/// compares arms on; making this one settable from a command line would invite
+/// exactly that. Tests reach it here, and a simulation harness would reach it
+/// here too -- nothing else does today, and this paragraph claims no more than
+/// that. Measured 2026-10-13: the only caller outside this function's own
+/// definition is a test helper, so "the simulation harness reaches it" would be
+/// a wish written in the present tense.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_and_write_profile_with_dof_offset<P: AsRef<Path>>(
+    graph: FlatEvidenceGraph,
+    emission_path: P,
+    sample_id: &str,
+    output_profile_path: P,
+    tol: f64,
+    max_iter: usize,
+    aln_weight_lambda: f64,
+    five_prime_weight: f64,
+    poly_a_weight: f64,
+    five_prime_window: u32,
+    prune_max_delta_as: i32,
+    min_weight: f64,
+    output_em_trace: Option<&mut Vec<(usize, f64, f64)>>,
+    output_emission_params: Option<&mut Vec<Option<TranscriptParam>>>,
+    output_read_assignments: Option<&mut Vec<ReadAssignment>>,
+    sigma2_dof_offset: f64,
+) -> Result<TelEmStats> {
+    // Guard at the boundary, because the failure below is SILENT rather than
+    // loud. A non-positive `c` can drive `W + 2*nu_0 + c` to zero or negative,
+    // and a non-finite one propagates NaN into the denominator; either way the
+    // `.max(INSTRUMENTAL_PAL_NOISE_FLOOR)` below absorbs the result and hands
+    // back a clean-looking 0.04. Measured: `f64::max(NaN, 0.04) == 0.04` and
+    // `f64::max(-1.04, 0.04) == 0.04`. A caller that passed `-2.0` would get a
+    // plausible sigma2 and no error at all.
+    assert!(
+        sigma2_dof_offset.is_finite() && sigma2_dof_offset > 0.0,
+        "sigma2_dof_offset must be finite and positive, got {sigma2_dof_offset}"
+    );
+    solve_and_write_profile_impl(
+        graph,
+        emission_path,
+        sample_id,
+        output_profile_path,
+        tol,
+        max_iter,
+        aln_weight_lambda,
+        five_prime_weight,
+        poly_a_weight,
+        five_prime_window,
+        prune_max_delta_as,
+        min_weight,
+        output_em_trace,
+        output_emission_params,
+        output_read_assignments,
+        sigma2_dof_offset,
+    )
+}
+
+/// The body. `sigma2_dof_offset` is the trailing constant of the σ²
+/// denominator; every other parameter and every other line is unchanged from
+/// the pre-parameterisation code, and at `SIGMA2_DOF_OFFSET` the arithmetic is
+/// bit-identical.
+#[allow(clippy::too_many_arguments)]
+fn solve_and_write_profile_impl<P: AsRef<Path>>(
     graph: FlatEvidenceGraph,
     emission_path: P,
     sample_id: &str,
@@ -313,6 +466,11 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
     // `output_em_trace` one (pushed per iteration): the state being reported is
     // the FINAL iterate, not the trajectory.
     output_read_assignments: Option<&mut Vec<ReadAssignment>>,
+    // Trailing constant `c` of the σ² denominator. Callers reach this through
+    // `solve_and_write_profile` (which supplies `SIGMA2_DOF_OFFSET`) or
+    // `solve_and_write_profile_with_dof_offset` (which validates it first);
+    // nothing else may name this function.
+    sigma2_dof_offset: f64,
 ) -> Result<TelEmStats> {
     // API-LEVEL DEFENCE, per the 2026-10-02 ruling.
     //
@@ -929,8 +1087,15 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
                     //   =>  S(mu) + 2*beta_0*sigma2_cohort = (W + 2*nu_0 + 2) * v
                     // Spec and full derivation:
                     // crates/telescope-core/MSTEP-PRIOR-SPEC-v1.0.md
-                    p.sigma2 =
-                        (sq_dev_new + 2.0 * beta_0 * p.sigma2_cohort) / (w_sum + 2.0 * nu_0 + 2.0);
+                    //
+                    // The trailing `+ 2` is now `sigma2_dof_offset`, which the
+                    // shipped entry point pins to `SIGMA2_DOF_OFFSET == 2.0`.
+                    // The derivation above is for c = 2 specifically; at other
+                    // c it no longer holds, which is why c is a knob and not a
+                    // second estimator. Read the constant's doc comment before
+                    // reading this one.
+                    p.sigma2 = (sq_dev_new + 2.0 * beta_0 * p.sigma2_cohort)
+                        / (w_sum + 2.0 * nu_0 + sigma2_dof_offset);
                     p.sigma2 = p.sigma2.max(INSTRUMENTAL_PAL_NOISE_FLOOR);
                 }
 
@@ -2855,6 +3020,96 @@ mod tests {
             "the sigma2 floor changed; it silently truncates every small-variance \
              transcript and the oracle ranks models against it"
         );
+        assert_eq!(
+            SIGMA2_DOF_OFFSET, 2.0,
+            "SIGMA2_DOF_OFFSET changed; it is the trailing constant of the sigma2 \
+             denominator and 2.0 IS Model A -- Model A drops the quadratic \
+             numerator term AND the -0.5 ln v normaliser together, so +2 and \
+             +3 are not the same model with a knob turned. The knob exists for \
+             the simulation harness; moving it moves the shipped estimator."
+        );
+    }
+
+    /// The "only naming site" invariant, pinned with a red proof.
+    ///
+    /// `solve_and_write_profile`'s doc comment claims it is the ONLY place
+    /// `SIGMA2_DOF_OFFSET` is named, and the pin test above pins only the
+    /// constant's VALUE. Those are two different claims, and the value test does
+    /// not cover the naming one: replacing the forwarder's argument with a
+    /// literal `2.0` leaves the const declared at 2.0, leaves the TOML == Rust
+    /// checker green, and leaves this module green — while the shipped path
+    /// stops reading the declared source at all. Measured on this tree before
+    /// this test existed: that edit turned 117/117 tests green.
+    ///
+    /// So this counts naming sites in PRODUCTION code and pins the count at 2 —
+    /// the declaration, and the one call. Zero means a literal crept into the
+    /// shipped path; three or more means a second path can supply its own `c`.
+    ///
+    /// Two things make the count honest rather than decorative:
+    ///
+    /// - Comments are stripped FIRST. Otherwise the constant's own doc comment
+    ///   satisfies the count and the assertion is a tautology. Same reason
+    ///   `ci/check_sigma2_constants.py` has `strip_comments`.
+    /// - The split anchors on the module header, not on the bare attribute. The
+    ///   string `#[cfg(test)]` alone occurs more than once in this file: once as
+    ///   the module attribute, and once more inside the constant's doc comment
+    ///   prose, which cites where the claim was measured. `rfind` on the bare
+    ///   attribute picks the LATER one, which lands inside this module and makes
+    ///   the slice swallow the pin test above -- the count then reads 4 instead
+    ///   of 2 and this test fails for a reason that has nothing to do with the
+    ///   invariant. The full header is unambiguous.
+    #[test]
+    fn test_the_shipped_entry_point_is_the_only_naming_site_of_the_dof_offset() {
+        let source = include_str!("em.rs");
+        let cut = source
+            .rfind("#[cfg(test)]\nmod tests {")
+            .expect("em.rs has exactly one #[cfg(test)] mod tests block");
+        let production = &source[..cut];
+
+        let mut code = String::new();
+        for line in production.lines() {
+            // A `//` reached before any quote is a comment. KNOWN LIMIT, stated
+            // rather than hidden: this is not a Rust lexer, so a line with `//`
+            // inside a string literal would be truncated and the count could
+            // fall short of 2 and turn this test red for the wrong reason.
+            let head = match line.find("//") {
+                Some(at) if !line[..at].contains('"') => &line[..at],
+                _ => line,
+            };
+            code.push_str(head);
+            code.push('\n');
+        }
+
+        let sites = code.matches("SIGMA2_DOF_OFFSET").count();
+        assert_eq!(
+            sites, 2,
+            "expected exactly 2 naming sites in production code -- the `pub const` \
+             and the single call in `solve_and_write_profile` -- but found {sites}. \
+             1 means the shipped path passes a literal and no longer reads the \
+             declared constant. Comments are excluded, so a doc mention cannot \
+             inflate this count. NOTE: a count of 2 alone does NOT rule out a \
+             third path supplying its own `c` from a literal -- that is what the \
+             call-site assertion below is for."
+        );
+
+        // The name count has a demonstrated blind spot: a third `pub fn` that
+        // calls the impl with a LITERAL `3.0` never mentions the constant, so
+        // the count above stays 2 and this test stays green. Measured, not
+        // assumed -- that is the shape a future simulation arm would take.
+        //
+        // So pin the call sites too. The definition does NOT match this
+        // pattern: it is `fn solve_and_write_profile_impl<P: AsRef<Path>>(`,
+        // so the generic sits between the name and the paren. That is
+        // deliberate -- it means the count below is callers only, which is
+        // exactly what this assertion wants.
+        let callers = code.matches("solve_and_write_profile_impl(").count();
+        assert_eq!(
+            callers, 2,
+            "expected exactly 2 callers of solve_and_write_profile_impl -- the \
+             shipped forwarder and the parameterised entry point -- but found \
+             {callers}. A third caller can supply a literal `c` without ever \
+             naming SIGMA2_DOF_OFFSET, which is invisible to the count above."
+        );
     }
 
     /// Output-stage truncation threshold mirrored from `solve_and_write_profile`.
@@ -3768,6 +4023,514 @@ mod tests {
 
         let _ = std::fs::remove_file(&emission);
         let _ = std::fs::remove_file(&profile);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // σ² REGULARISATION DEGREES-OF-FREEDOM OFFSET `c` (`SIGMA2_DOF_OFFSET`)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// The observation and the cohort prior of the closed-form fixture,
+    /// repeated here so these tests do not depend on a `const` declared inside
+    /// another test's body.
+    const DOF_OFFSET_MU_COHORT: f64 = 7.0;
+    /// `sigma2_cohort` the fixture is built with.
+    const DOF_OFFSET_SIGMA2_COHORT: f64 = 0.5;
+    /// Posterior weight each of the two symmetric candidates receives. It is
+    /// exactly 0.5 because the fixture has one molecule and two candidates with
+    /// EQUAL `AS` and EQUAL `g_k` — the E-step cannot break the tie, at any `c`.
+    const DOF_OFFSET_W: f64 = 0.5;
+
+    /// The closed form, recomputed INDEPENDENTLY from the fixture's documented
+    /// operands rather than read off a run.
+    ///
+    /// `y = (100.0_f32).log2() as f64` = 6.6438560485839844, posterior exactly
+    /// (0.5, 0.5), so `W = 0.5`, `S1 = 0.5*y`, `S2 = 0.5*y*y`. `S1`/`S2` are
+    /// spelled as multiplies rather than `powf` because that is the
+    /// reassociation the E-step's accumulation performs; reassociating them
+    /// moves the last ULP and bit-comparability is this function's whole
+    /// purpose.
+    ///
+    /// MEASURED BIT-EQUALITY, not an assumption: at every `c` in the [1, 5]
+    /// sweep below this returns the solver's `sigma2` bit for bit, including
+    /// `0x3fcd99553b6147ab` at the default. Had it merely agreed to a
+    /// tolerance, the sweep would be worth one ULP and would not have been
+    /// worth writing.
+    fn dof_offset_closed_form(c: f64) -> f64 {
+        let y = (100.0_f32).log2() as f64;
+        let mu = (DOF_OFFSET_W * y + TAU_0 * DOF_OFFSET_MU_COHORT) / (DOF_OFFSET_W + TAU_0);
+        let s1 = DOF_OFFSET_W * y;
+        let s2 = DOF_OFFSET_W * y * y;
+        let sq_dev_new = (s2 - 2.0 * mu * s1 + mu * mu * DOF_OFFSET_W).max(0.0);
+        let numerator = sq_dev_new + 2.0 * BETA_0 * DOF_OFFSET_SIGMA2_COHORT;
+        numerator / (DOF_OFFSET_W + 2.0 * NU_0 + c)
+    }
+
+    /// `(stats, emission_params, em_trace, read_assignments)` from one run of
+    /// the closed-form fixture.
+    ///
+    /// `explicit_c == None` takes the SHIPPED DEFAULT
+    /// (`solve_and_write_profile`, which supplies `SIGMA2_DOF_OFFSET`);
+    /// `Some(c)` takes `solve_and_write_profile_with_dof_offset`. Every
+    /// observable is requested, because the question this exists to answer is
+    /// "did anything at all move", and an out-param that was not requested
+    /// cannot answer it.
+    #[allow(clippy::type_complexity)]
+    fn dof_offset_run(
+        emission: &Path,
+        profile_tag: &str,
+        explicit_c: Option<f64>,
+    ) -> (
+        TelEmStats,
+        Vec<Option<TranscriptParam>>,
+        Vec<(usize, f64, f64)>,
+        Vec<ReadAssignment>,
+    ) {
+        let profile = scratch(&format!("dof_offset_profile_{profile_tag}.parquet"));
+        let cands: [(&str, i32, u32); 2] = [("tx0", 1000, 0), ("tx1", 1000, 0)];
+        let mut params = Vec::new();
+        let mut trace = Vec::new();
+        let mut reads = Vec::new();
+        let stats = match explicit_c {
+            Some(c) => solve_and_write_profile_with_dof_offset(
+                synth_graph_with_gaps((100.0_f32).log2(), &cands),
+                emission,
+                "TEST",
+                &profile,
+                1e-6,
+                2, // max_iter -- see the closed-form test's note; do NOT raise.
+                20.0,
+                FIVE_PRIME_OFF,
+                POLY_A_ON,
+                FIVE_PRIME_WINDOW,
+                PRUNE_MAX_DELTA_AS,
+                MIN_WEIGHT,
+                Some(&mut trace),
+                Some(&mut params),
+                Some(&mut reads),
+                c,
+            ),
+            None => solve_and_write_profile(
+                synth_graph_with_gaps((100.0_f32).log2(), &cands),
+                emission,
+                "TEST",
+                &profile,
+                1e-6,
+                2,
+                20.0,
+                FIVE_PRIME_OFF,
+                POLY_A_ON,
+                FIVE_PRIME_WINDOW,
+                PRUNE_MAX_DELTA_AS,
+                MIN_WEIGHT,
+                Some(&mut trace),
+                Some(&mut params),
+                Some(&mut reads),
+            ),
+        }
+        .unwrap();
+        let _ = std::fs::remove_file(&profile);
+        (stats, params, trace, reads)
+    }
+
+    /// Write the closed-form fixture's emission parquet and hand back its path.
+    fn dof_offset_emission(tag: &str) -> PathBuf {
+        let emission = scratch(&format!("dof_offset_emission_{tag}.parquet"));
+        write_test_emission(
+            &emission,
+            &[
+                (
+                    "tx0",
+                    "gene0",
+                    DOF_OFFSET_MU_COHORT,
+                    DOF_OFFSET_SIGMA2_COHORT,
+                ),
+                (
+                    "tx1",
+                    "gene1",
+                    DOF_OFFSET_MU_COHORT,
+                    DOF_OFFSET_SIGMA2_COHORT,
+                ),
+            ],
+        );
+        emission
+    }
+
+    /// The default must be the shipped Model A estimator, and this says it the
+    /// only way it can be checked without re-deriving anything: run the SAME
+    /// fixture through the parameterised entry point with `c = 2` explicitly,
+    /// and through the default entry point, and require the two to agree to the
+    /// LAST BIT on every observable.
+    ///
+    /// EXACT `to_bits()` EQUALITY, NO TOLERANCE — and this is the assertion
+    /// where the temptation is strongest, because a `< 1e-15` bound here would
+    /// still pass for every `c` within an ULP of 2, which is precisely the
+    /// drift this parameter exists to make impossible. A tolerance would make
+    /// the test a re-implementation of the thing under test.
+    ///
+    /// The comparison is deliberately WIDER than σ² — `mu`, `alpha`,
+    /// `em_accum_weight`, the ids, the flags, the per-iteration EM trace, the
+    /// per-read assignment, and the whole `TelEmStats` — because a `c` that
+    /// reached anything but the denominator would show up in one of those
+    /// first, and a σ²-only test would report it as a σ² regression.
+    #[test]
+    fn test_default_sigma2_dof_offset_is_bit_identical_to_the_named_parameter() {
+        let emission = dof_offset_emission("default");
+        let (stats_a, params_a, trace_a, reads_a) = dof_offset_run(&emission, "default", None);
+        let (stats_b, params_b, trace_b, reads_b) =
+            dof_offset_run(&emission, "default_explicit", Some(2.0));
+        let _ = std::fs::remove_file(&emission);
+
+        // VACUITY GUARDS. Two arms of a comparison agree for free if both are
+        // empty, and every out-param here is a `Vec` that starts empty. If an
+        // arm produced nothing, every loop below would pass without executing
+        // a single comparison.
+        assert_eq!(
+            params_a.len(),
+            2,
+            "arm A must produce both transcripts or the bit-comparison below is vacuous"
+        );
+        assert_eq!(
+            params_b.len(),
+            2,
+            "arm B must produce both transcripts or the bit-comparison below is vacuous"
+        );
+        assert!(
+            !trace_a.is_empty() && !trace_b.is_empty(),
+            "both arms must record an EM trace or the trace comparison is vacuous"
+        );
+        assert_eq!(
+            reads_a.len(),
+            1,
+            "arm A must produce the read assignment or that comparison is vacuous"
+        );
+        assert_eq!(
+            reads_b.len(),
+            1,
+            "arm B must produce the read assignment or that comparison is vacuous"
+        );
+
+        for (i, (pa, pb)) in params_a.iter().zip(params_b.iter()).enumerate() {
+            let pa = pa
+                .as_ref()
+                .unwrap_or_else(|| panic!("arm A row {i} must have params"));
+            let pb = pb
+                .as_ref()
+                .unwrap_or_else(|| panic!("arm B row {i} must have params"));
+            assert_eq!(pa.transcript_id, pb.transcript_id, "row {i} transcript_id");
+            assert_eq!(pa.gene_id, pb.gene_id, "row {i} gene_id");
+            assert_eq!(pa.is_competent, pb.is_competent, "row {i} is_competent");
+            assert_eq!(pa.em_finalized, pb.em_finalized, "row {i} em_finalized");
+            assert_eq!(pa.is_imputed, pb.is_imputed, "row {i} is_imputed");
+            assert_eq!(pa.mu.to_bits(), pb.mu.to_bits(), "row {i} mu (bitwise)");
+            assert_eq!(
+                pa.sigma2.to_bits(),
+                pb.sigma2.to_bits(),
+                "row {i} sigma2 (bitwise); THE DEFAULT MUST BE c = 2 BIT FOR BIT"
+            );
+            assert_eq!(
+                pa.sigma2_cohort.to_bits(),
+                pb.sigma2_cohort.to_bits(),
+                "row {i} sigma2_cohort (bitwise)"
+            );
+            assert_eq!(
+                pa.mu_cohort.to_bits(),
+                pb.mu_cohort.to_bits(),
+                "row {i} mu_cohort (bitwise)"
+            );
+            assert_eq!(
+                pa.alpha.to_bits(),
+                pb.alpha.to_bits(),
+                "row {i} alpha (bitwise)"
+            );
+            assert_eq!(
+                pa.em_accum_weight.to_bits(),
+                pb.em_accum_weight.to_bits(),
+                "row {i} em_accum_weight (bitwise)"
+            );
+        }
+
+        assert_eq!(
+            trace_a.len(),
+            trace_b.len(),
+            "EM trace length differs: {} vs {}",
+            trace_a.len(),
+            trace_b.len()
+        );
+        for (i, ((ai, al, ae), (bi, bl, be))) in trace_a.iter().zip(trace_b.iter()).enumerate() {
+            assert_eq!(ai, bi, "trace[{i}] iteration index");
+            assert_eq!(
+                al.to_bits(),
+                bl.to_bits(),
+                "trace[{i}] log-likelihood (bitwise)"
+            );
+            assert_eq!(
+                ae.to_bits(),
+                be.to_bits(),
+                "trace[{i}] mean entropy (bitwise)"
+            );
+        }
+
+        for (i, (ra, rb)) in reads_a.iter().zip(reads_b.iter()).enumerate() {
+            assert_eq!(ra.read_id, rb.read_id, "read[{i}] read_id");
+            assert_eq!(
+                ra.n_candidates_before_cutoff, rb.n_candidates_before_cutoff,
+                "read[{i}] n_candidates_before_cutoff"
+            );
+            assert_eq!(ra.top_tx_id, rb.top_tx_id, "read[{i}] top_tx_id");
+            assert_eq!(
+                ra.top_weight.to_bits(),
+                rb.top_weight.to_bits(),
+                "read[{i}] top_weight (bitwise)"
+            );
+            assert_eq!(
+                ra.entropy.to_bits(),
+                rb.entropy.to_bits(),
+                "read[{i}] entropy (bitwise)"
+            );
+        }
+
+        // `TelEmStats` derives only `Debug`, and every one of its fields is an
+        // integer, the `CandidateLedger`, or the internally-recorded trace — so
+        // the rendered form is a TOTAL, exact comparison of the whole struct,
+        // and it is total BY NAME: a count added later is compared here without
+        // this test being edited.
+        assert_eq!(
+            stats_a.ledger, stats_b.ledger,
+            "the candidate ledger must be identical between the two arms"
+        );
+        assert_eq!(
+            format!("{stats_a:?}"),
+            format!("{stats_b:?}"),
+            "TelEmStats must be identical between the default and the explicit c = 2 arm"
+        );
+    }
+
+    /// The pre/post receipt. These two bit patterns are what production
+    /// produced BEFORE `sigma2_dof_offset` became a parameter, measured by
+    /// instrumenting this exact fixture and then reverting the instrumentation
+    /// (repo `915394d`, clean tree). They exist so that "the refactor is
+    /// bit-identical at the default" is a claim with a receipt behind it rather
+    /// than an argument from reading the diff.
+    ///
+    /// `0x3fcd99553b6147ab` is `EXPECTED_SIGMA2.to_bits()` for the closed-form
+    /// test above, and `0x401bb70fcccccccd` is `EXPECTED_MU.to_bits()`.
+    #[test]
+    fn test_closed_form_fixture_sigma2_and_mu_are_bit_exact() {
+        let emission = dof_offset_emission("bits");
+        let (_stats, params, _trace, _reads) = dof_offset_run(&emission, "bits", None);
+        let _ = std::fs::remove_file(&emission);
+        let p = params[0]
+            .as_ref()
+            .expect("tx0 must have params in the closed-form fixture");
+
+        // NO TOLERANCE. If this goes red the answer is the ULP distance between
+        // the two patterns, REPORTED — never a widened bound. A tolerance here
+        // would let the exact failure this ticket exists to prevent (a
+        // parameterised `2.0` that quietly computes something adjacent to it)
+        // pass.
+        assert_eq!(
+            p.sigma2.to_bits(),
+            0x3fcd_9955_3b61_47abu64,
+            "sigma2 bit pattern CHANGED. Measured pre-refactor: 0x3fcd99553b6147ab \
+             (got {:#018x}, {:.17}); report the ULP distance between them, do NOT \
+             widen this assertion",
+            p.sigma2.to_bits(),
+            p.sigma2
+        );
+        assert_eq!(
+            p.mu.to_bits(),
+            0x401b_b70f_cccc_cccd_u64,
+            "mu bit pattern CHANGED. Measured pre-refactor: 0x401bb70fcccccccd \
+             (got {:#018x}, {:.17}); report the ULP distance between them, do NOT \
+             widen this assertion",
+            p.mu.to_bits(),
+            p.mu
+        );
+    }
+
+    /// What `c = 3` actually computes — and, more usefully, what it does NOT
+    /// compute.
+    ///
+    /// This arm is written to FAIL for a reason worth noticing rather than to
+    /// pass for a reason worth forgetting:
+    ///
+    /// * the value is compared BITWISE against `dof_offset_closed_form(3.0)`,
+    ///   computed in the test from the fixture's documented operands. An
+    ///   earlier draft compared sigma2(3) only against sigma2(2) being
+    ///   smaller, which any monotone-in-`c` implementation satisfies — including
+    ///   one that ignores `c` entirely and clamps. Comparing against the closed
+    ///   form is what gives the assertion teeth.
+    /// * `c = 3` is NOT Model B, and this asserts that with a number rather than
+    ///   with prose: Model B also restores `tau_0 * (mu - mu_cohort)^2` in the
+    ///   NUMERATOR and lands on `0.19104280102765178`, while the `c` knob moves
+    ///   the denominator only and lands on `0.18919787718575778`. A later reader
+    ///   who describes a `c = 3` arm as "Model B" is contradicting this
+    ///   assertion, not merely using loose language.
+    ///
+    /// FLOOR HEADROOM, stated the way the closed-form test states it. The
+    /// smallest value in the [1, 5] sweep is 0.13874 at `c = 5`, 3.47x
+    /// `INSTRUMENTAL_PAL_NOISE_FLOOR` — clear of clamping, but NOT the 10x
+    /// margin the joint-MAP test demands. So this test does not demand 10x and
+    /// would be wrong to: a wider sweep would reach the floor, and an arm
+    /// clamped at the floor is measuring the floor, not the closed form.
+    #[test]
+    fn test_sigma2_dof_offset_three_is_the_third_estimator_not_model_b() {
+        let emission = dof_offset_emission("c3");
+        let (_s3, params3, _t3, _r3) = dof_offset_run(&emission, "c3", Some(3.0));
+        let (_s2, params2, _t2, _r2) = dof_offset_run(&emission, "c2", Some(2.0));
+        let _ = std::fs::remove_file(&emission);
+        let s3 = params3[0].as_ref().expect("tx0 at c=3").sigma2;
+        let s2 = params2[0].as_ref().expect("tx0 at c=2").sigma2;
+
+        // Bitwise, against the independently derived closed form.
+        assert_eq!(
+            s3.to_bits(),
+            dof_offset_closed_form(3.0).to_bits(),
+            "sigma2 at c = 3 must equal the closed form \
+             (S(mu) + 2*beta_0*sigma2_cohort) / (W + 2*nu_0 + 3) BIT FOR BIT; \
+             got {s3:.17}, closed form {:.17}",
+            dof_offset_closed_form(3.0)
+        );
+        // Pin the value itself, so a change to the fixture or to the closed
+        // form cannot quietly walk BOTH sides of the assertion above at once.
+        assert_eq!(
+            s3.to_bits(),
+            0x3fc8_37a2_d37e_235du64,
+            "sigma2 at c = 3 moved: got {s3:.17} ({:#018x}), expected 0.18919787718575778",
+            s3.to_bits()
+        );
+
+        // `c = 3` is NOT Model B. Recomputed here rather than quoted, so the
+        // distinction survives an edit to the constant or to a prior.
+        let y = (100.0_f32).log2() as f64;
+        let mu = (DOF_OFFSET_W * y + TAU_0 * DOF_OFFSET_MU_COHORT) / (DOF_OFFSET_W + TAU_0);
+        let s1 = DOF_OFFSET_W * y;
+        let s2_sum = DOF_OFFSET_W * y * y;
+        let sq_dev_new = (s2_sum - 2.0 * mu * s1 + mu * mu * DOF_OFFSET_W).max(0.0);
+        let model_b = (sq_dev_new
+            + TAU_0 * (mu - DOF_OFFSET_MU_COHORT).powi(2)
+            + 2.0 * BETA_0 * DOF_OFFSET_SIGMA2_COHORT)
+            / (DOF_OFFSET_W + 2.0 * NU_0 + 3.0);
+        assert_eq!(
+            model_b.to_bits(),
+            0x3fc8_7417_2b46_6663u64,
+            "the Model B reference moved: got {model_b:.17}. Re-derive it before \
+             trusting the comparison below"
+        );
+        assert_ne!(
+            s3.to_bits(),
+            model_b.to_bits(),
+            "c = 3 has become Model B. The knob moves the DENOMINATOR only; Model B \
+             also needs tau_0*(mu - mu_cohort)^2 back in the numerator, and the two \
+             land on different values ({s3} vs {model_b}). Either the numerator was \
+             parameterised too, or this arm is no longer the estimator it claims."
+        );
+
+        // Directional, and the whole reason the knob exists.
+        assert!(
+            s3 < s2,
+            "sigma2 must SHRINK as c grows: sigma2(3) = {s3} is not below \
+             sigma2(2) = {s2}"
+        );
+
+        // Floor headroom, asserted rather than assumed (see the doc comment).
+        assert!(
+            s3 > INSTRUMENTAL_PAL_NOISE_FLOOR * 2.0,
+            "sigma2 at c = 3 is {s3}, within 2x INSTRUMENTAL_PAL_NOISE_FLOOR \
+             ({INSTRUMENTAL_PAL_NOISE_FLOOR}); the floor would be clamping and this \
+             arm would be measuring the floor rather than the closed form"
+        );
+    }
+
+    /// σ² is strictly decreasing in `c` over [1, 5], and every point equals the
+    /// closed form bit for bit.
+    ///
+    /// A NON-MONOTONE SWEEP IS A BUG, NOT A RESULT — the shape that is easiest
+    /// to write down as a finding, which is why the failure message says what
+    /// to do instead. The arithmetic says `sigma2 = N / (W + 2*nu_0 + c)` with
+    /// `N` positive and `c`-independent, hence strictly decreasing; any other
+    /// shape means `c` reached something it should not have — the E-step's
+    /// weights, `mu`, or the floor. `N` is `c`-independent HERE because the two
+    /// candidates are symmetric, so the posterior is pinned at (0.5, 0.5) for
+    /// every `c`. On an asymmetric fixture `N` would move with `c` and this
+    /// test's premise would no longer hold.
+    #[test]
+    fn test_sigma2_is_strictly_decreasing_over_the_c_sweep() {
+        let sweep = [1.0f64, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0];
+        let emission = dof_offset_emission("sweep");
+        let mut measured = Vec::new();
+        for (i, c) in sweep.iter().enumerate() {
+            let (_stats, params, _trace, _reads) =
+                dof_offset_run(&emission, &format!("sweep{i}"), Some(*c));
+            let s = params[0].as_ref().expect("tx0").sigma2;
+            // EVERY point against the closed form, not just the endpoints.
+            assert_eq!(
+                s.to_bits(),
+                dof_offset_closed_form(*c).to_bits(),
+                "sigma2 at c = {c} must equal the closed form BIT FOR BIT; got \
+                 {s:.17}, closed form {:.17}",
+                dof_offset_closed_form(*c)
+            );
+            measured.push((c, s));
+        }
+        let _ = std::fs::remove_file(&emission);
+
+        for w in measured.windows(2) {
+            let (c_lo, s_lo) = w[0];
+            let (c_hi, s_hi) = w[1];
+            assert!(
+                s_hi < s_lo,
+                "sigma2 must be STRICTLY decreasing in c, but sigma2({c_hi}) = {s_hi} \
+                 is not below sigma2({c_lo}) = {s_lo}. A flat or rising step means `c` \
+                 reached the E-step, mu, or the noise floor -- investigate before \
+                 writing this down as a result."
+            );
+        }
+        let floor_ratio =
+            measured.last().expect("the sweep is non-empty").1 / INSTRUMENTAL_PAL_NOISE_FLOOR;
+        assert!(
+            floor_ratio > 2.0,
+            "the sweep's minimum sigma2 is {floor_ratio}x the noise floor; below \
+             roughly 2x, the low end of this sweep would be measuring \
+             INSTRUMENTAL_PAL_NOISE_FLOOR rather than the closed form"
+        );
+    }
+
+    /// The boundary guard, and why it has to exist: `f64::max` ABSORBS the
+    /// failure. Measured: `f64::max(f64::NAN, 0.04) == 0.04` and
+    /// `f64::max(-1.04, 0.04) == 0.04`. So a `c` of `-2.5`, `0.0` or `NaN`
+    /// makes `W + 2*nu_0 + c` zero, negative or NaN, and the M-step's
+    /// `.max(INSTRUMENTAL_PAL_NOISE_FLOOR)` hands back a perfectly plausible
+    /// `0.04` with no error anywhere. Without the guard a caller would get a
+    /// clean-looking sigma2 and no signal that it was wrong.
+    ///
+    /// `c = -2.5` is the exact zero case here: `W = 0.5` and `2*nu_0 = 2`.
+    #[test]
+    #[should_panic(expected = "sigma2_dof_offset must be finite and positive")]
+    fn test_sigma2_dof_offset_guard_rejects_the_exact_denominator_zero() {
+        let emission = dof_offset_emission("guard");
+        let _ = dof_offset_run(&emission, "guard", Some(-2.5));
+    }
+
+    /// The guard must refuse `NaN` too, and `NaN` is the case every `> 0.0`
+    /// comparison silently passes: `NaN > 0.0` is false, `NaN <= 0.0` is false,
+    /// and `NaN.is_nan()` is the only test that sees it. Spelling the guard as
+    /// `c > 0.0` alone would let it through and hand the caller the noise floor.
+    #[test]
+    #[should_panic(expected = "sigma2_dof_offset must be finite and positive")]
+    fn test_sigma2_dof_offset_guard_rejects_nan() {
+        let emission = dof_offset_emission("guard_nan");
+        let _ = dof_offset_run(&emission, "guard_nan", Some(f64::NAN));
+    }
+
+    /// And `+inf`, which passes every finiteness test written as a comparison
+    /// but drives the quotient to zero rather than to NaN — a silent collapse to
+    /// the floor all the same.
+    #[test]
+    #[should_panic(expected = "sigma2_dof_offset must be finite and positive")]
+    fn test_sigma2_dof_offset_guard_rejects_infinity() {
+        let emission = dof_offset_emission("guard_inf");
+        let _ = dof_offset_run(&emission, "guard_inf", Some(f64::INFINITY));
     }
 
     /// Re-read a sidecar written by `write_emission_params_parquet`: the
