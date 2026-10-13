@@ -15,6 +15,26 @@ use clap::{Parser, Subcommand};
 use telescope_core::emission_model::FallbackConfig;
 use telescope_core::{anchor_builder, em, emission_model, evidence, resolver, summary};
 
+mod ledger_json;
+
+/// Write the record-level ledger if `--ledger` was given.
+///
+/// Attached to each Module-2 exit rather than inside `print_filter_ledger`,
+/// because that function prints and this one writes, and a stderr ledger is
+/// not readable by the scrapers that consume this artifact. `None` is the
+/// default, so the common path costs one `Option` test.
+fn maybe_write_filter_ledger(
+    path: Option<&PathBuf>,
+    stats: &telescope_core::evidence::FilterCounts,
+) -> Result<()> {
+    if let Some(p) = path {
+        ledger_json::write_filter(p, stats)
+            .with_context(|| format!("failed to write --ledger {}", p.display()))?;
+        eprintln!("[telescope]  filter ledger: {}", p.display());
+    }
+    Ok(())
+}
+
 /// The `--polyA-source` argument, shared verbatim by `extract-evidence` and
 /// `quant` so the two subcommands cannot drift apart.
 const POLY_A_SOURCE_HELP: &str = "Where per-read poly(A) length comes from: \
@@ -243,6 +263,20 @@ enum Cmd {
             help = POLY_A_SOURCE_HELP
         )]
         poly_a_source: String,
+
+        /// Write the record-level filter ledger here as JSON
+        /// (`telescope.filter_ledger/v1`).
+        ///
+        /// OPT-IN, not a default sidecar: `--provenance-out` on
+        /// `build-emission` writes by default, and a second flag with the
+        /// opposite default invites a reader to assume both run. The path is
+        /// explicit so the record-level and anchor-level ledgers cannot land in
+        /// one file — they are different stages with different denominators,
+        /// and a single merged document would invite exactly the "summed the
+        /// two totals" mistake the schema's two top-level keys exist to
+        /// prevent.
+        #[arg(long)]
+        ledger: Option<PathBuf>,
     },
 
     /// Modules 2 + 3: BAM → evidence → TEL-EM profile.
@@ -280,6 +314,16 @@ enum Cmd {
             help = POLY_A_SOURCE_HELP
         )]
         poly_a_source: String,
+
+        /// Write the record-level filter ledger here as JSON
+        /// (`telescope.filter_ledger/v1`). See `extract-evidence --ledger`.
+        ///
+        /// `quant` runs the same Module-2 filter chain as `extract-evidence`,
+        /// so its ledger describes the same population; the profile it writes
+        /// is built from those records, and without this the only trace of the
+        /// drop is a stderr block that no later script can read back.
+        #[arg(long)]
+        ledger: Option<PathBuf>,
 
         /// EM log-likelihood convergence tolerance (per-molecule average LL).
         #[arg(long, default_value_t = 1e-6)]
@@ -507,6 +551,17 @@ enum Cmd {
         /// Per-sample read cap per transcript (default 200).
         #[arg(long, default_value_t = 200)]
         max_reads_per_sample: usize,
+
+        /// Write the anchor-level filter ledger here as JSON
+        /// (`telescope.filter_ledger/v1`).
+        ///
+        /// This is the ONLY subcommand with an anchor-level ledger, because it
+        /// is the only one that produces `AnchorStats`. The record-level ledger
+        /// belongs to `extract-evidence` / `quant` / `resolve-evidence`; the
+        /// two are different populations (records entering Module 2 vs records
+        /// entering the anchor scan) and must go to different files.
+        #[arg(long)]
+        ledger: Option<PathBuf>,
     },
 
     /// Module 0: Resolve cohort-level transcript evidence (Tier A/B/C,
@@ -544,6 +599,15 @@ enum Cmd {
         /// Output `telescope.transcript_evidence.parquet`.
         #[arg(long)]
         output: PathBuf,
+
+        /// Write the record-level filter ledger here as JSON
+        /// (`telescope.filter_ledger/v1`). See `extract-evidence --ledger`.
+        ///
+        /// For a cohort this is the field-wise SUM over the input BAMs, so
+        /// `records_entered` is the union of the inputs and not any one
+        /// sample's count.
+        #[arg(long)]
+        ledger: Option<PathBuf>,
     },
 }
 
@@ -754,6 +818,7 @@ fn main() -> Result<()> {
             bam,
             tes_slack,
             poly_a_source,
+            ledger,
         } => {
             let poly_a = evidence::parse_poly_a_source(&poly_a_source)?;
             eprintln!("[telescope] Module 2: extracting single-molecule evidence");
@@ -777,6 +842,7 @@ fn main() -> Result<()> {
                 .map(|m| m.candidate_count as u64)
                 .sum();
             print_filter_ledger(&graph.stats, "[telescope]  ");
+            maybe_write_filter_ledger(ledger.as_ref(), &graph.stats)?;
             let avg = if graph.molecules.is_empty() {
                 0.0
             } else {
@@ -805,6 +871,7 @@ fn main() -> Result<()> {
             debug,
             read_assignments,
             dump_emission_params,
+            ledger,
         } => {
             let poly_a = evidence::parse_poly_a_source(&poly_a_source)?;
             // `--polyA-source none` fills `log_pal` with a placeholder, not a
@@ -929,6 +996,7 @@ fn main() -> Result<()> {
             }
             eprintln!("[telescope]    molecules:      {}", graph.molecules.len());
             print_filter_ledger(&graph.stats, "[telescope]    ");
+            maybe_write_filter_ledger(ledger.as_ref(), &graph.stats)?;
             eprintln!(
                 "[telescope]    transcripts:    {}",
                 graph.transcript_names.len()
@@ -1321,6 +1389,7 @@ fn main() -> Result<()> {
             tes_slack,
             min_coverage,
             max_reads_per_sample,
+            ledger,
         } => {
             if bams.len() != sample_ids.len() {
                 anyhow::bail!(
@@ -1358,6 +1427,11 @@ fn main() -> Result<()> {
             )
             .context("anchor_builder::build_anchor_pool failed")?;
             eprintln!("[telescope]  {}", stats.report());
+            if let Some(p) = ledger.as_ref() {
+                ledger_json::write_anchor(p, &stats)
+                    .with_context(|| format!("failed to write --ledger {}", p.display()))?;
+                eprintln!("[telescope]  anchor ledger: {}", p.display());
+            }
             // The `tx_to_gene entries: 0` line above and this one are far apart,
             // and neither of them, alone, says what L2=0 downstream will mean.
             // Say it here, where the pool that caused it was just written.
@@ -1378,6 +1452,7 @@ fn main() -> Result<()> {
             tes_cluster_radius,
             tes_slack,
             output,
+            ledger,
         } => {
             if bams.len() != sample_ids.len() {
                 anyhow::bail!(
@@ -1415,6 +1490,7 @@ fn main() -> Result<()> {
                 graph.candidate_pool.len(),
             );
             print_filter_ledger(&graph.stats, "[telescope]  ");
+            maybe_write_filter_ledger(ledger.as_ref(), &graph.stats)?;
 
             // Load transcript→gene mapping (TSV) → HashMap<String, String>.
             let tx_to_gene_map: std::collections::HashMap<String, String> = match tx_to_gene {

@@ -459,6 +459,19 @@ pub struct SampleStats {
 pub struct AnchorStats {
     pub samples: usize,
     pub total_records: u64,
+    /// Records the BAM decoder could not read at all, summed over samples.
+    ///
+    /// A DISJOINT POPULATION, deliberately excluded from `unaccounted()`:
+    /// it is incremented BEFORE `total_records`, so folding it into the
+    /// identity's right-hand side would make the deficit read -1 for every
+    /// parse failure -- a number that looks like a tunable bias rather than a
+    /// bookkeeping mistake. Round 65 decision 2.
+    ///
+    /// Added 2026-10-13 (Ticket 2C) because the frozen ledger schema requires
+    /// it and `SampleStats` already counted it per sample; without this field
+    /// the cohort-level ledger was blind to a population that leaves the
+    /// stream before the LHS is even incremented.
+    pub parse_errors: u64,
     pub filtered_unique: u64,
     /// See [`SampleStats::filtered_no_refid`].
     pub filtered_no_refid: u64,
@@ -488,6 +501,7 @@ impl AnchorStats {
     fn add(&mut self, s: &SampleStats) {
         self.samples += 1;
         self.total_records += s.total_records;
+        self.parse_errors += s.parse_errors;
         self.filtered_unique += s.filtered_unique;
         self.filtered_no_refid += s.filtered_no_refid;
         self.filtered_no_position += s.filtered_no_position;
@@ -564,10 +578,16 @@ impl AnchorStats {
     /// `total_records` minus every bucket that is supposed to absorb a record.
     ///
     /// This is the number that must be 0 for the ledger to be conservative.
-    /// It is printed rather than asserted: Ticket 2B adds the test, and until
-    /// that test exists a hard `assert_eq!` here would be a claim without a
-    /// falsification proof. `parse_errors` is deliberately NOT in this sum --
-    /// it is incremented before `total_records`, so it is a disjoint
+    /// Ticket 2B added the test that enforces it (`249675a` widened the
+    /// covered paths to 9/10); the `debug_assert!` below is a dev-time
+    /// tripwire for the one direction `saturating_sub` cannot report, and it
+    /// compiles out under `--release`, which is how `ci/gates.sh` runs.
+    ///
+    /// `parse_errors` is deliberately NOT in this sum. It IS aggregated onto
+    /// this struct now (Ticket 2C, for the frozen ledger schema), so a reader
+    /// meeting the field in `filter_ledger.json` will not conclude it was
+    /// never counted -- it was counted and then deliberately excluded, because
+    /// it is incremented BEFORE `total_records` and is therefore a disjoint
     /// population.
     pub fn unaccounted(&self) -> u64 {
         let bucket_sum = self.filtered_unique
@@ -1079,6 +1099,7 @@ mod tests {
         let agg = AnchorStats {
             samples: 1,
             total_records: 100,
+            parse_errors: 7,
             filtered_unique: 10,
             filtered_no_refid: 3,
             filtered_no_position: 4,
