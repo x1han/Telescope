@@ -1030,6 +1030,161 @@ pub mod test_support {
             .build()
     }
 
+    /// As [`synth_record`], but with NO reference sequence id at all: the
+    /// builder's `set_reference_sequence_id` is simply never called, so the
+    /// encoded record carries tid = -1.
+    ///
+    /// Added 2026-10-13 (Ticket 2B-Fix). Until then this shape was recorded as
+    /// unreachable, on the strength of `bam::io::Writer` raising
+    /// `InvalidReferenceSequenceId`. That error is the `Some(id)`-out-of-range
+    /// branch. Having NO tid is a distinct, supported encoding, and it is what
+    /// `RNAME=*` produces in a SAM file -- measured through samtools 1.24 on
+    /// 2026-10-13:
+    ///
+    /// ```text
+    ///   norid  flag=4  rname=*  pos=0  mapq=60  cigar=2000M
+    /// ```
+    ///
+    /// Note samtools forces FLAG 4 here and KEEPS MAPQ, which is what lets the
+    /// record clear the `MAPQ < 20` gate and die at `reference_sequence_id()`
+    /// instead, one line further down. The MAPQ gate's position in the chain is
+    /// load-bearing for this fixture: a record that died earlier would land in
+    /// `filtered_unique` and prove nothing.
+    ///
+    /// Reproduce that receipt (samtools 1.24):
+    ///
+    /// ```bash
+    /// printf '@SQ\tSN:tx0\tLN:2000\nnorid\t0\t*\t0\t60\t2000M\t*\t0\t0\t%s\t%s\tpt:i:100\n' \
+    ///   "$(printf 'A%.0s' {1..2000})" "$(printf 'I%.0s' {1..2000})" > /tmp/n.sam
+    /// samtools view -b -o /tmp/n.bam /tmp/n.sam
+    /// samtools view /tmp/n.bam | cut -f1-6
+    /// # norid  4  *  0  60  2000M
+    /// ```
+    pub fn synth_record_no_refid(
+        name: &str,
+        as_score: Option<i32>,
+        nm: i32,
+        mapq: u8,
+    ) -> RecordBuf {
+        let cigar: Cigar = [Op::new(Kind::Match, REF_LEN)].into_iter().collect();
+        let mut tags = vec![(TAG_PT, Value::from(100i32)), (TAG_NM, Value::from(nm))];
+        if let Some(a) = as_score {
+            tags.push((TAG_AS, Value::from(a)));
+        }
+        RecordBuf::builder()
+            .set_name(name)
+            .set_flags(Flags::empty())
+            .set_alignment_start(Position::new(1).expect("1-based and non-zero"))
+            .set_mapping_quality(MappingQuality::new(mapq).unwrap())
+            .set_cigar(cigar)
+            .set_data(tags.into_iter().collect())
+            .build()
+    }
+
+    /// As [`synth_record`], but with NO read name: `set_name` is never called.
+    ///
+    /// The mirror image of [`synth_record_no_refid`], and reachable for the same
+    /// reason -- `QNAME=*` is legal SAM and survives the round trip through
+    /// samtools verbatim (measured 2026-10-13, samtools 1.24):
+    ///
+    /// ```text
+    ///   *       flag=0  rname=tx0  pos=1  mapq=60  cigar=2000M
+    /// ```
+    ///
+    /// Reproduce (samtools 1.24): same SAM as above with the QNAME column set
+    /// to `*` instead of the RNAME:
+    ///
+    /// ```bash
+    /// printf '@SQ\tSN:tx0\tLN:2000\n*\t0\ttx0\t1\t60\t2000M\t*\t0\t0\t%s\t%s\tpt:i:100\n' \
+    ///   "$(printf 'A%.0s' {1..2000})" "$(printf 'I%.0s' {1..2000})" > /tmp/n.sam
+    /// samtools view -b -o /tmp/n.bam /tmp/n.sam
+    /// samtools view /tmp/n.bam | cut -f1-6
+    /// # *  0  tx0  1  60  2000M
+    /// ```
+    ///
+    /// ⭐ THIS ONE MATTERS DOWNSTREAM: samtools text output PRESERVES `*` as
+    /// QNAME. So `recompute_anchor_filters` in
+    /// `workspace/validation/benchmark/dseta_step0_5/run_dseta_step0_5.py` CAN
+    /// check `filtered_no_read_id` on the text side (`f[0] == "*"`) — it is not
+    /// a structural blind spot of the text projection. An earlier claim in the
+    /// Round 71 erratum said it was; that claim was wrong.
+    ///
+    /// Note this record keeps FLAG 0 and a valid tid, so it clears every filter
+    /// up to `record.name()` -- which is the point. It dies at the LAST branch,
+    /// the one that discards a record it could otherwise have written to the
+    /// pool, so a missing name is a silent loss unless something counts it.
+    pub fn synth_record_no_read_id(
+        ref_id: usize,
+        as_score: Option<i32>,
+        nm: i32,
+        mapq: u8,
+    ) -> RecordBuf {
+        let cigar: Cigar = [Op::new(Kind::Match, REF_LEN)].into_iter().collect();
+        let mut tags = vec![(TAG_PT, Value::from(100i32)), (TAG_NM, Value::from(nm))];
+        if let Some(a) = as_score {
+            tags.push((TAG_AS, Value::from(a)));
+        }
+        RecordBuf::builder()
+            .set_flags(Flags::empty())
+            .set_reference_sequence_id(ref_id)
+            .set_alignment_start(Position::new(1).expect("1-based and non-zero"))
+            .set_mapping_quality(MappingQuality::new(mapq).unwrap())
+            .set_cigar(cigar)
+            .set_data(tags.into_iter().collect())
+            .build()
+    }
+
+    /// As [`synth_record`], but with NO alignment start: `set_alignment_start`
+    /// is never called, so the encoder writes POS = 0 and the decoder's
+    /// `Position::new(0)` fails.
+    ///
+    /// Added 2026-10-13 (Ticket 2B-Fix). This is the third of the three
+    /// "omitted setter" fixtures, and the least obvious of them:
+    ///
+    /// > `Position::new(0)` is an INVALID RUST VALUE — positions are 1-based —
+    /// > so `set_alignment_start` cannot be given one. It looks like POS = 0 is
+    /// > unrepresentable.
+    ///
+    /// It is not. The constraint is on the *Rust* constructor, not on the
+    /// encoding: an unset field is written as 0, and the decoder cannot turn 0
+    /// into a `Position`. The two facts face each other and the path is open.
+    ///
+    /// WHAT IS ON THE WIRE, measured 2026-10-13 (samtools 1.24). It is `0`,
+    /// NOT a `-1` sentinel — which is how the tid case encodes absence, and the
+    /// two are NOT the same mechanism:
+    ///
+    /// ```text
+    /// QNAME='nopos' FLAG=0 RNAME='tx0' POS='0' MAPQ=60 CIGAR='2000M'
+    /// ```
+    ///
+    /// Compare `synth_record_no_refid`, which samtools renders `rname=*`
+    /// because tid = -1 is a real sentinel in the format. Anyone generalising
+    /// from that case to this one will predict `pos=*` and be wrong.
+    ///
+    /// Requires a valid `ref_id`: `reference_sequence_id()` is checked BEFORE
+    /// `alignment_start()`, so a record with no tid would land in
+    /// `filtered_no_refid` and never reach this branch.
+    pub fn synth_record_no_position(
+        ref_id: usize,
+        as_score: Option<i32>,
+        nm: i32,
+        mapq: u8,
+    ) -> RecordBuf {
+        let cigar: Cigar = [Op::new(Kind::Match, REF_LEN)].into_iter().collect();
+        let mut tags = vec![(TAG_PT, Value::from(100i32)), (TAG_NM, Value::from(nm))];
+        if let Some(a) = as_score {
+            tags.push((TAG_AS, Value::from(a)));
+        }
+        RecordBuf::builder()
+            .set_name("nopos")
+            .set_flags(Flags::empty())
+            .set_reference_sequence_id(ref_id)
+            .set_mapping_quality(MappingQuality::new(mapq).unwrap())
+            .set_cigar(cigar)
+            .set_data(tags.into_iter().collect())
+            .build()
+    }
+
     /// As [`synth_record_with_gap`], but with an explicit leading CIGAR.
     ///
     /// `leading` are the ops that sit 5' of the first `Match`, given as

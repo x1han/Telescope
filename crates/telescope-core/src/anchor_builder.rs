@@ -527,9 +527,20 @@ impl AnchorStats {
     /// `ΔAS` prune reached no bucket on 2026-10-06.
     ///
     /// What actually kept the Dataset A scraper green was simpler than a
-    /// bookkeeping accident: those four paths never fire on a BAM minimap2
-    /// writes. The identity was observably holding on this data. What it was
-    /// NOT was *guaranteed* -- and no test asserted it.
+    /// bookkeeping accident: on the BAMs this project actually has, those four
+    /// paths do not fire. That is a statement about PRODUCTION DATA, not about
+    /// what is constructible -- the two came apart on 2026-10-13, when three of
+    /// the four were shown to be reachable through ordinary fixtures, and one
+    /// (`filtered_no_reflen`) still has no attempt against it. See the
+    /// CORRECTION block in this file's test module.
+    ///
+    /// The production claim rests on measured facts recorded at `SampleStats`:
+    /// every unmapped record carries MAPQ 0, so it dies at the MAPQ gate before
+    /// reaching `reference_sequence_id()`. Reproduce with the `samtools`
+    /// commands quoted on that field. On HC2 all three new buckets are 0.
+    ///
+    /// The identity was observably holding on this data. What it was NOT was
+    /// *guaranteed* -- and, before Ticket 2B, no test asserted it.
     pub fn report(&self) -> String {
         format!(
             "samples={} total={} filtered(unique={} no_reflen={} 3p_anchor={} coverage={} \
@@ -605,7 +616,10 @@ impl AnchorStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::evidence::test_support::{synth_record, synth_record_with_gap, write_synthetic_bam};
+    use crate::evidence::test_support::{
+        synth_record, synth_record_no_position, synth_record_no_read_id, synth_record_no_refid,
+        synth_record_with_gap, write_synthetic_bam,
+    };
 
     #[test]
     fn test_anchor_stats_aggregation() {
@@ -810,27 +824,52 @@ mod tests {
     // with all three new buckets at 0 -- but nothing enforced it. The gap was
     // auditability, not a wrong number.
     //
-    // WHAT THIS FIXTURE COVERS, AND WHAT IT CANNOT. Six of the ten terminal
-    // paths are reachable from a synthetic BAM. The other four are NOT, and the
-    // fixture says so out loud rather than implying full coverage:
+    // === CORRECTION 2026-10-13 (Ticket 2B-Fix) ============================
     //
-    //   filtered_no_refid     -- needs a record whose tid is absent from the
-    //                             header. `bam::io::Writer` refuses to emit one
-    //                             (`InvalidReferenceSequenceId`), so the record
-    //                             cannot be constructed at all.
-    //   filtered_no_position  -- needs `alignment_start/end` to decode to None
-    //                             on a record the writer accepted.
-    //   filtered_no_read_id   -- needs `record.name()` to be None.
-    //   filtered_no_reflen    -- `ref_len` is built FROM the header, so a
-    //                             reference that survived `reference_sequence_id`
-    //                             always has a non-zero length.
+    // The paragraph below used to read "Six of the ten terminal paths are
+    // reachable from a synthetic BAM. The other four are NOT." THAT WAS WRONG,
+    // TWICE, and both errors are worth keeping because they are the same error.
     //
-    // Those four are covered statically instead, by
+    //   ERROR 1. The `bam::io::Writer` error I cited --
+    //   `InvalidReferenceSequenceId(MissingEntry { actual: 99, expected: 3 })`
+    //   -- is the `Some(id)`-OUT-OF-RANGE branch. Having NO tid is a separate,
+    //   supported encoding (tid = -1), and it is what `RNAME=*` produces.
+    //
+    //   ERROR 2. Having corrected error 1 I then wrote that
+    //   `filtered_no_position` was still unreachable, reasoning that "POS is a
+    //   fixed-width mandatory BAM field, so 'absent' has no encoding". That is
+    //   wrong too. The constraint is on the RUST CONSTRUCTOR --
+    //   `Position::new(0)` is invalid because positions are 1-based -- not on
+    //   the encoding. An unset field is written as 0, and 0 is precisely what
+    //   `alignment_start()` cannot turn into a `Position`.
+    //
+    //   In both cases I read a real, specific library fact and generalised it
+    //   one step past what it said. The error message described a different
+    //   branch; the invalid constructor described a different layer. Specific
+    //   is not the same as correct.
+    //
+    // REACHABILITY IS NOW 9/10, enforced by
+    // `test_the_three_observable_drop_paths_really_execute` below.
+    //
+    // WHAT THIS FIXTURE COVERS. Six of the ten terminal paths. The other four:
+    //
+    //   filtered_no_refid     -- REACHABLE, covered by the 9/10 test
+    //                             (`synth_record_no_refid`).
+    //   filtered_no_position  -- REACHABLE, covered by the 9/10 test
+    //                             (`synth_record_no_position`).
+    //   filtered_no_read_id   -- REACHABLE, covered by the 9/10 test
+    //                             (`synth_record_no_read_id`).
+    //   filtered_no_reflen    -- NOT TESTED. No attempt was made. `ref_len` is
+    //                             built from the header, whose lengths are
+    //                             `NonZero`; that is a statement about a
+    //                             constructor, not a failed attempt, and it is
+    //                             labelled as one.
+    //
+    // The remaining one is covered statically by
     // `workspace/comms/2026-10-13-round68-closeout/pkg/scripts/audit_record_conservation.py`,
     // which does not depend on being able to construct a record. Neither tool is
     // in `gates.sh` today; that is a deliberate standing decision, not an
-    // oversight. If those four ever become fixture-reachable, this comment is
-    // the thing to update.
+    // oversight.
 
     /// Σ of every bucket that is supposed to absorb a record.
     fn counted_buckets(s: &SampleStats) -> u64 {
@@ -930,12 +969,106 @@ mod tests {
         let _ = std::fs::remove_file(&bam);
     }
 
+    /// Reachability is 9/10, and this is the test that says so.
+    ///
+    /// Ticket 2B asserted that FOUR of the ten terminal paths could not be
+    /// reached by any fixture, on the strength of `bam::io::Writer` raising
+    /// `InvalidReferenceSequenceId`. That error is the `Some(id)`-out-of-range
+    /// branch; having NO tid is a different, supported encoding. Ticket 2B-Fix
+    /// then recorded `filtered_no_position` as still unreachable, reasoning
+    /// that POS has no encoding for "absent". **That reasoning was also wrong**
+    /// — see `synth_record_no_position` for why, and for the fix. Three of the
+    /// four execute; the test below exercises all three in one composition:
+    ///
+    /// ```text
+    /// total=6  no_refid=1  no_position=1  no_read_id=1  3p_anchor=1  passed=2
+    /// ```
+    ///
+    /// ## The one that remains
+    ///
+    /// `filtered_no_reflen` fires when `ref_len.get(&ref_id)` returns 0. It is
+    /// NOT TESTED — no attempt was made — and the reason it is not merely
+    /// "hard" is that `ref_len` is built from the header, whose lengths are
+    /// `NonZero`. **That is a library statement about a constructor, not a
+    /// proof that I tried**, and it is labelled as one. If a route exists, this
+    /// comment is where it belongs.
+    #[test]
+    fn test_the_three_observable_drop_paths_really_execute() {
+        let recs = vec![
+            synth_record("ok0", 0, None, 0, 60), // -> passed
+            synth_record("ok1", 1, None, 0, 60), // -> passed
+            // No tid. MAPQ 60 clears the MAPQ gate, so it dies at
+            // reference_sequence_id() rather than one line earlier.
+            synth_record_no_refid("norid", None, 0, 60), // -> filtered_no_refid
+            // Valid tid, MAPQ 60, POS never set -> encoder writes 0 ->
+            // alignment_start() cannot make a Position.
+            synth_record_no_position(2, None, 0, 60), // -> filtered_no_position
+            // No QNAME, valid tid, FLAG 0: clears every filter but the last.
+            synth_record_no_read_id(0, None, 0, 60), // -> filtered_no_read_id
+            // reverse + gap => 3' end lands short of the TES by more than
+            // tes_slack, so this exercises a FOURTH bucket and keeps the
+            // per-bucket expectations from being three-field trivial.
+            synth_record_with_gap("gap3p", 1, 100, true, None, 0, 60), // -> filtered_3p_anchor
+        ];
+
+        let bam = write_synthetic_bam("reach", recs);
+        let (anchors, s) =
+            extract_anchors_from_bam(&bam, "reach", &TxToGene::new(), 35, 0.80, 200).unwrap();
+
+        // --- THE INVARIANT, FIRST ------------------------------------------
+        // Same ordering rule as `test_anchor_record_conservation`, and for the
+        // same reason: the identity holds for ANY input as long as every drop
+        // is counted, so it must be the thing that reports an uncounted drop
+        // rather than a fixture expectation noticing a number moved.
+        assert_eq!(
+            s.total_records,
+            counted_buckets(&s) + s.passed,
+            "a record left the stream through an uncounted path: \
+             total_records={} counted={} passed={}",
+            s.total_records,
+            counted_buckets(&s),
+            s.passed
+        );
+
+        // The whole point of this test: these three are NON-ZERO on a real BAM.
+        assert_eq!(s.total_records, 6);
+        assert_eq!(s.passed, 2);
+        assert_eq!(
+            s.filtered_no_refid, 1,
+            "a record with no tid must reach filtered_no_refid, not filtered_unique"
+        );
+        assert_eq!(
+            s.filtered_no_position, 1,
+            "a record with POS=0 must reach filtered_no_position"
+        );
+        assert_eq!(
+            s.filtered_no_read_id, 1,
+            "a record with no QNAME must reach filtered_no_read_id"
+        );
+        assert_eq!(s.filtered_3p_anchor, 1);
+        assert_eq!(anchors.len() as u64, s.passed);
+        // Signed, so an OVER-count is visible too. `AnchorStats::unaccounted()`
+        // clamps with `saturating_sub`, which would read a record bumped into
+        // two buckets as "balanced" -- this cannot, because the sum is
+        // subtracted as a whole rather than clamped per step.
+        assert_eq!(
+            s.total_records as i64 - counted_buckets(&s) as i64 - s.passed as i64,
+            0,
+            "signed conservation: a negative value means a record was counted twice"
+        );
+
+        let _ = std::fs::remove_file(&bam);
+    }
+
     /// The SAME identity, evaluated over a `SampleStats` built by hand.
     ///
-    /// This one covers the arithmetic for the four buckets no BAM fixture can
-    /// reach: it asserts that a stats value carrying those counters still
-    /// balances. Without it, `filtered_no_refid` / `filtered_no_position` /
-    /// `filtered_no_read_id` would appear in no runtime assertion anywhere.
+    /// As of Ticket 2B-Fix (2026-10-13) this is no longer the only place the
+    /// three counters appear in a runtime assertion --
+    /// `test_the_three_observable_drop_paths_really_execute` reaches all three
+    /// through a real BAM. What is left for THIS test is the arithmetic on a
+    /// counter no fixture populates (`filtered_no_reflen`, untested): it
+    /// asserts that a stats value carrying all ten buckets at once still
+    /// balances, and that a leak is reported rather than absorbed.
     #[test]
     fn test_unaccounted_is_zero_when_every_bucket_is_populated() {
         use noodles_sam::alignment::record::data::field::Tag;
