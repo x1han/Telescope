@@ -605,7 +605,7 @@ impl AnchorStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::evidence::test_support::{synth_record, write_synthetic_bam};
+    use crate::evidence::test_support::{synth_record, synth_record_with_gap, write_synthetic_bam};
 
     #[test]
     fn test_anchor_stats_aggregation() {
@@ -800,5 +800,180 @@ mod tests {
         // no anchors passed — not that L2 was skipped.
         assert_eq!(pool_gene_tx_cardinality(&[]), (0, 0));
         assert!(degenerate_gene_pool_warning(0, 0).is_none());
+    }
+
+    // === Ticket 2B: the conservation invariant, made enforced ============
+    //
+    // Before this test the identity `total_records == sum(filtered_*) + passed`
+    // held only ACCIDENTALLY, on data that happened not to trigger four of the
+    // drop paths. Measured on real HC2 (39,369,625 records) it closed exactly,
+    // with all three new buckets at 0 -- but nothing enforced it. The gap was
+    // auditability, not a wrong number.
+    //
+    // WHAT THIS FIXTURE COVERS, AND WHAT IT CANNOT. Six of the ten terminal
+    // paths are reachable from a synthetic BAM. The other four are NOT, and the
+    // fixture says so out loud rather than implying full coverage:
+    //
+    //   filtered_no_refid     -- needs a record whose tid is absent from the
+    //                             header. `bam::io::Writer` refuses to emit one
+    //                             (`InvalidReferenceSequenceId`), so the record
+    //                             cannot be constructed at all.
+    //   filtered_no_position  -- needs `alignment_start/end` to decode to None
+    //                             on a record the writer accepted.
+    //   filtered_no_read_id   -- needs `record.name()` to be None.
+    //   filtered_no_reflen    -- `ref_len` is built FROM the header, so a
+    //                             reference that survived `reference_sequence_id`
+    //                             always has a non-zero length.
+    //
+    // Those four are covered statically instead, by
+    // `workspace/comms/2026-10-13-round68-closeout/pkg/scripts/audit_record_conservation.py`,
+    // which does not depend on being able to construct a record. Neither tool is
+    // in `gates.sh` today; that is a deliberate standing decision, not an
+    // oversight. If those four ever become fixture-reachable, this comment is
+    // the thing to update.
+
+    /// Σ of every bucket that is supposed to absorb a record.
+    fn counted_buckets(s: &SampleStats) -> u64 {
+        s.filtered_unique
+            + s.filtered_no_refid
+            + s.filtered_no_position
+            + s.filtered_no_read_id
+            + s.filtered_no_reflen
+            + s.filtered_3p_anchor
+            + s.filtered_coverage
+            + s.filtered_polya_invalid
+            + s.filtered_cap
+    }
+
+    #[test]
+    fn test_anchor_record_conservation() {
+        use noodles_sam::alignment::record::data::field::Tag;
+        use noodles_sam::alignment::record_buf::data::field::Value;
+        let nm: Tag = Tag::new(b'N', b'M');
+
+        // No pt:i -> filtered_polya_invalid (A4, poly_a_length < 10).
+        let mut nopt = synth_record("nopt", 0, None, 0, 60);
+        nopt.data_mut().clear();
+        nopt.data_mut().insert(nm, Value::from(1i32));
+
+        let mut recs = vec![
+            synth_record("ok0", 0, None, 0, 60),  // -> passed
+            synth_record("ok1", 1, None, 0, 60),  // -> passed
+            synth_record("lowq", 0, None, 0, 10), // MAPQ < 20
+            synth_record_with_gap("gap3p", 1, 100, true, None, 0, 60), // 3' too short
+            synth_record_with_gap("shortcov", 1, 500, false, None, 0, 60), // coverage
+            nopt,                                 // no poly(A)
+        ];
+        // 205 records on one transcript with the cap at 200 -> 5 over cap.
+        for i in 0..205 {
+            recs.push(synth_record(&format!("cap{i}"), 2, None, 0, 60));
+        }
+
+        let bam = write_synthetic_bam("conserve", recs);
+        let (anchors, s) =
+            extract_anchors_from_bam(&bam, "conserve", &TxToGene::new(), 35, 0.80, 200).unwrap();
+
+        // --- THE INVARIANT, FIRST ------------------------------------------
+        // Asserted before the per-counter expectations on purpose. The
+        // invariant holds for ANY input as long as every drop is counted, so a
+        // fixture drift keeps it green and is caught by the per-counter
+        // asserts below; an uncounted drop breaks it and must be reported as
+        // the conservation failure it is, not as "the fixture lost a record".
+        // With the order reversed, measured 2026-10-13, the fixture assertion
+        // fired first every time and the invariant was never the thing that
+        // reported the failure -- which made the load-bearing claim untestable.
+        assert_eq!(
+            s.total_records,
+            counted_buckets(&s) + s.passed,
+            "a record left the stream through an uncounted path: \
+             total_records={} counted={} passed={}",
+            s.total_records,
+            counted_buckets(&s),
+            s.passed
+        );
+        // The terminal really is `passed`.
+        assert_eq!(
+            anchors.len() as u64,
+            s.passed,
+            "passed counts records that never reached the pool"
+        );
+        // parse_errors is incremented BEFORE total_records, so it is a disjoint
+        // population and must NOT appear in the identity. Asserted so a future
+        // edit that adds it to the sum is caught rather than silently accepted.
+        assert_eq!(s.parse_errors, 0);
+
+        // --- the fixture really exercises what it claims to ----------------
+        // Without these the test could pass on a fixture that filters nothing,
+        // which is the shape of vacuity this project keeps shipping.
+        assert_eq!(s.filtered_unique, 1, "fixture lost its MAPQ<20 record");
+        assert_eq!(s.filtered_3p_anchor, 1, "fixture lost its 3'-anchor record");
+        assert_eq!(s.filtered_coverage, 1, "fixture lost its coverage record");
+        assert_eq!(
+            s.filtered_polya_invalid, 1,
+            "fixture lost its no-poly(A) record"
+        );
+        assert_eq!(s.filtered_cap, 5, "fixture lost its over-cap records");
+        assert_eq!(s.passed, 202, "fixture lost its passing records");
+        assert_eq!(
+            s.total_records,
+            1 + 1 + 1 + 1 + 5 + 202,
+            "the fixture's record count changed; re-derive the expectations"
+        );
+        // The four paths this fixture cannot reach are pinned at zero, so a
+        // future change that makes one fire shows up here as a count change
+        // rather than as a silently different total.
+        assert_eq!(s.filtered_no_refid, 0);
+        assert_eq!(s.filtered_no_position, 0);
+        assert_eq!(s.filtered_no_read_id, 0);
+        assert_eq!(s.filtered_no_reflen, 0);
+
+        let _ = std::fs::remove_file(&bam);
+    }
+
+    /// The SAME identity, evaluated over a `SampleStats` built by hand.
+    ///
+    /// This one covers the arithmetic for the four buckets no BAM fixture can
+    /// reach: it asserts that a stats value carrying those counters still
+    /// balances. Without it, `filtered_no_refid` / `filtered_no_position` /
+    /// `filtered_no_read_id` would appear in no runtime assertion anywhere.
+    #[test]
+    fn test_unaccounted_is_zero_when_every_bucket_is_populated() {
+        use noodles_sam::alignment::record::data::field::Tag;
+        use noodles_sam::alignment::record_buf::data::field::Value;
+        let _ = std::mem::size_of::<Tag>();
+        let _ = std::mem::size_of::<Value>();
+
+        let agg = AnchorStats {
+            samples: 1,
+            total_records: 100,
+            filtered_unique: 10,
+            filtered_no_refid: 3,
+            filtered_no_position: 4,
+            filtered_no_read_id: 5,
+            filtered_no_reflen: 6,
+            filtered_3p_anchor: 7,
+            filtered_coverage: 8,
+            filtered_polya_invalid: 9,
+            filtered_cap: 11,
+            passed: 37,
+            distinct_genes: 2,
+            distinct_transcripts: 3,
+        };
+        assert_eq!(
+            agg.unaccounted(),
+            0,
+            "ten populated buckets summing to total_records must leave 0"
+        );
+
+        // One record lost: the helper must surface it, not absorb it.
+        let leaking = AnchorStats {
+            total_records: 101,
+            ..agg.clone()
+        };
+        assert_eq!(
+            leaking.unaccounted(),
+            1,
+            "unaccounted() must report the gap, not clamp it"
+        );
     }
 }
