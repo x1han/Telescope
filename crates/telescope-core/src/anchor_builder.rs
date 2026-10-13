@@ -270,15 +270,24 @@ fn extract_anchors_from_bam<P: AsRef<Path>>(
         // Position + length on reference.
         let ref_id = match record.reference_sequence_id() {
             Some(Ok(i)) => i,
-            _ => continue,
+            _ => {
+                stats.filtered_no_refid += 1;
+                continue;
+            }
         };
         let alignment_start = match record.alignment_start() {
             Some(Ok(p)) => p.get(),
-            _ => continue,
+            _ => {
+                stats.filtered_no_position += 1;
+                continue;
+            }
         };
         let alignment_end = match record.alignment_end() {
             Some(Ok(p)) => p.get(),
-            _ => continue,
+            _ => {
+                stats.filtered_no_position += 1;
+                continue;
+            }
         };
 
         let rl = *ref_len.get(&ref_id).unwrap_or(&0);
@@ -340,7 +349,10 @@ fn extract_anchors_from_bam<P: AsRef<Path>>(
 
         let read_id = match record.name() {
             Some(n) => String::from_utf8_lossy(n).to_string(),
-            None => continue,
+            None => {
+                stats.filtered_no_read_id += 1;
+                continue;
+            }
         };
         anchors.push(AnchorRecord {
             sample_id: sample_id.to_string(),
@@ -409,7 +421,31 @@ fn write_anchor_parquet<P: AsRef<Path>>(anchors: &[AnchorRecord], output: P) -> 
 pub struct SampleStats {
     pub total_records: u64,
     pub parse_errors: u64,
+    /// MAPQ < 20. NOTE this is NOT "non-unique" -- it is "low MAPQ", and on
+    /// these BAMs it swallows nearly everything. Reproduce (HC2, 2026-10-13):
+    ///
+    /// ```bash
+    /// B=/datg/hanxi/project/Telescope/aidrs_pipeline/trans_align/HC2/HC2.sorted.bam
+    /// samtools flagstat "$B" | grep -E 'in total|mapped'      # 39369625 / 37714800
+    /// samtools view "$B" | awk '$5 < 20' | wc -l              # 38163664
+    /// samtools view -f 4 "$B" | awk '{print $5}' | sort -u    # 0  (every unmapped record)
+    /// samtools view -f 4 "$B" | awk '$5 >= 20' | wc -l        # 0
+    /// ```
+    ///
+    /// ⇒ unmapped records are counted HERE, not in `filtered_no_refid`: they
+    /// never survive the MAPQ gate. Splitting the two is deferred -- it changes
+    /// what the ledger asserts, so it is a decision, not a repair.
     pub filtered_unique: u64,
+    /// Dropped because `reference_sequence_id()` yielded `None`/Err AFTER
+    /// passing the MAPQ gate. Added 2026-10-13: this path used to `continue`
+    /// with no counter at all, so records leaving here were invisible.
+    pub filtered_no_refid: u64,
+    /// Same, for `alignment_start()` / `alignment_end()`. Two call sites, one
+    /// bucket: a record can reach only one of them.
+    pub filtered_no_position: u64,
+    /// Same, for `record.name()` being `None`. A record with no name cannot be
+    /// written to the pool, so this is not a discard we could avoid.
+    pub filtered_no_read_id: u64,
     pub filtered_no_reflen: u64,
     pub filtered_3p_anchor: u64,
     pub filtered_coverage: u64,
@@ -424,6 +460,12 @@ pub struct AnchorStats {
     pub samples: usize,
     pub total_records: u64,
     pub filtered_unique: u64,
+    /// See [`SampleStats::filtered_no_refid`].
+    pub filtered_no_refid: u64,
+    /// See [`SampleStats::filtered_no_position`].
+    pub filtered_no_position: u64,
+    /// See [`SampleStats::filtered_no_read_id`].
+    pub filtered_no_read_id: u64,
     pub filtered_no_reflen: u64,
     pub filtered_3p_anchor: u64,
     pub filtered_coverage: u64,
@@ -447,6 +489,9 @@ impl AnchorStats {
         self.samples += 1;
         self.total_records += s.total_records;
         self.filtered_unique += s.filtered_unique;
+        self.filtered_no_refid += s.filtered_no_refid;
+        self.filtered_no_position += s.filtered_no_position;
+        self.filtered_no_read_id += s.filtered_no_read_id;
         self.filtered_no_reflen += s.filtered_no_reflen;
         self.filtered_3p_anchor += s.filtered_3p_anchor;
         self.filtered_coverage += s.filtered_coverage;
@@ -455,15 +500,105 @@ impl AnchorStats {
         self.passed += s.passed;
     }
 
+    /// Render the stats line.
+    ///
+    /// FIELD ORDER IS A COMPATIBILITY CONSTRAINT, DO NOT REORDER.
+    /// `workspace/validation/benchmark/dseta_step0_5/run_dseta_step0_5.py`
+    /// (plus five archived copies) scrapes this line with a regex that pins
+    /// BOTH `filtered(unique=N no_reflen=M ... cap=K)` AND `passed=P`
+    /// immediately after that closing paren, then computes its own
+    /// `deficit = total - (filtered + passed)`. Any new field inserted inside
+    /// the group OR between `)` and `passed=` makes `must()` fail and `die()`.
+    ///
+    /// ⇒ the new counters live after `passed=`. Verified against the real
+    /// regex, not reasoned about: an earlier attempt put them after `cap=`
+    /// and still failed to match.
+    ///
+    /// ⚠ THAT SCRAPER IS NOW STALE, AND IT FAILS LOUDLY IN A CONFUSING WAY.
+    /// It recomputes `deficit` over the OLD bucket set. If any of
+    /// `no_refid` / `no_position` / `no_read_id` is non-zero it matches the
+    /// line, then `die()`s claiming "a record left the stream through an
+    /// unaccounted path" about a ledger that is in fact balanced. It must be
+    /// updated to read `unaccounted=` before Ticket 2C relies on it.
+    ///
+    /// This was NOT the only place the identity was ever evaluated, and this
+    /// is not the first version of it: see `em.rs`'s `deficit()` /
+    /// `terminal_sum()`, which enforces the same rule on the E-step after the
+    /// `ΔAS` prune reached no bucket on 2026-10-06.
+    ///
+    /// What actually kept the Dataset A scraper green was simpler than a
+    /// bookkeeping accident: those four paths never fire on a BAM minimap2
+    /// writes. The identity was observably holding on this data. What it was
+    /// NOT was *guaranteed* -- and no test asserted it.
     pub fn report(&self) -> String {
         format!(
-            "samples={} total={} filtered(unique={} no_reflen={} 3p_anchor={} coverage={} polya={} cap={}) passed={}",
-            self.samples, self.total_records,
-            self.filtered_unique, self.filtered_no_reflen,
-            self.filtered_3p_anchor, self.filtered_coverage,
-            self.filtered_polya_invalid, self.filtered_cap,
-            self.passed
+            "samples={} total={} filtered(unique={} no_reflen={} 3p_anchor={} coverage={} \
+             polya={} cap={}) passed={} unaccounted={} no_refid={} no_position={} no_read_id={}",
+            self.samples,
+            self.total_records,
+            self.filtered_unique,
+            self.filtered_no_reflen,
+            self.filtered_3p_anchor,
+            self.filtered_coverage,
+            self.filtered_polya_invalid,
+            self.filtered_cap,
+            self.passed,
+            self.unaccounted(),
+            self.filtered_no_refid,
+            self.filtered_no_position,
+            self.filtered_no_read_id
         )
+    }
+
+    /// `total_records` minus every bucket that is supposed to absorb a record.
+    ///
+    /// This is the number that must be 0 for the ledger to be conservative.
+    /// It is printed rather than asserted: Ticket 2B adds the test, and until
+    /// that test exists a hard `assert_eq!` here would be a claim without a
+    /// falsification proof. `parse_errors` is deliberately NOT in this sum --
+    /// it is incremented before `total_records`, so it is a disjoint
+    /// population.
+    pub fn unaccounted(&self) -> u64 {
+        let bucket_sum = self.filtered_unique
+            + self.filtered_no_refid
+            + self.filtered_no_position
+            + self.filtered_no_read_id
+            + self.filtered_no_reflen
+            + self.filtered_3p_anchor
+            + self.filtered_coverage
+            + self.filtered_polya_invalid
+            + self.filtered_cap
+            + self.passed;
+
+        // Over-count (bucket_sum > total_records) is the ONE direction the
+        // `saturating_sub` chain below cannot report: it clamps to 0 and reads
+        // as "balanced". The under-count direction is surfaced correctly by
+        // the returned value itself, so assert on this one only.
+        //
+        // ⚠ NOT THE GATE. `ci/gates.sh` runs `cargo test --release`, and the
+        // release profile does not set `debug-assertions`, so this compiles out
+        // there. Ticket 2B's test must carry its own `assert_eq!` in the test
+        // body; this line is a dev-time tripwire, nothing more.
+        debug_assert!(
+            bucket_sum <= self.total_records,
+            "buckets sum to {} but total_records is {}: a record reached two \
+             buckets, or `passed` was bumped without a push. saturating_sub \
+             would report 0 for this and hide it.",
+            bucket_sum,
+            self.total_records
+        );
+
+        self.total_records
+            .saturating_sub(self.filtered_unique)
+            .saturating_sub(self.filtered_no_refid)
+            .saturating_sub(self.filtered_no_position)
+            .saturating_sub(self.filtered_no_read_id)
+            .saturating_sub(self.filtered_no_reflen)
+            .saturating_sub(self.filtered_3p_anchor)
+            .saturating_sub(self.filtered_coverage)
+            .saturating_sub(self.filtered_polya_invalid)
+            .saturating_sub(self.filtered_cap)
+            .saturating_sub(self.passed)
     }
 }
 
