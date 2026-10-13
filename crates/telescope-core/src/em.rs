@@ -3040,9 +3040,11 @@ mod tests {
     /// `Q(production) - Q(argmax)` is smooth and well conditioned instead.
     #[test]
     fn test_mstep_is_model_a_and_is_not_model_b() {
-        const KAPPA_0: f64 = 2.0; // em.rs `tau_0`
-        const NU_0: f64 = 1.0; // em.rs `nu_0`
-        const BETA_0: f64 = 1.0; // em.rs `beta_0`
+        // NU_0 / BETA_0 / TAU_0 are deliberately NOT restated here. This test
+        // is named for production Model A, so it must read production's own
+        // constants -- a local transcription is a guarantee about the test, not
+        // about the crate. Model B's kappa_0 IS tau_0 (MSTEP-PRIOR-SPEC-v1.0.md),
+        // so TAU_0 is what the joint objective below is evaluated at.
         const MU_COHORT: f64 = 8.5; // deliberately NOT near the observations
         const SIGMA2_COHORT: f64 = 0.5;
         const FLOOR: f64 = crate::emission_model::INSTRUMENTAL_PAL_NOISE_FLOOR;
@@ -3138,7 +3140,7 @@ mod tests {
                 s1,
                 s2,
                 MU_COHORT,
-                KAPPA_0,
+                TAU_0,
                 NU_0,
                 BETA_0,
                 SIGMA2_COHORT,
@@ -3206,7 +3208,7 @@ mod tests {
         //     question, settled by the production-arm oracle, not by a unit
         //     test. What this test pins is narrower and checkable: production
         //     computes Model A's closed form, and does not compute Model B's.
-        let mu_indep = (s1 + KAPPA_0 * MU_COHORT) / (w + KAPPA_0);
+        let mu_indep = (s1 + TAU_0 * MU_COHORT) / (w + TAU_0);
         let s_mu_indep = s2 - 2.0 * mu_indep * s1 + mu_indep * mu_indep * w;
         let sigma2_model_a =
             ((s_mu_indep + 2.0 * BETA_0 * SIGMA2_COHORT) / (w + 2.0 * NU_0 + 2.0)).max(FLOOR);
