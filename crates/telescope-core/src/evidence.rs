@@ -596,27 +596,43 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
             continue;
         }
 
-        // Every filter has now been passed. This is the RHS term of the
-        // ledger identity, and it is deliberately placed HERE rather than at
-        // the `push` further down, so that a record dropped between here and
-        // the push falls on the LHS and trips the `ledger_deficit() == 0`
-        // assertion at the end of the stream.
+        // THE RHS TERM LIVES BELOW, NOT HERE. Read to the end of the `read_id`
+        // match and you will find `fc.records_with_candidates += 1` sitting
+        // immediately above `let entry = read_map.entry(read_id)`, i.e. after
+        // the LAST exit in the record loop. That placement is the whole point.
         //
-        // MEASURED 2026-10-14, replacing an earlier claim on this line that
-        // "from this point to the push there is no `continue`, `return`, or `?`
-        // (checked by reading the whole span)". THAT WAS WRONG: there is one --
-        // `record.name() -> None => continue` at :642 -- and it sits AFTER this
-        // increment. A nameless record is therefore counted as one that has
-        // candidates, the identity still balances, the assertion does not fire,
-        // and the record is lost with no counter anywhere recording the loss.
-        // Pinned by `test_a_nameless_record_is_lost_without_tripping_the_ledger_guard`.
+        // HISTORY, because the wrong version of this comment is instructive.
+        // The increment used to sit HERE -- right after the last counted filter
+        // -- on the claim that "from this point to the push there is no
+        // `continue`, `return`, or `?` (checked by reading the whole span)".
+        // THAT CLAIM WAS FALSE. There was one: `record.name() -> None =>
+        // continue`, downstream of this line. A nameless record was therefore
+        // counted as one that had reached the candidate push, the ledger
+        // identity still balanced, `ledger_deficit()` returned 0, and the
+        // record was lost with no counter anywhere recording the loss -- a
+        // silent drop behind a guard that looked total. Found 2026-10-14 by
+        // building the BAM it takes; see R93.
         //
-        // The two drop sites BEFORE this line (:570 `refID`, :577 `pos`) are the
-        // ones the guard does catch, because nothing has been counted on the RHS
-        // yet; `test_ledger_guard_panics_on_a_record_with_no_reference_sequence_id`
-        // and `test_ledger_guard_panics_on_a_record_with_no_alignment_start` are
-        // the red proofs that it can.
-        fc.records_with_candidates += 1;
+        // The three malformed-record exits in this loop are :570 (`refID`),
+        // :577 (`pos`) and :642 (`name`). All three are now upstream of the
+        // RHS term, so any of them lands on the LHS alone and trips the
+        // assertion at the end of the stream. Three `#[should_panic]` tests
+        // pin that: `..._with_no_reference_sequence_id`,
+        // `..._with_no_alignment_start`, `..._with_no_read_name`.
+        //
+        // WHY THIS IS NOT A SCHEMA CHANGE. `FilterCounts`' field list is
+        // untouched -- no bucket was added, nothing downstream of Schema v1
+        // sees a new field. What moved is the MEANING of one existing counter,
+        // from "passed every filter" to "actually produced a candidate". The
+        // second is the field's literal name, and it is the only placement
+        // from which all three exits are upstream.
+        //
+        // INVARIANT, and it is the one a future edit can break: there must be
+        // no `continue`, `return`, `?`, `bail!` or early `panic!` between the
+        // increment and the `candidates.push` below. If you add one, move the
+        // increment past it in the same commit -- otherwise you have reopened
+        // exactly this bug, and the three tests below will still be green
+        // because none of them can reach a site you added.
 
         // 3. Observed 5' gap `g_k`, in this candidate's own cDNA coordinates.
         //
@@ -729,6 +745,19 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
             mapq,
             gap5p,
         };
+
+        // THE RHS TERM OF THE LEDGER IDENTITY. Everything above is computed;
+        // everything below is bookkeeping. This is the LAST point in the loop
+        // at which a record can still leave, so it is the only placement from
+        // which every exit (:570 refID, :577 pos, :642 read name) sits upstream
+        // and therefore lands on the LHS alone. See the long note above the
+        // filters for the history of the two earlier placements.
+        //
+        // Counted here, the record has definitely produced a candidate: the
+        // `match` immediately below either pushes a new entry or merges into an
+        // existing one for the same read, and there is no third branch.
+        fc.records_with_candidates += 1;
+
         let entry = read_map.entry(read_id).or_insert_with(|| TempReadEntry {
             poly_a_len,
             candidates: Vec::new(),
@@ -2483,6 +2512,13 @@ mod tests {
             "exactly one read is past the window: {s:?}"
         );
         assert_eq!(s.records_with_candidates, 2, "{s:?}");
+        // This assertion is only worth writing because a SIBLING test shows the
+        // same expression going non-zero. Measured 2026-10-14: hard-zeroing
+        // `ledger_deficit()` (`return 0;`) leaves THIS TEST GREEN, because a
+        // function that can only return 0 satisfies `== 0` trivially. The three
+        // `test_ledger_guard_panics_on_a_record_with_*` tests are what make it
+        // non-vacuous -- all three go red under that same mutation. Delete them
+        // and this line is decoration.
         assert_eq!(s.ledger_deficit(), 0, "ledger must close: {s:?}");
         assert_eq!(s.dropped_total(), 1, "{s:?}");
 
@@ -2529,6 +2565,13 @@ mod tests {
         assert_eq!(s.dropped_unmapped, 1, "{s:?}");
         assert_eq!(s.dropped_supplementary, 1, "{s:?}");
         assert_eq!(s.records_with_candidates, 1, "{s:?}");
+        // This assertion is only worth writing because a SIBLING test shows the
+        // same expression going non-zero. Measured 2026-10-14: hard-zeroing
+        // `ledger_deficit()` (`return 0;`) leaves THIS TEST GREEN, because a
+        // function that can only return 0 satisfies `== 0` trivially. The three
+        // `test_ledger_guard_panics_on_a_record_with_*` tests are what make it
+        // non-vacuous -- all three go red under that same mutation. Delete them
+        // and this line is decoration.
         assert_eq!(s.ledger_deficit(), 0, "ledger must close: {s:?}");
         assert_eq!(
             graph.molecules.len(),
@@ -2547,10 +2590,11 @@ mod tests {
     //
     // These fixtures are raw BAM BYTES rather than `write_synthetic_bam`
     // records, and they have to be: the values under test are "no reference"
-    // (refID = -1) and "no position" (pos = -1), and in noodles' record API
-    // both fields are `usize`. -1 is not representable there -- it exists only
-    // in the encoded record. `bam::io::Writer` cannot express these records, so
-    // a byte fixture is the only way to reach the code under test.
+    // (refID = -1), "no position" (pos = -1) and "no read name" (`*\0`), and in
+    // noodles' record API the first two are `usize` and the third is non-empty.
+    // None of the three is representable there -- they exist only in the
+    // encoded record. `bam::io::Writer` cannot express these records, so a byte
+    // fixture is the only way to reach the code under test.
     //
     // Each file is ONE record, identical apart from the one field named: FLAG 0
     // (mapped, forward, primary), 20M at offset 980 of a 1000 bp `tx1`,
@@ -2568,8 +2612,8 @@ mod tests {
     // ---------------------------------------------------------------------
 
     /// `refID = -1` on a record whose FLAG says mapped. `reference_sequence_id()`
-    /// yields nothing, so the `_ => continue` at :570 is taken. That is BEFORE
-    /// `records_with_candidates += 1` (:605), so the ledger identity does not
+    /// yields nothing, so the `_ => continue` at :570 is taken. That is UPSTREAM
+    /// of `fc.records_with_candidates += 1`, so the ledger identity does not
     /// balance and the assertion must panic.
     #[test]
     #[should_panic(expected = "evidence filter ledger does not close")]
@@ -2581,7 +2625,8 @@ mod tests {
     }
 
     /// `pos = -1`, so `alignment_start().get()` yields nothing and the
-    /// `_ => continue` at :577 is taken. Same ledger arithmetic as above.
+    /// `_ => continue` at :577 is taken. Also upstream of the RHS term; same
+    /// ledger arithmetic as above.
     #[test]
     #[should_panic(expected = "evidence filter ledger does not close")]
     fn test_ledger_guard_panics_on_a_record_with_no_alignment_start() {
@@ -2589,8 +2634,8 @@ mod tests {
         let _ = extract_evidence(&path, 35);
     }
 
-    /// The gap the two tests above do NOT close, and the reason the assertion
-    /// is not the backstop it looks like.
+    /// The third of the three malformed-record exits, and the one that used to be
+    /// invisible.
     ///
     /// QNAME is the two bytes `*\0`. noodles' `fields::name()` returns `None`
     /// for exactly two byte patterns -- `*\0` and `\0\0` -- and for nothing
@@ -2599,44 +2644,73 @@ mod tests {
     /// does not; nor does QNAME `*` written through a SAM/BAM writer, which
     /// normalises it.)
     ///
-    /// :642 is DOWNSTREAM of `records_with_candidates += 1`. The record is
-    /// counted as one that reached the candidate push, then vanishes before the
-    /// push. The identity balances, `extract_evidence` returns `Ok`, and the
-    /// record is gone with no counter recording it. This test pins that
-    /// measured behaviour so the gap cannot be re-described as closed.
+    /// CHANGED 2026-10-14. This test used to assert the opposite and was named
+    /// `test_a_nameless_record_is_lost_without_tripping_the_ledger_guard`: it
+    /// pinned a run that returned `Ok` with `ledger_deficit() == 0`,
+    /// `records_with_candidates == 1`, and zero molecules -- a record counted
+    /// as delivered and then gone, behind a guard that could not see it.
+    /// `fc.records_with_candidates += 1` now sits after :642 rather than
+    /// before it, so this exit is upstream of the RHS term like the other two,
+    /// and the assertion fires. `FilterCounts` gained no field; only the
+    /// placement moved. See the note above the filters for the full history.
     ///
-    /// `FilterCounts`' struct definition is frozen (Schema v1 and its six
-    /// downstream scrapers), so the fix is NOT a new bucket; it is a comment
-    /// correction plus this test. See the note at :599.
+    /// All three exits -- refID, pos, read name -- now trip the same assertion,
+    /// so the three `#[should_panic]` tests above and here are the complete
+    /// set. Adding a fourth malformed-record exit downstream of the increment
+    /// would reopen the bug silently; the invariant is stated at the increment.
     #[test]
-    fn test_a_nameless_record_is_lost_without_tripping_the_ledger_guard() {
+    #[should_panic(expected = "evidence filter ledger does not close")]
+    fn test_ledger_guard_panics_on_a_record_with_no_read_name() {
         let path = write_raw_bam("nameless", BAM_NO_NAME);
-        let graph = extract_evidence(&path, 35).expect(
-            "this run returns Ok. The ledger balances even though the record is \
-             gone, so the guard at the end of the stream cannot see the loss.",
-        );
-        std::fs::remove_file(&path).ok();
+        let _ = extract_evidence(&path, 35);
+    }
 
-        let s = graph.stats;
-        assert_eq!(s.records_entered, 1, "{s:?}");
-        assert_eq!(s.records_with_candidates, 1, "{s:?}");
-        assert_eq!(s.dropped_total(), 0, "{s:?}");
+    /// The pre-change behaviour, kept as a fixture-level assertion so the
+    /// 2026-10-14 receipt in R93 stays checkable against the code as it is
+    /// now rather than against a claim in a commit message.
+    ///
+    /// It does NOT run `extract_evidence` -- that panics now, by design. It
+    /// reproduces the arithmetic the old placement produced, from the same
+    /// counters the guard reads, and shows why that arithmetic balanced: the
+    /// RHS term was incremented before :642, so a record dropped there was
+    /// counted on BOTH sides. 1 entered, 0 dropped, 1 "with candidates",
+    /// deficit 0 -- and no molecule. Conservation held; the loss did not get
+    /// recorded. That is the whole lesson, so it is asserted rather than
+    /// described.
+    #[test]
+    fn test_the_old_rhs_placement_balanced_the_ledger_while_losing_the_record() {
+        // The bug, arithmetic only: the increment ran BEFORE the name check, so
+        // a record dropped at :642 was counted as one that reached the push. A
+        // record dropped at :642 incremented NO bucket of its own.
+        let s = FilterCounts {
+            records_entered: 1,
+            records_with_candidates: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            s.dropped_total(),
+            0,
+            "nothing recorded the drop -- that is why the deficit was blind: {s:?}"
+        );
         assert_eq!(
             s.ledger_deficit(),
             0,
-            "THE GUARD IS BLIND HERE: the drop is downstream of the RHS term, so \
-             the identity balances by construction: {s:?}"
+            "THE BLINDNESS, ARITHMETICALLY: conservation holds while the record \
+             is gone. This is what the 2026-10-14 fixture returned before the \
+             increment moved: Ok, deficit 0, zero molecules. {s:?}"
         );
+
+        // And the fix: with the increment downstream of :642, the same record
+        // leaves the RHS term uncounted and the guard sees it.
+        let fixed = FilterCounts {
+            records_entered: 1,
+            ..Default::default()
+        };
+        // records_with_candidates stays 0 -- the drop is upstream now.
         assert_eq!(
-            graph.molecules.len(),
-            0,
-            "the record entered, was counted as having candidates, and produced \
-             nothing: {s:?}"
-        );
-        assert_eq!(
-            graph.candidate_pool.len(),
-            0,
-            "the nameless read is absent from the candidate pool: {s:?}"
+            fixed.ledger_deficit(),
+            1,
+            "after the move the same fixture trips the assertion: {fixed:?}"
         );
     }
 
