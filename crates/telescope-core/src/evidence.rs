@@ -598,10 +598,24 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
 
         // Every filter has now been passed. This is the RHS term of the
         // ledger identity, and it is deliberately placed HERE rather than at
-        // the `push` further down: from this point to the push there is no
-        // `continue`, `return`, or `?` (checked by reading the whole span), so
-        // the two placements are equivalent, and this one cannot be skipped by
-        // a future early-exit added in between.
+        // the `push` further down, so that a record dropped between here and
+        // the push falls on the LHS and trips the `ledger_deficit() == 0`
+        // assertion at the end of the stream.
+        //
+        // MEASURED 2026-10-14, replacing an earlier claim on this line that
+        // "from this point to the push there is no `continue`, `return`, or `?`
+        // (checked by reading the whole span)". THAT WAS WRONG: there is one --
+        // `record.name() -> None => continue` at :642 -- and it sits AFTER this
+        // increment. A nameless record is therefore counted as one that has
+        // candidates, the identity still balances, the assertion does not fire,
+        // and the record is lost with no counter anywhere recording the loss.
+        // Pinned by `test_a_nameless_record_is_lost_without_tripping_the_ledger_guard`.
+        //
+        // The two drop sites BEFORE this line (:570 `refID`, :577 `pos`) are the
+        // ones the guard does catch, because nothing has been counted on the RHS
+        // yet; `test_ledger_guard_panics_on_a_record_with_no_reference_sequence_id`
+        // and `test_ledger_guard_panics_on_a_record_with_no_alignment_start` are
+        // the red proofs that it can.
         fc.records_with_candidates += 1;
 
         // 3. Observed 5' gap `g_k`, in this candidate's own cDNA coordinates.
@@ -2521,5 +2535,159 @@ mod tests {
             1,
             "only the survivor reaches the graph"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // RED PROOF for the production `ledger_deficit() == 0` assertion.
+    //
+    // Every other test in this module exercises that assertion's GREEN side.
+    // Until now nothing had ever made it go red, which under this project's own
+    // rule ("a comment stating an invariant is a wish until a test goes red")
+    // left it indistinguishable from an assertion that could never fire.
+    //
+    // These fixtures are raw BAM BYTES rather than `write_synthetic_bam`
+    // records, and they have to be: the values under test are "no reference"
+    // (refID = -1) and "no position" (pos = -1), and in noodles' record API
+    // both fields are `usize`. -1 is not representable there -- it exists only
+    // in the encoded record. `bam::io::Writer` cannot express these records, so
+    // a byte fixture is the only way to reach the code under test.
+    //
+    // Each file is ONE record, identical apart from the one field named: FLAG 0
+    // (mapped, forward, primary), 20M at offset 980 of a 1000 bp `tx1`,
+    // `pt:i:70`, `tx1` the only reference. It clears every COUNTED filter --
+    // unmapped, supplementary, poly(A) tag, poly(A) value, no CIGAR span,
+    // empty span, 3' TES window -- so the drop site under test is the only one
+    // that can be reached. Build them with:
+    //
+    //     cd crates/telescope-core/tests
+    //     python3 make_ledger_fixtures.py --out-dir /tmp/ledger_fx \
+    //         --check ../src/evidence.rs
+    //
+    // which rebuilds all three files and fails if any array below differs from
+    // its output. Run from `crates/telescope-core/tests`.
+    // ---------------------------------------------------------------------
+
+    /// `refID = -1` on a record whose FLAG says mapped. `reference_sequence_id()`
+    /// yields nothing, so the `_ => continue` at :570 is taken. That is BEFORE
+    /// `records_with_candidates += 1` (:605), so the ledger identity does not
+    /// balance and the assertion must panic.
+    #[test]
+    #[should_panic(expected = "evidence filter ledger does not close")]
+    fn test_ledger_guard_panics_on_a_record_with_no_reference_sequence_id() {
+        let path = write_raw_bam("notid", BAM_NO_REFID);
+        // No cleanup: the panic unwinds past it. The file is 160 bytes in the
+        // system temp dir and is overwritten by the pid-keyed name on rerun.
+        let _ = extract_evidence(&path, 35);
+    }
+
+    /// `pos = -1`, so `alignment_start().get()` yields nothing and the
+    /// `_ => continue` at :577 is taken. Same ledger arithmetic as above.
+    #[test]
+    #[should_panic(expected = "evidence filter ledger does not close")]
+    fn test_ledger_guard_panics_on_a_record_with_no_alignment_start() {
+        let path = write_raw_bam("nopos", BAM_NO_POS);
+        let _ = extract_evidence(&path, 35);
+    }
+
+    /// The gap the two tests above do NOT close, and the reason the assertion
+    /// is not the backstop it looks like.
+    ///
+    /// QNAME is the two bytes `*\0`. noodles' `fields::name()` returns `None`
+    /// for exactly two byte patterns -- `*\0` and `\0\0` -- and for nothing
+    /// else, so this is the only read-name that reaches the `None => continue`
+    /// at :642. (An EMPTY read name, `l_read_name = 0`, returns `Some("")` and
+    /// does not; nor does QNAME `*` written through a SAM/BAM writer, which
+    /// normalises it.)
+    ///
+    /// :642 is DOWNSTREAM of `records_with_candidates += 1`. The record is
+    /// counted as one that reached the candidate push, then vanishes before the
+    /// push. The identity balances, `extract_evidence` returns `Ok`, and the
+    /// record is gone with no counter recording it. This test pins that
+    /// measured behaviour so the gap cannot be re-described as closed.
+    ///
+    /// `FilterCounts`' struct definition is frozen (Schema v1 and its six
+    /// downstream scrapers), so the fix is NOT a new bucket; it is a comment
+    /// correction plus this test. See the note at :599.
+    #[test]
+    fn test_a_nameless_record_is_lost_without_tripping_the_ledger_guard() {
+        let path = write_raw_bam("nameless", BAM_NO_NAME);
+        let graph = extract_evidence(&path, 35).expect(
+            "this run returns Ok. The ledger balances even though the record is \
+             gone, so the guard at the end of the stream cannot see the loss.",
+        );
+        std::fs::remove_file(&path).ok();
+
+        let s = graph.stats;
+        assert_eq!(s.records_entered, 1, "{s:?}");
+        assert_eq!(s.records_with_candidates, 1, "{s:?}");
+        assert_eq!(s.dropped_total(), 0, "{s:?}");
+        assert_eq!(
+            s.ledger_deficit(),
+            0,
+            "THE GUARD IS BLIND HERE: the drop is downstream of the RHS term, so \
+             the identity balances by construction: {s:?}"
+        );
+        assert_eq!(
+            graph.molecules.len(),
+            0,
+            "the record entered, was counted as having candidates, and produced \
+             nothing: {s:?}"
+        );
+        assert_eq!(
+            graph.candidate_pool.len(),
+            0,
+            "the nameless read is absent from the candidate pool: {s:?}"
+        );
+    }
+
+    // ---- fixture bytes, emitted verbatim by make_ledger_fixtures.py ----
+    const BAM_NO_REFID: &[u8] = &[
+        0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x06, 0x00, 0x42, 0x43, 0x02,
+        0x00, 0x83, 0x00, 0x73, 0x72, 0xf4, 0x65, 0xd4, 0x61, 0x60, 0x60, 0x70, 0xf0, 0x70, 0xe1,
+        0x0c, 0xf3, 0xb3, 0x32, 0xd4, 0x33, 0xe3, 0x0c, 0xf6, 0xb7, 0x4a, 0xce, 0xcf, 0x2f, 0x4a,
+        0xc9, 0xcc, 0x4b, 0x2c, 0x49, 0xe5, 0x72, 0x08, 0x0e, 0xe4, 0x0c, 0xf6, 0xb3, 0x2a, 0xa9,
+        0x30, 0xe4, 0xf4, 0x01, 0xca, 0x1b, 0x18, 0x18, 0x70, 0x31, 0x02, 0xd5, 0xb3, 0x00, 0x31,
+        0x50, 0x8c, 0xe1, 0x05, 0x33, 0x03, 0x83, 0x3f, 0x90, 0xfd, 0x1f, 0x08, 0xae, 0x00, 0xd9,
+        0x6c, 0x36, 0x0c, 0x0c, 0x20, 0x79, 0x11, 0xa8, 0x18, 0x03, 0x14, 0x14, 0xa5, 0x26, 0xa6,
+        0x38, 0x32, 0x38, 0x00, 0xa5, 0x84, 0x3c, 0x60, 0x50, 0x0e, 0x0b, 0x28, 0x28, 0xc9, 0x74,
+        0x03, 0x2a, 0x07, 0x00, 0xbb, 0x76, 0x14, 0x0f, 0x97, 0x00, 0x00, 0x00, 0x1f, 0x8b, 0x08,
+        0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x06, 0x00, 0x42, 0x43, 0x02, 0x00, 0x1b, 0x00,
+        0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    const BAM_NO_POS: &[u8] = &[
+        0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x06, 0x00, 0x42, 0x43, 0x02,
+        0x00, 0x81, 0x00, 0x73, 0x72, 0xf4, 0x65, 0xd4, 0x61, 0x60, 0x60, 0x70, 0xf0, 0x70, 0xe1,
+        0x0c, 0xf3, 0xb3, 0x32, 0xd4, 0x33, 0xe3, 0x0c, 0xf6, 0xb7, 0x4a, 0xce, 0xcf, 0x2f, 0x4a,
+        0xc9, 0xcc, 0x4b, 0x2c, 0x49, 0xe5, 0x72, 0x08, 0x0e, 0xe4, 0x0c, 0xf6, 0xb3, 0x2a, 0xa9,
+        0x30, 0xe4, 0xf4, 0x01, 0xca, 0x1b, 0x18, 0x18, 0x70, 0x31, 0x02, 0xd5, 0xb3, 0x00, 0x31,
+        0x50, 0x8c, 0xe1, 0x05, 0x33, 0x03, 0x83, 0x3f, 0x03, 0x04, 0xfc, 0x07, 0x02, 0x36, 0x1b,
+        0x06, 0x06, 0x90, 0xbc, 0x08, 0x94, 0x0f, 0x95, 0x62, 0x28, 0x4a, 0x4d, 0x4c, 0x71, 0x64,
+        0x70, 0x00, 0x4a, 0x09, 0x79, 0xc0, 0xa0, 0x1c, 0x16, 0x50, 0x50, 0x92, 0xe9, 0x06, 0x54,
+        0x0e, 0x00, 0x84, 0xdd, 0x2e, 0x33, 0x97, 0x00, 0x00, 0x00, 0x1f, 0x8b, 0x08, 0x04, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0xff, 0x06, 0x00, 0x42, 0x43, 0x02, 0x00, 0x1b, 0x00, 0x03, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    const BAM_NO_NAME: &[u8] = &[
+        0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x06, 0x00, 0x42, 0x43, 0x02,
+        0x00, 0x7f, 0x00, 0x73, 0x72, 0xf4, 0x65, 0xd4, 0x61, 0x60, 0x60, 0x70, 0xf0, 0x70, 0xe1,
+        0x0c, 0xf3, 0xb3, 0x32, 0xd4, 0x33, 0xe3, 0x0c, 0xf6, 0xb7, 0x4a, 0xce, 0xcf, 0x2f, 0x4a,
+        0xc9, 0xcc, 0x4b, 0x2c, 0x49, 0xe5, 0x72, 0x08, 0x0e, 0xe4, 0x0c, 0xf6, 0xb3, 0x2a, 0xa9,
+        0x30, 0xe4, 0xf4, 0x01, 0xca, 0x1b, 0x18, 0x18, 0x70, 0x31, 0x02, 0xd5, 0xb3, 0x00, 0x31,
+        0x50, 0x8c, 0xe1, 0x05, 0x33, 0x03, 0x83, 0x37, 0x03, 0x04, 0x5c, 0x01, 0xb2, 0x99, 0x6c,
+        0x18, 0x18, 0x40, 0xf2, 0x22, 0x40, 0xfc, 0x1f, 0x08, 0xa0, 0x52, 0x0c, 0x5a, 0x0c, 0x0e,
+        0x40, 0x61, 0x21, 0x0f, 0x18, 0x94, 0xc3, 0x02, 0x0a, 0x4a, 0x32, 0xdd, 0x80, 0x4a, 0x01,
+        0x63, 0x44, 0x63, 0x8a, 0x93, 0x00, 0x00, 0x00, 0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0xff, 0x06, 0x00, 0x42, 0x43, 0x02, 0x00, 0x1b, 0x00, 0x03, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    fn write_raw_bam(tag: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "telescope_evidence_{}_test_{}.bam",
+            tag,
+            std::process::id()
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        path
     }
 }
