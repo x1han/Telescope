@@ -312,9 +312,18 @@ pub fn load_emission_parameters<P: AsRef<Path>>(
 /// The shipped entry point: `solve_and_write_profile_impl` at the default
 /// `SIGMA2_DOF_OFFSET` (2.0, Model A).
 ///
-/// This is the ONLY place that constant is named. Every one of the 52 call
-/// sites goes through here, so the shipped path has exactly one `c` and it is
-/// not a parameter any of them can reach past.
+/// This is the ONLY place the SHIPPED binary names that constant. Every one of
+/// the 52 call sites goes through here, so the shipped path has exactly one `c`
+/// and it is not a parameter any of them can reach past.
+///
+/// CHANGED 2026-10-14. This paragraph used to read "the ONLY place that
+/// constant is named", which is no longer true: the research binary's `quant`
+/// entry passes `sigma2_dof_offset.unwrap_or(em::SIGMA2_DOF_OFFSET)`. The
+/// claim is narrowed to the shipped binary because that is the claim the
+/// `SIGMA2_DOF_OFFSET`-is-a-`const` decision was about, and it still holds --
+/// `ci/check_dof_lockout.py` asserts that `crates/telescope-cli/src/main.rs`
+/// contains no occurrence of the parameter's name at all and that its one call
+/// site passes literal `None`.
 #[allow(clippy::too_many_arguments)]
 pub fn solve_and_write_profile<P: AsRef<Path>>(
     graph: FlatEvidenceGraph,
@@ -364,14 +373,22 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
 /// needs the quadratic term back in the numerator. Read `SIGMA2_DOF_OFFSET`
 /// before describing a `c != 2` arm as any named model.
 ///
-/// NOT EXPOSED ON THE CLI, deliberately. Every other EM hyper-parameter is a
-/// flag, and none of them is one of the two numbers the simulation oracle
-/// compares arms on; making this one settable from a command line would invite
-/// exactly that. Tests reach it here, and a simulation harness would reach it
-/// here too -- nothing else does today, and this paragraph claims no more than
-/// that. Measured 2026-10-13: the only caller outside this function's own
-/// definition is a test helper, so "the simulation harness reaches it" would be
-/// a wish written in the present tense.
+/// NOT EXPOSED ON THE SHIPPED CLI, deliberately. Every other EM hyper-parameter
+/// is a flag, and none of them is one of the two numbers the simulation oracle
+/// compares arms on; making this one settable from the production `telescope`
+/// would invite exactly that.
+///
+/// CHANGED 2026-10-14 -- the sentence above used to say "NOT EXPOSED ON THE
+/// CLI" flatly, and that became false the day `telescope-research` shipped.
+/// `c` IS now settable from a command line, on a SEPARATE binary that calls
+/// this same function through the same `quant` implementation the production
+/// path uses. The separation is the property, not the absence of a flag:
+/// `crates/telescope-cli/src/main.rs` cannot reach this argument at all, and
+/// `ci/check_dof_lockout.py` is what holds that, not this comment.
+///
+/// Tests reach it here, and `crates/telescope-cli/src/quant.rs` reaches it via
+/// `unwrap_or(SIGMA2_DOF_OFFSET)`, so `None` and the shipped entry point are the
+/// same `c`. A simulation harness would still have to come here.
 #[allow(clippy::too_many_arguments)]
 pub fn solve_and_write_profile_with_dof_offset<P: AsRef<Path>>(
     graph: FlatEvidenceGraph,
