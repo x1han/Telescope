@@ -100,8 +100,8 @@ use anyhow::{bail, Context, Result};
 
 use crate::anchor_builder::TxToGene;
 use arrow::array::{
-    Array, BooleanArray, BooleanBuilder, Float64Builder, Int32Array, ListArray, StringArray,
-    StringBuilder, UInt32Builder,
+    Array, ArrayBuilder, BooleanArray, BooleanBuilder, Float64Builder, Int32Array, ListArray,
+    StringArray, StringBuilder, UInt32Builder,
 };
 use arrow::datatypes::{DataType, Field, Int32Type, Schema};
 use arrow::record_batch::RecordBatch;
@@ -801,6 +801,17 @@ pub fn read_reference_universe<P: AsRef<Path>>(bam_path: P) -> Result<Vec<String
     // `test_a_duplicated_universe_entry_is_collapsed_by_the_header_reader` in
     // `crates/telescope-cli/tests/` pins the collapse, so that upgrade turns a
     // test red instead of silently changing what the guard means.
+    //
+    // UPDATED 2026-10-15. The paragraph above, read alone, says the CLI
+    // conservation guard is sound "only by an undocumented invariant of a
+    // third-party crate". That was the state of the world when it was written
+    // and it is no longer: `build_emission_from_anchors` now checks
+    // `reference_universe` for duplicates ITSELF and `bail!`s. So a noodles
+    // upgrade that un-collapses the map now turns the CLI test red AND, if the
+    // collapse were removed without anyone reading the test, a loud `Err` at
+    // the library entry point instead of a silently corrupted emission table.
+    // The dependence on noodles is real but it is no longer load-bearing on
+    // its own.
     Ok((0..header.reference_sequences().len())
         .map(|i| match header.reference_sequences().get_index(i) {
             Some((name, _)) => name.to_string(),
@@ -932,6 +943,38 @@ where
     P: AsRef<Path>,
     Q: AsRef<Path>,
 {
+    // W2'. Fail closed on a reference universe that names a transcript twice.
+    //
+    // WHY THIS IS HERE AND NOT ONLY IN `main.rs`. The CLI's conservation
+    // `ensure!` (n_after == n_reference + n_anchored_not_in_reference) compares
+    // two cardinalities of `anchored UNION universe`, so it is an identity on any
+    // two well-formed SETS and can only fire when the universe carries a
+    // duplicate key. Today `read_reference_universe` returns noodles'
+    // `reference_sequences()`, which is a name-keyed MAP and has already
+    // collapsed duplicates by the time it reaches us -- measured: `@SQ SN:tx0,
+    // SN:tx1, SN:tx1` yields two entries. So the CLI guard currently rests on an
+    // undocumented invariant of a third-party crate rather than on anything this
+    // repository enforces, and a noodles upgrade that changed that map would make
+    // the guard reachable with nobody noticing its status had changed.
+    //
+    // Checking here makes the precondition explicit at the layer that actually
+    // consumes it, so the law's soundness stops depending on someone else's data
+    // structure. Cost is O(n) over a header-sized vector, paid once, and it runs
+    // before a single parquet row is read.
+    if let Some(universe) = reference_universe {
+        let mut seen = std::collections::HashSet::with_capacity(universe.len());
+        for tx in universe {
+            if !seen.insert(tx.as_str()) {
+                anyhow::bail!(
+                    "reference universe names transcript {tx:?} more than once; \
+                     a duplicate key is pushed into the emitted row set twice while \
+                     `n_imputed` (a HashSet) counts it once, so the conservation law \
+                     is violated by construction rather than by accident",
+                );
+            }
+        }
+    }
+
     // 1. Read anchor pool.
     let mut tx_accums: HashMap<String, TxAccumulator> = HashMap::new();
     let mut cohort_log2_pals: Vec<f64> = Vec::new();
@@ -1200,6 +1243,24 @@ where
         provenance_rows.push((tx_id.clone(), gene_id.clone(), tier, n_obs));
     }
 
+    // W1'. The physical builder must have received exactly one row per key the
+    // solver decided to emit. `tx_keys` was MOVED by the emission loop above, so
+    // `tx_keys.len()` is unreachable here; `n_rows_emitted` is its pre-move
+    // capture, and the builder is still live because `finish()` has not run.
+    //
+    // This is the check the CLI conservation `ensure!` cannot make: that law
+    // compares two cardinalities of `anchored UNION universe`, which is an
+    // identity on any two SETS. A builder that silently dropped or duplicated
+    // a row changes the emitted ARRAYS, not the set, so nothing downstream sees
+    // it -- `RecordBatch::try_new` would succeed as long as the lengths agree
+    // with each other, which they would not, so this is where it dies instead.
+    anyhow::ensure!(
+        tx_id_builder.len() == n_rows_emitted,
+        "emission builder row count {} != emitted key count {}",
+        tx_id_builder.len(),
+        n_rows_emitted,
+    );
+
     let schema = output_schema();
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -1250,22 +1311,36 @@ where
     // provenance file describing a model that was never emitted.
     let provenance_path = write_provenance_parquet(output_path.as_ref(), &provenance_rows)?;
 
+    // W1'' second half. `n_imputed_padded` and `n_imputed_suppressed` are
+    // computed by two independent `filter`s over `imputed_keys`, and
+    // `em_suppressed` is a HashSet, so the two predicates are exact complements
+    // and the sum is `imputed_keys.len()` by construction. The comment below
+    // says so. This turns that comment into a check the code cannot violate
+    // without the check also going red: the risk is not the partition being
+    // wrong now, it being wrong after someone adds a third imputed category and
+    // remembers to update one side only.
+    let n_imputed = imputed_keys.len();
+    let n_imputed_padded = imputed_keys
+        .iter()
+        .filter(|tx| !em_suppressed.contains(**tx))
+        .count();
+    let n_imputed_suppressed = imputed_keys
+        .iter()
+        .filter(|tx| em_suppressed.contains(**tx))
+        .count();
+    anyhow::ensure!(
+        n_imputed == n_imputed_padded + n_imputed_suppressed,
+        "imputed split is not a partition: n_imputed={n_imputed} but \
+         padded={n_imputed_padded} + suppressed={n_imputed_suppressed}",
+    );
+
     Ok(FallbackTierCounts {
         l1: n_l1,
         l2: n_l2,
         l3: n_l3,
-        n_imputed: imputed_keys.len(),
-        // The split is a PARTITION of `imputed_keys`, not a second count:
-        // `n_imputed_padded + n_imputed_suppressed == imputed_keys.len()` by
-        // construction, and every emitted row still carries exactly one tier.
-        n_imputed_padded: imputed_keys
-            .iter()
-            .filter(|tx| !em_suppressed.contains(**tx))
-            .count(),
-        n_imputed_suppressed: imputed_keys
-            .iter()
-            .filter(|tx| em_suppressed.contains(**tx))
-            .count(),
+        n_imputed,
+        n_imputed_padded,
+        n_imputed_suppressed,
         n_reference,
         n_anchored_not_in_reference,
         provenance_path,
@@ -2839,34 +2914,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// The failure mode `main.rs`'s conservation guard defends against, pinned
-    /// where it is actually reachable.
+    /// The failure mode `main.rs`'s conservation guard defends against, now
+    /// REJECTED at the door rather than documented as latent.
     ///
-    /// The CLI asserts
-    ///     n_after == n_reference + n_anchored_not_in_reference
-    /// and BOTH sides are the cardinality of `anchored UNION universe`, so on a
-    /// well-formed universe the law is an identity and the guard cannot fire.
-    /// The one input that breaks it is a universe naming a transcript TWICE: the
-    /// padding loop pushes the key into `tx_keys` once per occurrence, so the
-    /// row is emitted twice, while `imputed_keys` is a `HashSet` and counts it
-    /// once. `n_after` then falls one short of `n_reference`.
+    /// W2' (Round 105) added a uniqueness check at the top of
+    /// `build_emission_from_anchors`. Before it, a universe naming a transcript
+    /// twice pushed the key into `tx_keys` once per occurrence, so the row was
+    /// emitted TWICE with byte-identical contents, while `imputed_keys` -- being
+    /// a `HashSet` -- counted it once. `n_after` then fell one short of
+    /// `n_reference`, and the CLI conservation law was the only thing that could
+    /// ever notice. It could not: both sides of that law are the cardinality of
+    /// `anchored UNION universe`, making it an identity on two SETS, and
+    /// `read_reference_universe` returns noodles' header MAP, so duplicates
+    /// arrive already collapsed one layer below this code.
     ///
-    /// Through the CLI that input is unreachable — `read_reference_universe`
-    /// returns noodles' header MAP, which collapses duplicate `@SQ` names before
-    /// this code sees them (measured, and pinned in
-    /// `crates/telescope-cli/tests/emission_conservation_rejects_a_duplicated_universe_entry.rs`).
-    /// So the guard's soundness rests on a third-party crate's invariant rather
-    /// than on anything this crate asserts. This test is the reachable half:
-    /// it drives `build_emission_from_anchors` with a duplicated universe
-    /// DIRECTLY, which is what a future caller of the library could do, and
-    /// shows the duplicate really does reach the output.
+    /// The defect was therefore latent twice over -- unreachable through the CLI,
+    /// and witnessed only by a library-level call no production path makes.
+    /// Checking at the entry replaces both dependencies with one this repository
+    /// enforces itself.
     ///
-    /// It documents a latent defect rather than pinning a desired behaviour: a
-    /// de-duplicated universe would be the obvious fix, and it is not applied
-    /// here because the emitted row set is what the conservation law is defined
-    /// over, and changing that is a spec decision, not a test's.
+    /// This is the RED half of that change. It drives the function directly with
+    /// the exact input that used to produce the corrupt table, and requires an
+    /// `Err` naming the offender. It is equally the regression guard in the other
+    /// direction: remove or weaken the check to a silent de-duplication and this
+    /// goes red, because `expect_err` would be handed back the `Ok` that used to
+    /// come. The final control rejects nothing: a distinct universe must still
+    /// build, so the check cannot be satisfied by refusing everything.
     #[test]
-    fn a_duplicated_universe_key_reaches_the_emitted_row_set_twice() {
+    fn a_duplicated_universe_key_is_rejected_at_the_entry_point() {
         let tmp = local_scratch("telescope_test_dup_universe");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).expect("mkdir tmp");
@@ -2880,11 +2955,10 @@ mod tests {
         let out = tmp.join("emission.parquet");
         write_anchor_pool_parquet(&anchor_pool, &fxs);
 
-        // `tx_pad` appears TWICE. A universe read from a BAM header cannot do
-        // this, which is precisely why the CLI guard is currently unreachable --
-        // see this test's doc comment.
+        // `tx_pad` appears TWICE: the input that used to emit two identical rows
+        // for one transcript while `n_imputed` counted it once.
         let universe: Vec<String> = vec!["tx_only".into(), "tx_pad".into(), "tx_pad".into()];
-        let tiers = build_emission_from_anchors(
+        let err = build_emission_from_anchors(
             &anchor_pool,
             None::<&str>,
             &out,
@@ -2892,62 +2966,38 @@ mod tests {
             Some(&universe),
             None,
         )
-        .expect("a duplicated universe must not crash the builder");
+        .expect_err("a duplicated universe must be REJECTED, not silently de-duplicated");
 
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tx_pad"),
+            "the error must NAME the offending transcript; an operator holding a \
+             70k-entry universe cannot otherwise tell which entry to fix. got: {msg}"
+        );
+
+        // CONTROL: the rejection precedes every write, so the corrupt table this
+        // input used to produce cannot exist on disk at all.
+        assert!(
+            !out.exists(),
+            "no output parquet may be written when the universe is rejected; the \
+             old behaviour wrote one containing two identical tx_pad rows"
+        );
+
+        // CONTROL: a well-formed universe is still accepted. Without this the
+        // check would pass by refusing everything, which is the other failure
+        // mode a fail-closed guard has.
+        let good: Vec<String> = vec!["tx_only".into(), "tx_pad".into()];
+        build_emission_from_anchors(
+            &anchor_pool,
+            None::<&str>,
+            &out,
+            &FallbackConfig::default(),
+            Some(&good),
+            None,
+        )
+        .expect("a universe with distinct keys must still build");
         let rows = read_emission_parquet(&out);
-
-        // THE FAILURE MODE. `n_reference` counts the universe vector, so it
-        // sees the duplicate; `n_imputed` is a set, so it does not.
-        assert_eq!(
-            tiers.n_reference, 3,
-            "the universe vector has three entries"
-        );
-        assert_eq!(
-            tiers.n_imputed, 1,
-            "but only ONE distinct key was padded: n_imputed is a HashSet, so \
-             it cannot see the duplicate. rows.len() will be 2."
-        );
-        assert_eq!(
-            tiers.n_imputed_padded, 1,
-            "the duplicate is counted once on the detail side too"
-        );
-        assert_eq!(
-            rows.len(),
-            3,
-            "1 anchored + the padded key ONCE PER OCCURRENCE: the loop pushes \
-             per universe ENTRY, so `tx_pad` is emitted twice. Note that this \
-             is `n_reference` (3) and NOT `n_after` (2) -- the emitted table \
-             matches the universe, while the CLI's law computes 2 from a \
-             HashSet. That gap is the entire failure mode. rows={rows:?}"
-        );
-        let dupes = rows.iter().filter(|r| r.0 == "tx_pad").count();
-        assert_eq!(
-            dupes, 2,
-            "the duplicate row is emitted verbatim: same transcript_id, same \
-             everything. Downstream that is two profile rows for one transcript."
-        );
-
-        // And this is exactly what the CLI law computes on these numbers.
-        let n_after = tiers.l1 + tiers.l2 + tiers.l3 + tiers.n_imputed;
-        let rhs = tiers.n_reference + tiers.n_anchored_not_in_reference;
-        assert_ne!(
-            n_after, rhs,
-            "THE POINT OF THIS TEST. On a duplicated universe the two sides \
-             DISAGREE ({n_after} vs {rhs}), which is the only way the CLI's \
-             conservation `ensure!` can ever fire. If this assertion fails, the \
-             universe is no longer able to break the law, and the CLI guard has \
-             become unfalsifiable for a second and independent reason -- \
-             re-check `read_reference_universe` before assuming the old one \
-             still holds."
-        );
-        assert_ne!(
-            n_after,
-            rows.len(),
-            "CONTROL: the emitted table does NOT equal the law's left-hand side \
-             when the universe is duplicated, which is why the law belongs \
-             inside this function (where `rows.len()` is known) rather than in \
-             the CLI (where it is not)."
-        );
+        assert_eq!(rows.len(), 2, "1 anchored + 1 padded; got rows={rows:?}");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

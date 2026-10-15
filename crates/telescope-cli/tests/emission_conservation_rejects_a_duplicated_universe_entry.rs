@@ -23,15 +23,22 @@
 //! table adds up, and it is not: it is arithmetic over the CLI's own counters,
 //! never against the parquet that was actually written.
 //!
-//! `read_reference_universe` explicitly does NOT de-duplicate `@SQ` names, on
-//! the grounds that SAM requires `SN` to be unique and that silently collapsing
-//! a duplicate would "turn a corrupt reference into a plausible-looking
-//! universe". That is the right call, and it is exactly what makes the guard
-//! reachable: a duplicated name enters `universe` twice, the padding loop pushes
-//! the key into `tx_keys` twice (so the row is emitted TWICE), while
-//! `n_imputed` is a `HashSet` and counts it ONCE. `n_after` therefore falls one
-//! short of `n_reference`, and the run fails loudly instead of writing a
-//! duplicated row and reporting a completeness line that does not add up.
+//! CORRECTION 2026-10-15. The paragraph this one replaced claimed that
+//! `read_reference_universe` explicitly does NOT de-duplicate `@SQ` names, and
+//! that this is "exactly what makes the guard reachable": a duplicated name
+//! entering `universe` twice, the padding loop pushing the key into `tx_keys`
+//! twice so the row is emitted TWICE, `n_imputed` (a `HashSet`) counting it
+//! ONCE, and `n_after` falling one short. **Every clause of that was FALSE** —
+//! `reference_sequences()` is a MAP keyed by reference name, so a header naming
+//! a transcript twice arrives already collapsed (measured below). The paragraph
+//! also directly contradicted the next one in this same file.
+//!
+//! It is kept in the record because the failure it describes is the real one and
+//! the reasoning is what made it invisible: a stated non-dedup invariant, once
+//! believed, makes an unreachable guard look load-bearing. The guard's soundness
+//! now rests on OUR OWN check rather than on that belief — see
+//! `build_emission_from_anchors`, which `bail!`s at its entry point if
+//! `reference_universe` ever does contain a duplicate.
 //!
 //! MEASURED OUTCOME, and it is not the one this file was written to produce:
 //! the guard CANNOT fire from the CLI, because `read_reference_universe`
@@ -142,9 +149,9 @@ fn cleanup(paths: &[&Path]) {
 /// anything this repository asserts.
 ///
 /// The reachable half of the failure mode is pinned in `emission_model.rs`:
-/// `test_a_duplicated_universe_key_reaches_the_emitted_row_set_twice` drives the
-/// library with a duplicated universe directly and shows the row really is
-/// emitted twice.
+/// `a_duplicated_universe_key_is_rejected_at_the_entry_point` drives the library
+/// with a duplicated universe directly and shows it is refused there, before any
+/// row is written.
 ///
 /// IF THIS TEST GOES RED, a `noodles` upgrade has changed the header map's
 /// duplicate handling. The consequence is not cosmetic: the CLI conservation

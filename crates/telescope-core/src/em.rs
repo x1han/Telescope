@@ -95,10 +95,27 @@ pub struct TranscriptParam {
     pub transcript_id: String,
     pub gene_id: String,
     pub is_competent: bool,
-    /// Cohort-level μ used as M-step MAP prior (fixed across iterations).
+    /// Shrinkage-prior μ, bound at load from the emission parquet's OWN
+    /// per-transcript `mu_logPAL` column (em.rs, `mu_col.value(i)`).
+    ///
+    /// MISNOMER, kept for compatibility and now documented rather than
+    /// renamed: "cohort" here means the tier the value was resolved at, not
+    /// that it is a single cohort-wide constant. Tier 1/2 rows carry that
+    /// transcript's own fitted `mu_logPAL`; only tier-3 (`cohort_fit`) and
+    /// imputed rows carry the cohort value. Pinned by
+    /// `test_emission_prior_fields_are_bound_from_the_emission_parquet`,
+    /// which fails if the binding is ever changed to a cohort-wide constant.
     pub mu_cohort: f64,
     /// Current μ estimate (initialized to mu_cohort, updated each M-step).
     pub mu: f64,
+    /// Shrinkage-prior σ², bound at load from the emission parquet's OWN
+    /// per-transcript `sigma2_logPAL` column (em.rs, `sigma2_col.value(i)`).
+    ///
+    /// MISNOMER, same sense as `mu_cohort` above and for the same reason: only
+    /// tier-3 (`cohort_fit`) and imputed rows hold the cohort variance. This is
+    /// the quantity the M-step multiplies by `beta_0` in the σ² numerator, so
+    /// reading it as a cohort constant overstates the prior on every tier-1/2
+    /// row. Fixed across iterations — the M-step rewrites `sigma2`, never this.
     pub sigma2_cohort: f64,
     /// Current EM iteration σ² (initialized to cohort, updated each M-step).
     pub sigma2: f64,
@@ -237,6 +254,29 @@ pub fn load_emission_parameters<P: AsRef<Path>>(
             let mu_cohort = mu_col.value(i);
             let mu = mu_cohort; // Initial value = cohort; M-step will update
             let sigma2_cohort = sigma2_col.value(i);
+
+            // The field is NAMED `sigma2_cohort` but is bound from this
+            // transcript's own `sigma2_logPAL`, and is the quantity the M-step
+            // multiplies by `beta_0` in the σ² numerator (em.rs, STEP 2). It is
+            // therefore a VARIANCE and must arrive finite and strictly positive;
+            // a NaN or a non-positive value entering `2.0 * beta_0 * p.sigma2_
+            // cohort` poisons `p.sigma2` for this transcript and, through the
+            // cohort fallback, for every transcript that borrows it.
+            //
+            // The expert's literal form of this check -- asserting
+            // `p.sigma2_cohort == emission.sigma2_logPAL` here -- is true by
+            // construction, since both names denote the same
+            // `sigma2_col.value(i)` call, and so could never fail. The binding
+            // itself is pinned by a unit test instead; see
+            // `test_emission_prior_fields_are_bound_from_the_emission_parquet`.
+            anyhow::ensure!(
+                sigma2_cohort.is_finite() && sigma2_cohort > 0.0,
+                "emission row {i} (transcript {}) has sigma2_logPAL = {}, which is \
+                 not a finite positive variance; it is about to become the M-step \
+                 prior scale beta_0 * sigma2_cohort",
+                tr_id,
+                sigma2_cohort
+            );
 
             map.insert(
                 tr_id.clone(),
@@ -739,6 +779,19 @@ fn solve_and_write_profile_impl<P: AsRef<Path>>(
     // that calls it "not finalised" reports the initialisation as a fit.
     let mut m_step_ran = false;
 
+    // D2 (Round 105): the W the LAST M-step actually consumed, captured by
+    // moving ownership out of the M-step block. Zero-copy -- `accum_w` is dead
+    // after the `let w_sum = accum_w[i]` read inside that block, so this is a
+    // `Vec` move, not a clone and not a second accumulation pass.
+    //
+    // Why it exists: `p.em_accum_weight` is stamped at the very end of the run
+    // from a FRESH `accumulate_mstep_suffstats` call over the post-loop
+    // `final_weights`, while `p.sigma2` in that same row came from the M-step's
+    // OWN suffstats. The two are one E-step apart, so the published W and the
+    // published sigma2 describe different iterations. This vector is what makes
+    // that gap measurable instead of merely noted in a comment.
+    let mut last_mstep_w: Vec<f64> = Vec::new();
+
     for iter in 0..max_iter {
         // E-step: parallel over ambiguous reads. Compute log-sum-exp normalized weights,
         // per-read log-likelihood, and per-read posterior entropy.
@@ -1129,6 +1182,13 @@ fn solve_and_write_profile_impl<P: AsRef<Path>>(
                 };
             }
         }
+
+        // D2: hand the M-step's own suffstats out of the block by MOVE.
+        // `accum_w` is dead past the `let w_sum = accum_w[i]` read above (every
+        // later use is of `w_sum`, `accum_w_y` or `accum_w_y2`), so this
+        // compiles to a pointer move -- no clone, no second accumulation pass,
+        // no extra O(num_transcripts) work per iteration.
+        last_mstep_w = accum_w;
     }
 
     // STAMP THE RUN'S ACTUAL W AND FINALISATION STATE INTO THE SNAPSHOT
@@ -1190,6 +1250,12 @@ fn solve_and_write_profile_impl<P: AsRef<Path>>(
     //     a fixed point on iteration 1: there, W(stamped one iteration late) ==
     //     W(stamped now), so the staleness is arithmetically invisible. That is
     //     why the second fixture exists.
+    //
+    // D2's two outputs are declared OUTSIDE this block and assigned inside it,
+    // because `final_w` is block-scoped here while the `TelEmStats` constructor
+    // that consumes these values is ~700 lines further down the same function.
+    let mut max_dw_phase_abs = 0.0_f64;
+    let mut max_dw_phase_rel = 0.0_f64;
     {
         let (final_w, _, _) = accumulate_mstep_suffstats(
             &params,
@@ -1211,6 +1277,38 @@ fn solve_and_write_profile_impl<P: AsRef<Path>>(
                     0.0
                 };
                 p.em_finalized = m_step_ran;
+            }
+        }
+
+        // D2: how far apart are the W the M-step CONSUMED and the W the sidecar
+        // PUBLISHES, for the same transcript?
+        //
+        // They are one E-step apart by construction: `last_mstep_w` comes from
+        // the suffstats built inside the loop, `final_w` from the fresh call
+        // above over the post-loop `final_weights`. Both `p.em_accum_weight` and
+        // `p.sigma2` therefore describe the fit one iteration before the weights
+        // that were published alongside them. That was previously only stated in
+        // a comment; these two fields make it a number the CLI can print and a
+        // regression can be watched against.
+        //
+        // The relative form divides by the LARGER of the two arms, so a
+        // transcript that gained weight reports its proportional move rather
+        // than an infinite one, and transcripts that are zero in both arms
+        // contribute exactly 0 instead of 0/0.
+        if !last_mstep_w.is_empty() {
+            for i in 0..num_transcripts {
+                let m_step_i = last_mstep_w[i];
+                let d = (final_w[i] - m_step_i).abs();
+                if d > max_dw_phase_abs {
+                    max_dw_phase_abs = d;
+                }
+                let scale = final_w[i].abs().max(m_step_i.abs());
+                if scale > 0.0 {
+                    let r = d / scale;
+                    if r > max_dw_phase_rel {
+                        max_dw_phase_rel = r;
+                    }
+                }
             }
         }
     }
@@ -1922,6 +2020,8 @@ fn solve_and_write_profile_impl<P: AsRef<Path>>(
         n_reads_any_emission_candidate,
         n_reads_single_emission_candidate,
         em_trace: output_em_trace.map(|t| t.clone()).unwrap_or_default(),
+        max_dw_phase_abs,
+        max_dw_phase_rel,
     })
 }
 
@@ -2994,6 +3094,23 @@ pub struct TelEmStats {
     pub n_reads_single_emission_candidate: u64,
     /// EM trace: per-iter `(iter_index, log_likelihood, mean_entropy)`.
     pub em_trace: Vec<(usize, f64, f64)>,
+    /// D2. Largest absolute disagreement, over all transcripts, between the W
+    /// the last M-step CONSUMED and the W the sidecar PUBLISHES as
+    /// `em_accum_weight`. Unit: molecules. Denominator: none -- this is a max,
+    /// not a rate. `0.0` when no M-step ran.
+    ///
+    /// Non-zero means the run's published W is one E-step behind the W that
+    /// produced the published `sigma2`. It is a MEASUREMENT of a known
+    /// one-iteration phase offset, not a defect: `p.em_accum_weight` is stamped
+    /// from a fresh suffstats pass after the loop by design, so that the column
+    /// reflects the run's actual final weights rather than the last in-loop
+    /// iteration. What was missing was any way to see HOW BIG the gap gets.
+    pub max_dw_phase_abs: f64,
+    /// D2. The same disagreement divided, per transcript, by the larger of the
+    /// two arms; `0.0` when no M-step ran or when a transcript is zero in both.
+    /// Dimensionless. Denominator: `max(W_final, W_mstep)` per transcript, named
+    /// here because a bare ratio against a moving denominator is unreadable.
+    pub max_dw_phase_rel: f64,
 }
 
 #[cfg(test)]
@@ -5895,6 +6012,193 @@ mod tests {
                  weights this profile was written from. max_iter = 2 here, so \
                  these are the SECOND E-step's weights."
             );
+        }
+    }
+
+    /// D2. `TelEmStats` now carries the measured size of the one-iteration phase
+    /// offset between the W the M-step CONSUMED and the W the sidecar PUBLISHES.
+    ///
+    /// WHY THE STRUCTURAL CLAIM IS "exactly zero at `max_iter = 1`". With one
+    /// iteration the loop runs E-step, then M-step over those same
+    /// `final_weights`, then exits; the stamp block then recomputes `final_w`
+    /// from that identical vector. Both arms are therefore the same numbers and
+    /// the metric MUST be bit-zero. That is the falsifiable half: a `max_dw_*`
+    /// that is non-zero here would mean the two vectors are not what the comment
+    /// says they are. It is not a vacuous zero -- an implementation that never
+    /// populated `last_mstep_w` would also read zero, which is why the second
+    /// half below pins the opposite direction.
+    #[test]
+    fn test_dw_phase_metrics_are_exactly_zero_when_there_is_no_phase_and_bounded_otherwise() {
+        let solve = |tag: &str, max_iter: usize| {
+            let emission = scratch(&format!("dwphase_{tag}_emission.parquet"));
+            let profile = scratch(&format!("dwphase_{tag}_profile.parquet"));
+            let graph =
+                multi_molecule_graph((100.0_f32).log2(), &[vec![("x", 1000, 0), ("y", 1000, 0)]]);
+            write_test_emission(
+                &emission,
+                &[("r0_x", "g", 9.0, 0.5), ("r0_y", "g", 5.0, 0.5)],
+            );
+            let mut params = Vec::new();
+            let stats = solve_and_write_profile(
+                graph,
+                &emission,
+                "TEST",
+                &profile,
+                1e-6,
+                max_iter,
+                20.0,
+                FIVE_PRIME_OFF,
+                POLY_A_ON,
+                FIVE_PRIME_WINDOW,
+                PRUNE_MAX_DELTA_AS,
+                0.0,
+                None,
+                Some(&mut params),
+                None,
+            )
+            .expect("solve must succeed");
+            let _ = std::fs::remove_file(&emission);
+            let _ = std::fs::remove_file(&profile);
+            (
+                stats.max_dw_phase_abs,
+                stats.max_dw_phase_rel,
+                stats.n_em_iter,
+            )
+        };
+
+        let (abs1, rel1, iter1) = solve("one", 1);
+        assert_eq!(iter1, 1, "the max_iter=1 arm must really run one iteration");
+        assert_eq!(
+            abs1, 0.0,
+            "with a single E-step the M-step's W and the published W are the same \
+             numbers, so the phase metric must be EXACTLY zero; got {abs1}"
+        );
+        assert_eq!(
+            rel1, 0.0,
+            "same arm, relative form must be zero too; got {rel1}"
+        );
+
+        // The other direction, so a metric stuck at zero cannot pass: the two
+        // candidates have different `mu_cohort`, which is what makes the
+        // posteriors MOVE between E-steps. A run that iterates must therefore
+        // report a strictly positive absolute gap.
+        let (abs_n, rel_n, iter_n) = solve("many", 20);
+        assert!(
+            iter_n > 1,
+            "this fixture must actually iterate, or the assertion below is \
+             measuring a fixed point and would pass for the wrong reason; got {iter_n}"
+        );
+        assert!(
+            abs_n > 0.0,
+            "an EM that moved between E-steps must report a non-zero phase gap; \
+             got exactly 0.0, which means `last_mstep_w` was never populated"
+        );
+        assert!(
+            (0.0..=1.0).contains(&rel_n),
+            "the relative form divides by the LARGER of the two arms, so it is \
+             bounded by 1 by construction; got {rel_n}"
+        );
+    }
+
+    /// D1. `sigma2_cohort` is a MISNOMER: the field carries this transcript's OWN
+    /// `sigma2_logPAL`, not a cohort-wide variance. The M-step multiplies it by
+    /// `beta_0` in the sigma^2 numerator, so anyone reading it as a single cohort
+    /// constant overstates the prior on every tier-1/2 row.
+    ///
+    /// This is the RED half. The falsifiable claim is not "the field equals
+    /// something" -- that is true by construction -- it is that three transcripts
+    /// with three DIFFERENT emission variances come back with three DIFFERENT
+    /// values rather than one shared number. A binding changed to a cohort-wide
+    /// constant satisfies the first and fails this.
+    #[test]
+    fn test_emission_prior_fields_are_bound_from_the_emission_parquet() {
+        let emission = scratch("prior_binding_emission.parquet");
+        // Three distinct variances AND three distinct mus, so a mixture of the
+        // two columns cannot accidentally satisfy the assertions below.
+        write_test_emission(
+            &emission,
+            &[
+                ("tx_a", "g", 9.0, 0.5),
+                ("tx_b", "g", 5.0, 1.25),
+                ("tx_c", "g", 7.25, 3.75),
+            ],
+        );
+
+        let params = load_emission_parameters(&emission).expect("emission must load");
+        let get = |id: &str| {
+            params
+                .get(id)
+                .unwrap_or_else(|| panic!("{id} must be present in the loaded params"))
+        };
+
+        assert_eq!(
+            get("tx_a").sigma2_cohort.to_bits(),
+            0.5_f64.to_bits(),
+            "tx_a must carry ITS OWN sigma2_logPAL"
+        );
+        assert_eq!(
+            get("tx_b").sigma2_cohort.to_bits(),
+            1.25_f64.to_bits(),
+            "tx_b must carry ITS OWN sigma2_logPAL, not tx_a's"
+        );
+        assert_eq!(
+            get("tx_c").sigma2_cohort.to_bits(),
+            3.75_f64.to_bits(),
+            "tx_c must carry ITS OWN sigma2_logPAL, not a cohort-wide constant"
+        );
+        assert_eq!(get("tx_a").mu_cohort.to_bits(), 9.0_f64.to_bits());
+        assert_eq!(get("tx_b").mu_cohort.to_bits(), 5.0_f64.to_bits());
+        assert_eq!(get("tx_c").mu_cohort.to_bits(), 7.25_f64.to_bits());
+
+        // `sigma2` is INITIALISED from the same column and the M-step rewrites
+        // only that one, so before any solve the two agree exactly.
+        assert_eq!(get("tx_a").sigma2.to_bits(), 0.5_f64.to_bits());
+
+        // The property that makes this more than three restatements of the same
+        // number: the three values must be pairwise distinct. If any future
+        // edit made them share a value, the "own column" wording in the field
+        // docs would be false while every assertion above still passed.
+        let s2s = [
+            get("tx_a").sigma2_cohort,
+            get("tx_b").sigma2_cohort,
+            get("tx_c").sigma2_cohort,
+        ];
+        assert!(
+            s2s[0] != s2s[1] && s2s[1] != s2s[2] && s2s[0] != s2s[2],
+            "the three transcripts were given three different sigma2_logPAL values, \
+             so the loaded priors must be three different numbers; got {s2s:?}"
+        );
+
+        let _ = std::fs::remove_file(&emission);
+    }
+
+    /// D1, negative half. `sigma2_cohort` enters the M-step as a VARIANCE
+    /// (`2.0 * beta_0 * p.sigma2_cohort`). A non-finite or non-positive value
+    /// poisons `p.sigma2` for that transcript and, through the cohort fallback,
+    /// for every transcript borrowing it -- silently, because the arithmetic
+    /// still completes. So the loader refuses it instead.
+    #[test]
+    fn test_emission_loader_rejects_a_non_positive_or_non_finite_sigma2_prior() {
+        for (label, bad) in [("zero", 0.0_f64), ("negative", -1.0), ("nan", f64::NAN)] {
+            let emission = scratch(&format!("prior_bad_{label}_emission.parquet"));
+            write_test_emission(
+                &emission,
+                &[("tx_ok", "g", 7.0, 0.5), ("tx_bad", "g", 6.0, bad)],
+            );
+
+            let err = load_emission_parameters(&emission)
+                .expect_err(&format!("sigma2_logPAL = {bad} must be rejected at load"));
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("sigma2_logPAL"),
+                "the error must name the offending COLUMN, not just the row; got: {msg}"
+            );
+            assert!(
+                msg.contains("tx_bad"),
+                "the error must name the offending TRANSCRIPT so an operator can \
+                 find it in a 70k-row model; got: {msg}"
+            );
+            let _ = std::fs::remove_file(&emission);
         }
     }
 

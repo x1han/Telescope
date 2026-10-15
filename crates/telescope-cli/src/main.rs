@@ -452,9 +452,23 @@ fn main() -> Result<()> {
             // `a_duplicated_universe_entry_is_collapsed_by_the_header_reader`
             // in `crates/telescope-cli/tests/`, and the failure mode itself, at
             // the layer where it IS reachable, by
-            // `a_duplicated_universe_key_reaches_the_emitted_row_set_twice` in
-            // `emission_model.rs`. Moving the law into `build_emission_from_anchors`,
-            // where `rows.len()` is known, is filed as a thawing-zone draft.
+            // `a_duplicated_universe_key_is_rejected_at_the_entry_point` in
+            // `emission_model.rs`.
+            //
+            // UPDATED 2026-10-15. The line above used to end by filing "moving
+            // the law into `build_emission_from_anchors`" as a thawing-zone
+            // draft. That draft has since been taken, and it closed this rather
+            // than opening it: `build_emission_from_anchors` now (a) `bail!`s
+            // at its entry point if `reference_universe` contains a duplicate
+            // name, so the malformed input is refused before a row is built
+            // rather than after; and (b) asserts
+            // `n_imputed == n_imputed_padded + n_imputed_suppressed` on the way
+            // out, where the emitted counts are known. So the CLI guard's
+            // soundness no longer rests on noodles' map semantics ALONE -- the
+            // library entry point refuses the input in its own right. This
+            // assertion remains an identity on well-formed input, which is
+            // still true and is now a second line of defence rather than the
+            // only one.
             //
             // Only meaningful when a universe was supplied; with none,
             // `n_reference == 0` and the sum is not the universe size.
