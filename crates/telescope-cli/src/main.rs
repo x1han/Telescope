@@ -397,6 +397,34 @@ fn main() -> Result<()> {
                 "[telescope]    n_imputed_rows:           {}",
                 tiers.n_imputed
             );
+            // CONSERVATION, asserted rather than warned.
+            //
+            // The emitted key set is `anchored UNION universe`, so the law that
+            // always holds is
+            //     n_after == n_reference + n_anchored_not_in_reference
+            // NOT `n_after == n_reference`: that one is false whenever an
+            // anchored transcript is absent from the universe, which is a
+            // configuration the code above deliberately WARNS about rather than
+            // rejects. Asserting the strict form would turn a tolerated
+            // configuration into a hard failure on runs that work today.
+            //
+            // This is fail-closed against the regression it was added for: if
+            // universe padding ever stops emitting a key it should emit (the
+            // `em_eligible`-suppressed resurrection bug was exactly that),
+            // `n_after` falls short and this fails the run instead of printing a
+            // completeness line that quietly does not add up.
+            //
+            // Only meaningful when a universe was supplied; with none,
+            // `n_reference == 0` and the sum is not the universe size.
+            if tiers.n_reference > 0 {
+                anyhow::ensure!(
+                    n_after == tiers.n_reference + tiers.n_anchored_not_in_reference,
+                    "emission conservation violated: emitted {} != reference universe {} + anchored-not-in-reference {}",
+                    n_after,
+                    tiers.n_reference,
+                    tiers.n_anchored_not_in_reference,
+                );
+            }
             if tiers.n_anchored_not_in_reference > 0 {
                 eprintln!(
                     "[telescope][WARN] {} anchored transcript(s) are absent from the reference universe, so n_emission_after ({}) is NOT the universe size ({}). The universe and the model disagree about which transcripts exist.",

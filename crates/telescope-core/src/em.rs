@@ -4513,6 +4513,218 @@ mod tests {
         );
     }
 
+    /// A transcript that wins NO posterior mass still gets an M-step, and the
+    /// σ² it lands on is `2*beta_0*sigma2_cohort / (2*nu_0 + c)` — NOT the prior.
+    ///
+    /// The M-step loop iterates EVERY graph transcript, so `w_sum == 0` is a
+    /// state the estimator genuinely visits rather than a hypothetical. This
+    /// pins the value there, because before it existed the behaviour was
+    /// documented nowhere and tested nowhere.
+    ///
+    /// The fixture produces W = 0 the way PRODUCTION produces it: the transcript
+    /// is poly(A)-incompetent, so the E-step pushes it to `-inf` and it wins no
+    /// mass. Round 101 made `emission_model.rs` EMIT such rows (as
+    /// `is_poly_a_competent = false`) instead of dropping them, which is what
+    /// gives this state a real producer on the `build-emission` path. A
+    /// synthetic "transcript nobody references" would yield the same number for
+    /// a different reason and would not survive "can this happen in a run?".
+    ///
+    /// WHAT THE FACTOR IS, and what it is not. The ratio to the prior is
+    /// `2 / (2*nu_0 + c)`, so it TRACKS `c` — 0.800x at c = 0.5, 0.667x at c = 1,
+    /// 0.500x at c = 2, 0.400x at c = 3, 0.286x at c = 5. "With no evidence σ²
+    /// is half the prior" is therefore a statement about the PRODUCTION value
+    /// c = 2, NOT a hyperparameter-independent property of the estimator. See
+    /// MSTEP-PRIOR-SPEC-v1.0.md, section "W = 0 transcripts".
+    ///
+    /// `c = 0` — the value that would make the ratio exactly 1.000 and reduce the
+    /// M-step to a no-op at W = 0 — is UNREACHABLE through the parameterised entry
+    /// point, whose guard is `is_finite() && > 0.0`. The shrinkage cannot be
+    /// switched off; the closest reachable ratio is 0.800x. Asserted rather than
+    /// assumed, because "you could always pass c = 0" is the obvious objection
+    /// to "the M-step always shrinks σ²".
+    #[test]
+    fn test_zero_weight_transcript_sigma2_is_two_beta0_prior_over_two_nu0_plus_c() {
+        let log_pal = (100.0_f32).log2();
+        let emission = scratch("w0_emission.parquet");
+        write_test_emission_with_competence(
+            &emission,
+            &[
+                (
+                    "tx0",
+                    "gene0",
+                    DOF_OFFSET_MU_COHORT,
+                    DOF_OFFSET_SIGMA2_COHORT,
+                    true,
+                ),
+                (
+                    "tx1",
+                    "gene1",
+                    DOF_OFFSET_MU_COHORT,
+                    DOF_OFFSET_SIGMA2_COHORT,
+                    true,
+                ),
+                // INCOMPETENT: identical parameters, so the ONLY reason this
+                // transcript wins no mass is the competence mask. Move the flag
+                // off tx2 and the W = 0 state disappears -- which is what the
+                // `em_accum_weight` assertion below would catch.
+                (
+                    "tx2",
+                    "gene2",
+                    DOF_OFFSET_MU_COHORT,
+                    DOF_OFFSET_SIGMA2_COHORT,
+                    false,
+                ),
+            ],
+        );
+
+        // c = 0 is excluded on purpose: the entry point rejects it
+        // (`is_finite() && > 0.0`). 5.0 is the top of Fig 3C's sweep.
+        let sweep = [0.5f64, 1.0, 2.0, 3.0, 5.0];
+        let mut measured = Vec::new();
+        for c in sweep {
+            let profile = scratch(&format!("w0_profile_{c}.parquet"));
+            let mut params = Vec::new();
+            solve_and_write_profile_with_dof_offset(
+                synth_graph(log_pal, &[("tx0", 900), ("tx1", 900), ("tx2", 900)]),
+                &emission,
+                "TEST",
+                &profile,
+                1e-6,
+                // 2, not 1: with max_iter = 1 the loop runs the E-step and exits
+                // BEFORE the M-step, so sigma2 and mu are still their INITIAL
+                // values and every assertion below would pass while measuring
+                // nothing. The other dof-offset fixtures use 2 for this reason.
+                2,
+                100.0,
+                FIVE_PRIME_OFF,
+                POLY_A_ON,
+                FIVE_PRIME_WINDOW,
+                PRUNE_MAX_DELTA_AS,
+                MIN_WEIGHT,
+                None,
+                Some(&mut params),
+                None,
+                c,
+            )
+            .unwrap();
+            let _ = std::fs::remove_file(&profile);
+
+            // Locate by NAME, never by index: `params` is ordered by the graph's
+            // transcript list, and an index would silently assert the wrong row.
+            let w0 = params
+                .iter()
+                .flatten()
+                .find(|p| p.transcript_id == "tx2")
+                .expect(
+                    "tx2 must have params: it is in the graph, so the M-step \
+                         visits it regardless of the weight it won",
+                );
+            let live = params
+                .iter()
+                .flatten()
+                .find(|p| p.transcript_id == "tx0")
+                .expect("tx0 must have params");
+
+            // VACUITY GUARD. Everything below is about W = 0, so assert it
+            // rather than assuming it: if the competence mask stopped firing,
+            // tx2 would win half the posterior and this whole test would be
+            // measuring the ordinary W > 0 path while appearing to pass.
+            assert_eq!(
+                w0.em_accum_weight, 0.0,
+                "tx2 is pushed to -inf, so its M-step W must be exactly 0.0; \
+                 got {}. If this is non-zero the fixture no longer produces a \
+                 W = 0 transcript and the sigma2 assertions below are measuring \
+                 something else.",
+                w0.em_accum_weight
+            );
+            // CONTROL: the other two DO win mass, so W = 0 is specific to tx2
+            // and not a property of this fixture as a whole.
+            assert!(
+                live.em_accum_weight > 0.0,
+                "CONTROL: tx0 must win posterior mass ({}) or the zero above says \
+                 nothing about incompetence",
+                live.em_accum_weight
+            );
+
+            let want = 2.0 * BETA_0 * DOF_OFFSET_SIGMA2_COHORT / (2.0 * NU_0 + c);
+            assert_eq!(
+                w0.sigma2.to_bits(),
+                want.to_bits(),
+                "sigma2 at W = 0 and c = {c} must equal \
+                 2*beta_0*sigma2_cohort / (2*nu_0 + c) BIT FOR BIT; got {:.17}, \
+                 want {:.17}",
+                w0.sigma2,
+                want
+            );
+
+            // THE ASYMMETRY. At W = 0 the tau_0 momentum term cancels exactly and
+            // mu returns to the prior, while sigma2 does not. R99 §3.4 reported
+            // the sigma2 half; the mu half is what makes it an asymmetry rather
+            // than a uniform "no evidence means no update".
+            assert_eq!(
+                w0.mu.to_bits(),
+                DOF_OFFSET_MU_COHORT.to_bits(),
+                "at W = 0 mu must land EXACTLY on the cohort prior, not near it; \
+                 got {:.17}",
+                w0.mu
+            );
+
+            // Not the floor. Below this the closed form would be unreachable and
+            // the bit-exact assertion above would be measuring the clamp.
+            assert!(
+                w0.sigma2 > INSTRUMENTAL_PAL_NOISE_FLOOR,
+                "sigma2 at c = {c} is {}, at or below INSTRUMENTAL_PAL_NOISE_FLOOR \
+                 ({INSTRUMENTAL_PAL_NOISE_FLOOR}); the floor is clamping and the \
+                 bit-exact comparison is vacuous",
+                w0.sigma2
+            );
+
+            // The ratio IS the mechanism, stated as a measurement rather than
+            // as prose. `sq_dev_new` is 0 at W = 0, so the numerator is the
+            // prior term alone and the ratio must be exactly 2/(2*nu_0 + c).
+            let ratio = w0.sigma2 / DOF_OFFSET_SIGMA2_COHORT;
+            let want_ratio = 2.0 / (2.0 * NU_0 + c);
+            assert_eq!(
+                ratio.to_bits(),
+                want_ratio.to_bits(),
+                "the W = 0 ratio to the prior must be exactly 2/(2*nu_0 + c) = \
+                 {want_ratio:.6} at c = {c}; got {ratio:.17}. The factor TRACKS c, \
+                 so \"sigma2 is halved with no evidence\" holds only at c = 2."
+            );
+            measured.push((c, ratio));
+        }
+        let _ = std::fs::remove_file(&emission);
+
+        // Pin the production number, which is the one that reached a report:
+        // 0.5x at c = 2, from `sigma2_cohort = 0.5`.
+        let prod = measured
+            .iter()
+            .find(|(c, _)| *c == 2.0)
+            .expect("the sweep contains the production c = 2");
+        assert_eq!(
+            prod.1.to_bits(),
+            0.5f64.to_bits(),
+            "at the production c = 2 the W = 0 sigma2 is exactly HALF the prior; \
+             got {:.17}. If this moved, R99 §3.4's table is stale.",
+            prod.1
+        );
+        // Strictly decreasing in c: the factor has no free parameter to break
+        // monotonicity, so a flat or rising step means `c` reached the floor or
+        // the E-step. Same reading rule as the sweep test above.
+        for w in measured.windows(2) {
+            assert!(
+                w[1].1 < w[0].1,
+                "the W = 0 ratio must be STRICTLY decreasing in c, but \
+                 ratio({}) = {:.6} is not below ratio({}) = {:.6}. Investigate \
+                 before writing this down as a result.",
+                w[1].0,
+                w[1].1,
+                w[0].0,
+                w[0].1
+            );
+        }
+    }
+
     /// The boundary guard, and why it has to exist: `f64::max` ABSORBS the
     /// failure. Measured: `f64::max(f64::NAN, 0.04) == 0.04` and
     /// `f64::max(-1.04, 0.04) == 0.04`. So a `c` of `-2.5`, `0.0` or `NaN`

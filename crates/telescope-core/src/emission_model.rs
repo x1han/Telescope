@@ -891,6 +891,18 @@ where
     )?;
 
     // 2. Optional em_eligible filter.
+    //
+    // `em_suppressed` records what the filter removed, BY MOVE -- the loop
+    // consumes `tx_accums`, so cloning the dropped keys would cost a clone per
+    // ineligible transcript. It is consumed later, when the reference universe
+    // pads the row set: a suppressed transcript that the universe names is
+    // still emitted, but as an INCOMPETENT row rather than a competent one.
+    // Dropping the row instead would leave `rows.len() < n_reference` with no
+    // counter able to see it, and would report the transcript as `n_missing`
+    // in the candidate ledger -- whose documented question is "would padding
+    // have saved this read?" (em.rs `CandidateAvailability`) -- when the truth
+    // is that the suppression was deliberate. See the match arm below.
+    let mut em_suppressed: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Some(te_path) = transcript_evidence_path {
         let em_set = load_em_eligible_set(&te_path)?;
         let mut filtered_accums: HashMap<String, TxAccumulator> = HashMap::new();
@@ -901,6 +913,8 @@ where
                     filtered_log2.push(v);
                 }
                 filtered_accums.insert(tx, acc);
+            } else {
+                em_suppressed.insert(tx);
             }
         }
         tx_accums = filtered_accums;
@@ -1011,22 +1025,56 @@ where
         Vec::with_capacity(n_rows_emitted);
 
     for tx_id in tx_keys {
-        // IMPUTED ROW. Reached only for a universe key with no anchors, which
-        // the union above guarantees is disjoint from `tx_accums`.
+        // IMPUTED ROW. Reached only for a universe key with no entry in
+        // `tx_accums`, which the union above guarantees. Two distinct reasons
+        // land here, and they are NOT the same row:
         //
-        // Every value here is the cohort fit, and `n_cohort_flnc = 0` is the
+        //   (a) never had anchors -- `is_polyA_competent = true`. That is the
+        //       load-bearing choice, and it is NOT a claim this transcript was
+        //       measured to have a poly(A) tail; it says the row is evaluable.
+        //       The F3 axiom isolates transcripts with NO poly(A), and a
+        //       transcript absent from the anchor pool has not been shown to be
+        //       one. HC2 measured `pt >= 10` on 98.23% of the reads landing on
+        //       exactly this set, so the isolated case is not what is padded.
+        //
+        //   (b) HAD anchors and was removed by the `em_eligible` filter --
+        //       `is_polyA_competent = false`. Marking this row true would let a
+        //       transcript the resolver deliberately suppressed win posterior
+        //       mass, which is the bug this arm exists to close: the reads of a
+        //       TierC transcript (zero poly(A)-compatible reads BY CONSTRUCTION,
+        //       `resolver::classify_tier`) or of a TierB transcript superseded by
+        //       its TierA isoform would stay attributed to it instead of to the
+        //       transcript that supersedes it.
+        //
+        // `false` is not a demotion, it is the E-step's own switch: an
+        // incompetent candidate is pushed as `-inf` and cannot win any mass, so
+        // the row is inert while still present. Keeping the row is what keeps
+        // `rows.len() == n_reference` and routes the candidate to the ledger's
+        // `n_incompetent` bucket -- whose question is "where did this candidate
+        // go?" -- rather than to `n_missing`, whose question is "would padding
+        // have saved this read?" (em.rs `CandidateAvailability`).
+        //
+        // In both cases the fit is the cohort fit and `n_cohort_flnc = 0` is the
         // in-schema marker that says "imputed, not observed" — the 7-column
         // schema is frozen and gets no eighth column for this.
-        //
-        // `is_polyA_competent = true` is the load-bearing choice and it is NOT
-        // a claim that this transcript was measured to have a poly(A) tail. It
-        // says the row is evaluable: the F3 axiom isolates transcripts with NO
-        // poly(A), and a transcript absent from the anchor pool has not been
-        // shown to be one. HC2 measured `pt >= 10` on 98.23% of the reads
-        // landing on exactly this set, so the isolated case is not what is
-        // being padded.
         let (gene_id, poly_a_frac, is_poly_a_competent, n_obs, fit, tier) =
             match tx_accums.get(tx_id.as_str()) {
+                None if em_suppressed.contains(tx_id.as_str()) => {
+                    let gene = tx_to_gene
+                        .and_then(|m| m.get(tx_id).cloned())
+                        .unwrap_or_else(|| (*tx_id).clone());
+                    (
+                        gene,
+                        1.0_f64,
+                        false,
+                        0_u32,
+                        LogNormalFit {
+                            mu: cohort_fit.mu,
+                            sigma2: cohort_fit.sigma2,
+                        },
+                        TIER_L3_IMPUTED,
+                    )
+                }
                 None => {
                     let gene = tx_to_gene
                         .and_then(|m| m.get(tx_id).cloned())
@@ -2546,6 +2594,139 @@ mod tests {
         );
         assert_eq!(rows[0].0, "tx_anchored", "sorted first");
         assert_eq!(rows[1].4, 0, "tx_pad_a is the imputed one");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A transcript the `em_eligible` filter removed and a transcript the
+    /// universe has never heard of both arrive at the row-assembly match with
+    /// `tx_accums.get(..) == None`, but they are not the same thing, and the
+    /// emitted row is where the difference has to survive.
+    ///
+    /// Before this test's production change both took the same arm and both
+    /// were written `is_poly_a_competent = true`, which told the EM solver that
+    /// a deliberately suppressed transcript had a flawless poly(A)
+    /// distribution. The suppression was therefore silently undone downstream,
+    /// and the candidate ledger filed the transcript under `rows_emitted`
+    /// rather than `n_incompetent` -- `n_incompetent` being the bucket whose
+    /// documented question is "present, but pushed to `-inf`".
+    ///
+    /// `tx_anchorless` is the CONTROL and it is not decoration. It is in the
+    /// universe but was never anchored, so the filter never saw it and it must
+    /// stay competent. Without that row a mutation that marked *every*
+    /// `None` transcript incompetent would pass this test, while
+    /// `test_universal_em_eligible_filtering` stays green because it supplies
+    /// no universe.
+    #[test]
+    fn test_suppressed_transcripts_emitted_as_incompetent() {
+        let tmp = local_scratch("telescope_test_suppressed_incompetent");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+
+        let fxs = vec![
+            TxFixture {
+                gene_id: "gene_A".into(),
+                tx_id: "tx_keep".into(),
+                pals: (10..20).collect::<Vec<i32>>(),
+            },
+            TxFixture {
+                gene_id: "gene_A".into(),
+                tx_id: "tx_filtered".into(),
+                pals: (30..40).collect::<Vec<i32>>(),
+            },
+        ];
+
+        let anchor_pool = tmp.join("anchor_pool.parquet");
+        let te_path = tmp.join("transcript_evidence.parquet");
+        let out = tmp.join("emission.parquet");
+        write_anchor_pool_parquet(&anchor_pool, &fxs);
+        // `tx_anchorless` is deliberately ABSENT here. `load_em_eligible_set`
+        // inserts only rows where `em_eligible == true`, so "not listed" and
+        // "listed false" are the same thing to the filter -- which is why an
+        // anchor-less transcript is never suppressed and the control below
+        // still means what it claims to.
+        write_transcript_evidence_minimal(
+            &te_path,
+            &[("tx_keep".into(), true), ("tx_filtered".into(), false)],
+        );
+        let universe: Vec<String> = vec![
+            "tx_keep".into(),
+            "tx_filtered".into(),
+            "tx_anchorless".into(),
+        ];
+
+        let tiers = build_emission_from_anchors(
+            &anchor_pool,
+            Some(&te_path),
+            &out,
+            &FallbackConfig::default(),
+            Some(&universe),
+            None,
+        )
+        .expect("em_eligible filter + reference universe");
+
+        let rows = read_emission_parquet(&out);
+        let by_tx: HashMap<&str, _> = rows.iter().map(|r| (r.0.as_str(), r)).collect();
+
+        // (1) The suppressed row is PRESENT and the count is the universe size.
+        assert_eq!(tiers.n_reference, 3);
+        assert_eq!(
+            rows.len(),
+            3,
+            "the union is anchored UNION universe, so the row count is \\
+             n_reference here (both anchored transcripts are in the universe). \\
+             rows={rows:?}"
+        );
+        assert_eq!(tiers.n_anchored_not_in_reference, 0);
+        // The law `telescope-cli` asserts on the production path, evaluated
+        // against the same numbers. See the `ensure!` in main.rs.
+        assert_eq!(
+            rows.len(),
+            tiers.n_reference + tiers.n_anchored_not_in_reference,
+            "emission conservation"
+        );
+
+        let sup = by_tx.get("tx_filtered").expect(
+            "the suppressed transcript must still be emitted, just \\
+                     marked incompetent -- dropping the row would leave \\
+                     rows.len() < n_reference with no counter able to see it",
+        );
+        assert_eq!(sup.4, 0, "its anchors were filtered out");
+        // (2) The whole point: strictly false, not merely "false because zero".
+        assert!(
+            !sup.3,
+            "an em_eligible-suppressed transcript must be emitted \\
+             INCOMPETENT. competent=true here claims a flawless poly(A) \\
+             distribution for a transcript the filter rejected on purpose, \\
+             and hands it a non-zero posterior in the EM solve."
+        );
+
+        // CONTROL: never anchored, never seen by the filter, still competent.
+        let anchorless = by_tx
+            .get("tx_anchorless")
+            .expect("the universe key with no anchors is emitted as imputed");
+        assert_eq!(anchorless.4, 0);
+        assert!(
+            anchorless.3,
+            "CONTROL: a universe transcript with no anchors is imputed for \\
+             COMPLETENESS, not suppressed, so it stays competent. If this is \\
+             false the match arm is matching on `None` rather than on being \\
+             suppressed."
+        );
+
+        let keep = by_tx.get("tx_keep").expect("the eligible transcript");
+        assert!(keep.3);
+        assert_eq!(
+            keep.4, 10,
+            "the eligible transcript keeps its own 10 observations"
+        );
+
+        // The partition stays four terms: neither imputed row is folded into
+        // the anchored counters, so every published tier percentage still
+        // describes the anchored population.
+        assert_eq!(tiers.n_imputed, 2);
+        assert_eq!(tiers.l1 + tiers.l2 + tiers.l3, 1);
+        assert_eq!(tiers.l1 + tiers.l2 + tiers.l3 + tiers.n_imputed, rows.len());
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
