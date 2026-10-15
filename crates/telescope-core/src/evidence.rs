@@ -1741,8 +1741,32 @@ pub mod test_support {
     /// Molecule ordering out of `extract_evidence` follows HashMap iteration
     /// order, so callers must look molecules up by `read_id`.
     pub fn write_synthetic_bam(tag: &str, records: Vec<RecordBuf>) -> std::path::PathBuf {
+        write_synthetic_bam_named(tag, &["tx0", "tx1", "tx2"], records)
+    }
+
+    /// `write_synthetic_bam` with the `@SQ` names chosen by the caller, so a
+    /// caller can build a reference universe it cannot otherwise produce.
+    ///
+    /// Added 2026-10-15 for the CLI conservation negative control. The
+    /// production `read_reference_universe` deliberately does NOT de-duplicate
+    /// `@SQ` names ("silently collapsing one would turn a corrupt reference
+    /// into a plausible-looking universe"), so a header naming the same
+    /// transcript twice reaches the universe-padding loop twice. Under the
+    /// fixed tx0/tx1/tx2 header that state is unreachable, which would have
+    /// left the conservation `ensure!` in `main.rs` with no way to be shown to
+    /// fire at all -- the guard would have been unfalsifiable by construction
+    /// and therefore unverified by the project's own admission rule.
+    ///
+    /// `names` is passed through verbatim, duplicates included. An empty name
+    /// is rejected by the header builder, so a caller cannot accidentally
+    /// construct the OTHER degenerate header case (a nameless reference).
+    pub fn write_synthetic_bam_named(
+        tag: &str,
+        names: &[&str],
+        records: Vec<RecordBuf>,
+    ) -> std::path::PathBuf {
         let mut header = sam::Header::builder();
-        for name in ["tx0", "tx1", "tx2"] {
+        for &name in names {
             header = header.add_reference_sequence(
                 name,
                 Map::<ReferenceSequence>::new(const { NonZero::new(REF_LEN).unwrap() }),
@@ -1751,7 +1775,7 @@ pub mod test_support {
         let header = header.build();
 
         let path = std::env::temp_dir().join(format!(
-            "telescope_evidence_{}_test_{}.bam",
+            "telescope_evidence_named_{}_test_{}.bam",
             tag,
             std::process::id()
         ));

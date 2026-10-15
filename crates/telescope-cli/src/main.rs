@@ -393,9 +393,16 @@ fn main() -> Result<()> {
             );
             eprintln!("[telescope]    n_emission_before:        {}", n_anchored);
             eprintln!("[telescope]    n_emission_after:         {}", n_after);
+            // The total stays first and stays backwards-compatible; the two
+            // detail counts follow in parentheses so the line still parses for
+            // anything reading `n_imputed_rows: <int>` and still ends on an
+            // integer. They are printed because the two populations are
+            // OPPOSITE facts -- `padded` was never observed, `suppressed` was
+            // observed and then removed on purpose -- and a bare total cannot
+            // tell a reader which one they are looking at.
             eprintln!(
-                "[telescope]    n_imputed_rows:           {}",
-                tiers.n_imputed
+                "[telescope]    n_imputed_rows:           {} (padded: {}, suppressed: {})",
+                tiers.n_imputed, tiers.n_imputed_padded, tiers.n_imputed_suppressed
             );
             // CONSERVATION, asserted rather than warned.
             //
