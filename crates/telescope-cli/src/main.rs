@@ -415,11 +415,46 @@ fn main() -> Result<()> {
             // rejects. Asserting the strict form would turn a tolerated
             // configuration into a hard failure on runs that work today.
             //
-            // This is fail-closed against the regression it was added for: if
-            // universe padding ever stops emitting a key it should emit (the
-            // `em_eligible`-suppressed resurrection bug was exactly that),
-            // `n_after` falls short and this fails the run instead of printing a
-            // completeness line that quietly does not add up.
+            // WHAT THIS ACTUALLY GUARDS AGAINST, corrected 2026-10-15. The
+            // comment here used to say this is "fail-closed against the
+            // regression it was added for ... (the `em_eligible`-suppressed
+            // resurrection bug was exactly that)". THAT WAS FALSE, and it is
+            // worth being precise because the two bugs are easy to conflate:
+            //
+            //   * P0-2, the bug this assertion was added alongside, was a
+            //     COMPETENCE-FLAG error. The suppressed transcript was emitted
+            //     either way — universe padding had already re-added it — so
+            //     the ROW COUNT NEVER CHANGED and a row-count law could not
+            //     have seen it. Its coverage is
+            //     `test_suppressed_transcripts_emitted_as_incompetent`, at the
+            //     library layer, where the flag is written.
+            //   * The defect this law DOES cover is padding STOPPING a key it
+            //     should emit (the "drop the row" alternative to the fix). Then
+            //     `n_after` falls one short per dropped key.
+            //
+            // It is fail-closed against the second, and the distinction matters:
+            // reading the old comment would credit this assertion with covering
+            // P0-2, and dropping it on the strength of that credit would remove
+            // a check without anyone knowing P0-2 was ever unprotected.
+            //
+            // MEASURED LIMITATION, 2026-10-15. This assertion currently CANNOT
+            // fire from the CLI. Both sides are the cardinality of
+            // `anchored UNION universe`, so the law is an identity on any two
+            // SETS; the only input that breaks it is a universe naming a
+            // transcript twice, and `read_reference_universe` returns noodles'
+            // header map, which collapses duplicate `@SQ` names before this
+            // code sees them. Measured: `@SQ SN:tx0, SN:tx1, SN:tx1` yields a
+            // two-entry universe and this run exits 0.
+            //
+            // So it is kept because the expert ruling locks it and because a
+            // future `noodles` upgrade could make it reachable -- NOT because it
+            // is currently load-bearing. The precondition is pinned by
+            // `a_duplicated_universe_entry_is_collapsed_by_the_header_reader`
+            // in `crates/telescope-cli/tests/`, and the failure mode itself, at
+            // the layer where it IS reachable, by
+            // `a_duplicated_universe_key_reaches_the_emitted_row_set_twice` in
+            // `emission_model.rs`. Moving the law into `build_emission_from_anchors`,
+            // where `rows.len()` is known, is filed as a thawing-zone draft.
             //
             // Only meaningful when a universe was supplied; with none,
             // `n_reference == 0` and the sum is not the universe size.
