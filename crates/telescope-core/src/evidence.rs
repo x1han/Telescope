@@ -980,6 +980,13 @@ pub mod test_support {
     use std::num::NonZero;
 
     use noodles_core::Position;
+
+    /// RE-EXPORTED so a caller in another crate can build a flagged record
+    /// without depending on `noodles_sam` itself. `telescope-cli`'s
+    /// integration tests do not declare that dependency, and re-implementing
+    /// the fixture there is exactly the copy that drifts.
+    pub use noodles_sam::alignment::record::Flags as SamFlags;
+
     use noodles_sam::{
         self as sam,
         alignment::{

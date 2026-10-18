@@ -205,6 +205,21 @@ enum Cmd {
         #[arg(long, default_value_t = 200)]
         max_reads_per_sample: usize,
 
+        /// Absolute floor on the per-read `AS_best - AS_second` gap.
+        ///
+        /// ⚠ THE DEFAULT 0.0 IS NOT A CALIBRATED PRODUCTION VALUE. It means
+        /// "no gap requirement" — this criterion is switched off unless you set
+        /// it. Nothing in this repository measures what it should be; the owner
+        /// declined to ship an uncalibrated default. Read 0.0 as "off", never as
+        /// "zero gap is correct".
+        #[arg(long, default_value_t = 0.0)]
+        gap_abs: f64,
+
+        /// Floor on the per-read `AS_best - AS_second` gap as a fraction of
+        /// `AS_best`. Same caveat as `--gap-abs`: the 0.0 default means "off".
+        #[arg(long, default_value_t = 0.0)]
+        gap_rel: f64,
+
         /// Write the anchor-level filter ledger here as JSON
         /// (`telescope.filter_ledger/v1`).
         ///
@@ -601,6 +616,8 @@ fn main() -> Result<()> {
             tes_slack,
             min_coverage,
             max_reads_per_sample,
+            gap_abs,
+            gap_rel,
             ledger,
         } => {
             if bams.len() != sample_ids.len() {
@@ -616,6 +633,28 @@ fn main() -> Result<()> {
             eprintln!("  min_cov:    {}", min_coverage);
             eprintln!("  cap_per_tx: {}", max_reads_per_sample);
             eprintln!("  output:     {}", output.display());
+            // The gap floors are printed even at their defaults precisely
+            // BECAUSE the defaults are "off" and not calibrated values: a run
+            // log that reads `gap_abs=0.0` without this line is indistinguishable
+            // from a run where somebody believes zero is the right threshold.
+            eprintln!(
+                "  gap_abs:    {} ({})",
+                gap_abs,
+                if gap_abs == 0.0 {
+                    "OFF — not a calibrated value"
+                } else {
+                    "active"
+                }
+            );
+            eprintln!(
+                "  gap_rel:    {} ({})",
+                gap_rel,
+                if gap_rel == 0.0 {
+                    "OFF — not a calibrated value"
+                } else {
+                    "active"
+                }
+            );
 
             let tx_to_g = match tx_to_gene {
                 Some(p) => anchor_builder::TxToGene::from_tsv(&p)
@@ -624,20 +663,20 @@ fn main() -> Result<()> {
             };
             eprintln!("  tx_to_gene entries: {}", tx_to_g.len());
 
+            let params = anchor_builder::AnchorParams {
+                tes_slack,
+                min_coverage,
+                max_reads_per_sample,
+                gap_abs,
+                gap_rel,
+            };
             let pairs: Vec<(PathBuf, &str)> = bams
                 .iter()
                 .cloned()
                 .zip(sample_ids.iter().map(|s| s.as_str()))
                 .collect();
-            let stats = anchor_builder::build_anchor_pool(
-                &pairs,
-                &tx_to_g,
-                &output,
-                tes_slack,
-                min_coverage,
-                max_reads_per_sample,
-            )
-            .context("anchor_builder::build_anchor_pool failed")?;
+            let stats = anchor_builder::build_anchor_pool(&pairs, &tx_to_g, &output, params)
+                .context("anchor_builder::build_anchor_pool failed")?;
             eprintln!("[telescope]  {}", stats.report());
             if let Some(p) = ledger.as_ref() {
                 ledger_json::write_anchor(p, &stats)

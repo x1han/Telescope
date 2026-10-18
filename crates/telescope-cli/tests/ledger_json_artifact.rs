@@ -24,14 +24,14 @@ use std::process::Command;
 
 use telescope_core::evidence::test_support::{
     synth_record, synth_record_no_position, synth_record_no_read_id, synth_record_no_refid,
-    write_synthetic_bam,
+    synth_record_with_flags, write_synthetic_bam, SamFlags as Flags,
 };
 
 const SCHEMA: &str = "telescope.filter_ledger/v1";
 
-/// The nine anchor-level filter buckets. Every one is read back out of the
+/// The twelve anchor-level filter buckets. Every one is read back out of the
 /// artifact and summed, so dropping a key from the `format!` cannot survive.
-const ANCHOR_BUCKETS: [&str; 9] = [
+const ANCHOR_BUCKETS: [&str; 12] = [
     "unique",
     "no_refid",
     "no_position",
@@ -41,6 +41,9 @@ const ANCHOR_BUCKETS: [&str; 9] = [
     "coverage",
     "polya_invalid",
     "cap",
+    "unmapped",
+    "supplementary",
+    "eligible_not_anchor",
 ];
 
 /// A BAM that trips all three of the filter paths Ticket 2B-Fix proved
@@ -83,6 +86,49 @@ fn all_good_bam(tag: &str) -> PathBuf {
         vec![
             synth_record("a0", 0, Some(0), 0, 60),
             synth_record("b0", 1, Some(1), 0, 60),
+        ],
+    )
+}
+
+/// A BAM whose three NEW buckets are non-zero and DISTINGUISHABLE: 1 unmapped,
+/// 2 supplementary, 3 physically eligible but not selected as the anchor.
+///
+/// The values are 1 / 2 / 3 for the same reason `three_defect_bam` uses them:
+/// equal values would make a transposition in the `format!` invisible, because
+/// it leaves the SUM unchanged and only a per-bucket expectation can see it.
+fn three_new_buckets_bam(tag: &str) -> PathBuf {
+    write_synthetic_bam(
+        tag,
+        vec![
+            // 1 x unmapped
+            synth_record_with_flags("u", 0, Flags::UNMAPPED, Some(10)),
+            // 2 x supplementary
+            synth_record_with_flags("s1", 0, Flags::SUPPLEMENTARY, Some(10)),
+            synth_record_with_flags("s2", 0, Flags::SUPPLEMENTARY, Some(10)),
+            // 3 records of ONE read that is physically eligible twice over but
+            // emits no anchor: an exact AS tie between two transcripts. That
+            // is 3 records in, 3 records into `eligible_not_anchor`.
+            synth_record("t0", 0, Some(100), 0, 60),
+            synth_record("t0", 1, Some(100), 0, 60),
+            synth_record("t0", 2, Some(100), 0, 60),
+        ],
+    )
+}
+
+/// A BAM whose every record carries MAPQ BELOW the old gate's threshold of 20.
+///
+/// This is the input `filtered_unique` used to absorb. It exists so the retired
+/// slot can be pinned on the path that actually runs the tool: the renderer unit
+/// test can only prove the key is still emitted, not that nothing increments it,
+/// because `AnchorStats::default()` is 0 whether the rule is enforced or not.
+fn retired_mapq_gate_bam(tag: &str) -> PathBuf {
+    write_synthetic_bam(
+        tag,
+        vec![
+            // MAPQ 3. Used to die at `if mapq < 20`.
+            synth_record("lowq", 0, Some(0), 0, 3),
+            // MAPQ 11, on a different transcript so the two do not tie.
+            synth_record("lowq2", 1, Some(1), 0, 11),
         ],
     )
 }
@@ -324,4 +370,154 @@ fn no_ledger_flag_writes_no_ledger() {
         "--ledger is opt-in; a run without it must not create {}",
         led.display()
     );
+}
+
+/// THE THREE BUCKETS ADDED 2026-10-18 REACH THE ARTIFACT, WITH THE COUNTS THE
+/// TOOL ACTUALLY PRODUCED.
+///
+/// `three_defect_bam` proves the Ticket-2A buckets are countable; it cannot
+/// reach these three, because every fixture it builds has MAPQ 60 and no
+/// flag-only record. Without this the three new keys would be asserted only by
+/// the renderer unit test, and the CLI path — the one that would drop a key on
+/// the floor — would be uncovered.
+///
+/// The per-bucket expectations are 1 / 2 / 3 on purpose; see the doc comment on
+/// `three_new_buckets_bam`.
+#[test]
+fn build_anchors_serializes_the_three_new_record_buckets() {
+    let bam = three_new_buckets_bam("newbuckets");
+    let out = scratch("newbuckets", "parquet");
+    let led = scratch("newbuckets", "json");
+    run(&[
+        "build-anchors",
+        "--bam",
+        bam.to_str().unwrap(),
+        "--sample-id",
+        "S1",
+        "--output",
+        out.to_str().unwrap(),
+        "--ledger",
+        led.to_str().unwrap(),
+    ]);
+    let json = read(&led);
+    cleanup(&[&bam, &out, &led]);
+
+    for (bucket, want) in [
+        ("unmapped", 1),
+        ("supplementary", 2),
+        ("eligible_not_anchor", 3),
+    ] {
+        assert_eq!(
+            int_field(&json, bucket),
+            want,
+            "bucket {bucket} must be serialized as {want} on this fixture:\n{json}"
+        );
+    }
+
+    let buckets: i64 = ANCHOR_BUCKETS.iter().map(|k| int_field(&json, k)).sum();
+    assert_eq!(
+        int_field(&json, "total_records") - buckets - int_field(&json, "passed"),
+        int_field(&json, "deficit"),
+        "the twelve-bucket identity must still hold:\n{json}"
+    );
+    assert_eq!(
+        int_field(&json, "deficit"),
+        0,
+        "a balanced fixture must report zero:\n{json}"
+    );
+    assert_eq!(
+        int_field(&json, "passed"),
+        0,
+        "the tie means no read produces an anchor; if this changed, so did the \
+         fixture"
+    );
+
+    // The read block rides along in the same document and is labelled as reads.
+    assert_eq!(
+        int_field(&json, "reads_seen"),
+        1,
+        "only the tie read is a read"
+    );
+    assert_eq!(int_field(&json, "rejected_tie"), 1);
+    assert_eq!(int_field(&json, "anchors_emitted"), 0);
+    // `reads_over_cap` is on the read block and must be serialized even when the
+    // cap never bit: an absent counter and a zero counter are different facts,
+    // and a consumer that reads it with `int_field` must not have to distinguish
+    // them by guessing.
+    assert_eq!(
+        int_field(&json, "reads_over_cap"),
+        0,
+        "one read on this fixture and the cap is 200, so nothing is over it"
+    );
+    assert!(
+        json.contains("\"reads\""),
+        "the read-denominated block must be present and separately named:\n{json}"
+    );
+}
+
+/// THE RETIRED `unique` SLOT IS REPORTED AS ZERO ON A REAL RUN, AND THE RECORDS
+/// IT USED TO ABSORB ARE IN THE POOL INSTEAD.
+///
+/// TWO ASSERTIONS, AND EITHER ALONE IS WORTH NOTHING. `unique == 0` on its own
+/// is satisfied by a `build-anchors` that deleted the records. `passed == 2` on
+/// its own is satisfied by a `build-anchors` that never had the gate. Together
+/// they say the gate is gone: the two MAPQ-below-20 records were dropped into
+/// `unique` before R139 and now reach the pool, and the slot they would have
+/// occupied is 0.
+///
+/// The fixture uses two DIFFERENT low MAPQs (3 and 11) on two transcripts so a
+/// re-added gate could not be mistaken for a fixture that happened to sit on
+/// the boundary, and so the two records cannot tie into one read.
+#[test]
+fn build_anchors_reports_a_retired_unique_bucket_of_zero() {
+    let bam = retired_mapq_gate_bam("retiredmapq");
+    let out = scratch("retiredmapq", "parquet");
+    let led = scratch("retiredmapq", "json");
+    run(&[
+        "build-anchors",
+        "--bam",
+        bam.to_str().unwrap(),
+        "--sample-id",
+        "S1",
+        "--output",
+        out.to_str().unwrap(),
+        "--ledger",
+        led.to_str().unwrap(),
+    ]);
+    let json = read(&led);
+    cleanup(&[&bam, &out, &led]);
+
+    assert_eq!(
+        int_field(&json, "unique"),
+        0,
+        "`unique` is a RETIRED compat slot: the MAPQ < 20 gate was removed in \
+         R139 because it discarded every secondary on HC2 and left every \
+         surviving read with one candidate, which made strict argmax, the gap \
+         floor and the same-gene veto dead code. The key stays in the frozen v1 \
+         schema; the value must stay 0.\n{json}"
+    );
+    assert_eq!(
+        int_field(&json, "passed"),
+        2,
+        "BOTH records carry MAPQ < 20 and both must now reach the pool — this \
+         is what makes the assertion above meaningful rather than vacuous.\n{json}"
+    );
+    assert_eq!(int_field(&json, "total_records"), 2);
+
+    // The twelve-bucket identity must still close with the slot in it.
+    let buckets: i64 = ANCHOR_BUCKETS.iter().map(|k| int_field(&json, k)).sum();
+    assert_eq!(
+        int_field(&json, "total_records") - buckets - int_field(&json, "passed"),
+        int_field(&json, "deficit"),
+        "the twelve-bucket identity must still hold:\n{json}"
+    );
+    assert_eq!(
+        int_field(&json, "deficit"),
+        0,
+        "a balanced fixture:\n{json}"
+    );
+
+    // And both reads reached the per-read stage, as anchors.
+    assert_eq!(int_field(&json, "reads_seen"), 2);
+    assert_eq!(int_field(&json, "anchors_emitted"), 2);
 }

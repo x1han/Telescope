@@ -54,6 +54,19 @@ const ANCHOR_SCOPE: &str = "RECORDS read from each anchor BAM; parse_errors is \
 a DISJOINT population; distinct_genes / distinct_transcripts are POOL-\
 level, assigned by build_anchor_pool and NOT summed over samples";
 
+/// The `reads` sub-block's own unit, carried in the artifact for the same
+/// reason [`RECORD_SCOPE`] exists: the unit used to live only in a doc comment
+/// and died the moment a number was quoted out of the log.
+///
+/// These counts are READS. They are deliberately NOT summed into `deficit`,
+/// which is a RECORDS identity, and a consumer that adds them to the record
+/// buckets gets a number that is neither a population nor an imbalance.
+const READ_SCOPE: &str = "READS, not records; NOT part of `deficit`, which is a \
+RECORDS identity. Every read contributes at most one anchor, so \
+reads_seen == anchors_emitted + rejected_tie + rejected_gap + \
+rejected_same_gene + rejected_cross_gene + gene_veto_disabled + \
+reads_no_eligible_candidate + reads_over_cap";
+
 /// Render the `record_level` half: the evidence-stage ledger.
 ///
 /// Consumes `FilterCounts`, which covers extract-evidence, quant and
@@ -117,12 +130,28 @@ pub fn render_anchor(s: &AnchorStats) -> String {
          \"3p_anchor\": {},\n\
          \"coverage\": {},\n\
          \"polya_invalid\": {},\n\
-         \"cap\": {}\n\
+         \"cap\": {},\n\
+         \"unmapped\": {},\n\
+         \"supplementary\": {},\n\
+         \"eligible_not_anchor\": {}\n\
          }},\n\
          \"passed\": {},\n\
          \"deficit\": {},\n\
          \"distinct_genes\": {},\n\
-         \"distinct_transcripts\": {}\n\
+         \"distinct_transcripts\": {},\n\
+         \"reads\": {{\n\
+         \"scope\": \"{READ_SCOPE}\",\n\
+         \"reads_seen\": {},\n\
+         \"anchors_emitted\": {},\n\
+         \"rejected_tie\": {},\n\
+         \"rejected_gap\": {},\n\
+         \"rejected_same_gene\": {},\n\
+         \"rejected_cross_gene\": {},\n\
+         \"gene_veto_disabled\": {},\n\
+         \"same_gene_unknown\": {},\n\
+         \"reads_no_eligible_candidate\": {},\n\
+         \"reads_over_cap\": {}\n\
+         }}\n\
          }}\n\
          }}\n",
         s.samples,
@@ -137,10 +166,23 @@ pub fn render_anchor(s: &AnchorStats) -> String {
         s.filtered_coverage,
         s.filtered_polya_invalid,
         s.filtered_cap,
+        s.filtered_unmapped,
+        s.filtered_supplementary,
+        s.filtered_eligible_not_anchor,
         s.passed,
         s.unaccounted(),
         s.distinct_genes,
         s.distinct_transcripts,
+        s.reads_seen,
+        s.anchors_emitted,
+        s.rejected_tie,
+        s.rejected_gap,
+        s.rejected_same_gene,
+        s.rejected_cross_gene,
+        s.gene_veto_disabled,
+        s.same_gene_unknown,
+        s.reads_no_eligible_candidate,
+        s.reads_over_cap,
     )
 }
 
@@ -190,11 +232,36 @@ mod tests {
         digits.parse().expect("captured digits are an i64")
     }
 
-    /// The nine anchor-level filter buckets, in the order `report()` emits
-    /// them. Two tests walk this list; if a tenth bucket is ever added, both
-    /// go red rather than silently comparing a 9-term sum against a 10-term
-    /// total.
-    const ANCHOR_BUCKETS: [&str; 9] = [
+    /// The twelve anchor-level filter buckets, in the order `report()` emits
+    /// them. Two tests walk this list; if a thirteenth bucket is ever added,
+    /// both go red rather than silently comparing a 12-term sum against a
+    /// 13-term total.
+    ///
+    /// ## `unique` IS A RETIRED COMPAT SLOT AND MUST STAY 0
+    ///
+    /// It was `filtered_unique` = MAPQ < 20. That gate was removed in R139: on
+    /// HC2 every secondary carries MAPQ 0, so discarding on it deleted 32.5 M
+    /// of 39.4 M records and left every surviving read with exactly ONE
+    /// candidate — which made strict argmax, the gap floor and the same-gene
+    /// veto dead code on real data. Nothing increments the counter now.
+    ///
+    /// The KEY STAYS, and not for tidiness: `telescope.filter_ledger/v1` is a
+    /// published artifact schema, a downstream consumer reads this name, and
+    /// `bucket_sum` above sums all twelve. Removing it would change `deficit`
+    /// arithmetic in the one place `deficit` is supposed to be authoritative.
+    ///
+    /// ⚠ **A RETIRED COUNTER IS THE ONE KIND OF FIELD NO TEST WILL CATCH BEING
+    /// RE-ADDED.** `ANCHOR_BUCKETS` reads it (so it cannot vanish), but nothing
+    /// in this file asserted its VALUE — `bucket_sum` is happy with any number
+    /// that keeps the identity closed. The two fixtures that DO pin it are
+    /// `retired_unique_bucket_is_reported_as_zero` below and
+    /// `build_anchors_reports_a_retired_unique_bucket_of_zero` in
+    /// `tests/ledger_json_artifact.rs`, which runs the real binary over a BAM
+    /// carrying a MAPQ-10 record — the exact input the gate used to swallow.
+    /// `balanced_stats` deliberately still pins `filtered_unique: 40`, because
+    /// it is the arithmetic fixture and 40 is what keeps its twelve-term sum at
+    /// 84; that fixture is NOT evidence about production.
+    const ANCHOR_BUCKETS: [&str; 12] = [
         "unique",
         "no_refid",
         "no_position",
@@ -204,9 +271,21 @@ mod tests {
         "coverage",
         "polya_invalid",
         "cap",
+        "unmapped",
+        "supplementary",
+        "eligible_not_anchor",
     ];
 
-    /// 40+5+3+2+1+4+6+2+1 == 64, plus `passed` 46, is exactly `total_records`.
+    /// 40+5+3+2+1+4+6+2+1+10+3+7 == 84, plus `passed` 26, is exactly
+    /// `total_records` 110.
+    ///
+    /// THE THREE NEW BUCKETS CARRY 10, 3 AND 7, NOT 0, 0, 0. A fixture that
+    /// adds buckets and leaves them empty makes every assertion over this list
+    /// a tautology on those terms: transposing `unmapped` and `supplementary`
+    /// in the `format!` would leave the SUM unchanged and turn green, which is
+    /// the same defect `three_defect_bam`'s doc comment in the integration test
+    /// records having already been caught once. Distinct values are the only
+    /// thing that makes a per-bucket sum able to fail.
     fn balanced_stats() -> AnchorStats {
         AnchorStats {
             samples: 3,
@@ -221,7 +300,23 @@ mod tests {
             filtered_coverage: 6,
             filtered_polya_invalid: 2,
             filtered_cap: 1,
-            passed: 46,
+            filtered_unmapped: 10,
+            filtered_supplementary: 3,
+            filtered_eligible_not_anchor: 7,
+            passed: 26,
+            // A closed read block, so the fixture is internally coherent in
+            // BOTH denominations: 43 reads, 26 anchors, 10 rejected ties, 4
+            // with no eligible candidate, 3 over the per-transcript cap.
+            reads_seen: 43,
+            anchors_emitted: 26,
+            rejected_tie: 10,
+            rejected_gap: 0,
+            rejected_same_gene: 0,
+            rejected_cross_gene: 0,
+            gene_veto_disabled: 0,
+            same_gene_unknown: 0,
+            reads_no_eligible_candidate: 4,
+            reads_over_cap: 3,
             distinct_genes: 12,
             distinct_transcripts: 30,
         }
@@ -351,5 +446,121 @@ mod tests {
     fn schema_tag_is_pinned() {
         assert!(render_anchor(&balanced_stats()).contains(SCHEMA));
         assert!(render_filter(&filter_counts()).contains(SCHEMA));
+    }
+
+    /// The `reads` block is a DIFFERENT DENOMINATION and says so in the
+    /// artifact. Two things have to hold and neither is visible from the other:
+    /// every counter reaches the JSON, and folding any of them into `deficit`
+    /// breaks the records identity.
+    ///
+    /// The negative half is the one that can fail. `int_field` scans for the
+    /// FIRST occurrence of a key, so a reads counter that was never serialized
+    /// would leave `deficit` at 0 and make the first half vacuous — which is
+    /// why the fixture populates reads counters with values that are NOT the
+    /// record ones (reads_seen 43 vs passed 26).
+    #[test]
+    fn the_reads_block_is_emitted_carries_its_unit_and_stays_out_of_the_identity() {
+        let s = balanced_stats();
+        let json = render_anchor(&s);
+        assert!(
+            json.contains(READ_SCOPE),
+            "reads block lost its scope:\n{json}"
+        );
+
+        for (k, want) in [
+            ("reads_seen", 43),
+            ("anchors_emitted", 26),
+            ("rejected_tie", 10),
+            ("reads_no_eligible_candidate", 4),
+            ("reads_over_cap", 3),
+        ] {
+            assert_eq!(
+                int_field(&json, k),
+                want,
+                "reads.{k} not serialized:\n{json}"
+            );
+        }
+        // Absent counters read 0 rather than vanishing, so a consumer never
+        // has to distinguish "no reads were rejected" from "nobody wrote it".
+        for k in [
+            "rejected_gap",
+            "rejected_same_gene",
+            "rejected_cross_gene",
+            "gene_veto_disabled",
+            "same_gene_unknown",
+        ] {
+            assert_eq!(int_field(&json, k), 0, "reads.{k} not serialized:\n{json}");
+        }
+
+        // The reads block's own identity, recomputed from the ARTIFACT rather
+        // than from the struct. `reads_over_cap` is a NEW term here, so this is
+        // the assertion that would catch its omission from either the JSON or
+        // `READ_SCOPE`: without it the sum is 40 against a reads_seen of 43 and
+        // the read ledger is short by exactly the three capped reads.
+        assert_eq!(
+            int_field(&json, "reads_seen"),
+            int_field(&json, "anchors_emitted")
+                + int_field(&json, "rejected_tie")
+                + int_field(&json, "rejected_gap")
+                + int_field(&json, "rejected_same_gene")
+                + int_field(&json, "rejected_cross_gene")
+                + int_field(&json, "gene_veto_disabled")
+                + int_field(&json, "reads_no_eligible_candidate")
+                + int_field(&json, "reads_over_cap"),
+            "the READS identity does not close on the rendered artifact:\n{json}"
+        );
+        assert!(
+            READ_SCOPE.contains("reads_over_cap"),
+            "READ_SCOPE quotes the identity, so a new term has to appear in the \
+             artifact's own scope string too: {READ_SCOPE}"
+        );
+
+        // The whole read block, added to the records identity, must break it.
+        // 43 reads added to a 110-record ledger is not a rounding error.
+        assert_eq!(
+            bucket_sum(&json) + int_field(&json, "passed"),
+            110,
+            "the RECORDS identity must not move when reads are present"
+        );
+        assert_eq!(
+            bucket_sum(&json) + int_field(&json, "passed") + int_field(&json, "reads_seen"),
+            153,
+            "sanity: this is the arithmetic that would be reported if a \
+             consumer mixed the two denominations"
+        );
+        assert_eq!(int_field(&json, "deficit"), 0);
+    }
+
+    /// THE RETIRED `unique` SLOT IS EMITTED, AND IT IS 0.
+    ///
+    /// `AnchorStats::default()` is the cheapest possible witness that the key
+    /// survives `render_anchor` — removing the line would make `int_field`
+    /// panic rather than return a wrong number, which is the failure this whole
+    /// file's substring scan is built to surface.
+    ///
+    /// It is NOT sufficient on its own, and the reason is the point of the test:
+    /// `default()` is 0 whether the production code increments the counter or
+    /// not, so this assertion says the KEY exists and nothing about the RULE.
+    /// The fixture that carries the rule — a real `build-anchors` run over a BAM
+    /// whose records include MAPQ 10, the input the removed gate used to
+    /// swallow — is
+    /// `build_anchors_reports_a_retired_unique_bucket_of_zero` in
+    /// `tests/ledger_json_artifact.rs`. Read this one as "the slot is still in
+    /// the schema", not as "the slot is still 0".
+    #[test]
+    fn retired_unique_bucket_is_reported_as_zero() {
+        let json = render_anchor(&AnchorStats::default());
+        assert_eq!(
+            int_field(&json, "unique"),
+            0,
+            "`unique` is a retired compat slot: the MAPQ < 20 gate is gone, so \
+             nothing may increment it, and the key must stay in the frozen v1 \
+             schema.\n{json}"
+        );
+        // And it is still inside the twelve-term sum rather than dangling:
+        // `bucket_sum` would not raise on a zero term, so pin the count.
+        assert_eq!(ANCHOR_BUCKETS.len(), 12);
+        assert!(ANCHOR_BUCKETS.contains(&"unique"));
+        assert_eq!(bucket_sum(&json), 0, "a default ledger counts nothing");
     }
 }
