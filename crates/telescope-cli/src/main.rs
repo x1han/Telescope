@@ -385,6 +385,12 @@ fn main() -> Result<()> {
             .context("Module 1 build_emission_from_anchors (Universal) failed")?;
             // GUARD, PART 2 OF 2: the tier sidecar. `tiers` does not exist until
             // the call above returns, so this half cannot sit next to the first.
+            // It is NOT defence-in-depth against a `.parquet` sidecar name — that
+            // shape is refused at the FIRST call — but the COLLISION branch is
+            // live here whenever the two paths canonicalise to one file, and a
+            // symlink at the sidecar path is enough to make that happen. Pinned
+            // by the symlink case in
+            // `tests/provenance_out_cannot_clobber_a_parquet_table.rs`.
             refuse_a_provenance_path_that_clobbers_a_table(&prov_path, &tiers.provenance_path)?;
             // L1/L2/L3 split, read off the RETURN VALUE rather than scraped
             // from the library's stderr. The denominator is the number of
@@ -1017,13 +1023,23 @@ mod tests {
     /// ## WHY THIS IS A UNIT TEST AND NOT ONLY THE PROCESS-LEVEL ONE
     ///
     /// `crates/telescope-cli/tests/provenance_out_cannot_clobber_a_parquet_table.rs`
-    /// drives the real binary and covers the two inputs a user can actually
-    /// type. It CANNOT cover the collision branch for the tier sidecar: that
-    /// file is always named `<stem>.provenance.parquet`, so the `.parquet`
-    /// extension check fires first, before the build starts, and the collision
-    /// branch is never reached through the CLI. Calling the guard directly is
-    /// what covers it — with a table whose name does NOT end in `.parquet`, so
-    /// only the collision can reject it.
+    /// drives the real binary and covers the inputs a user can actually type,
+    /// INCLUDING the tier-sidecar collision (its symlink case). This unit test
+    /// is still the cheaper half of the pair: it calls the guard directly, so
+    /// the collision branch is exercised against a table whose name does NOT
+    /// end in `.parquet` and with no BAM, no pool and no build in the way.
+    ///
+    /// ⚠ THIS PARAGRAPH USED TO CLAIM THE OPPOSITE — that the collision branch
+    /// "is never reached through the CLI", because a tier sidecar is always
+    /// named `<stem>.provenance.parquet` and the `.parquet` extension check
+    /// fires first. That is FALSE. `same_file_or_path` canonicalises, and
+    /// `canonicalize` RESOLVES SYMLINKS: if the tier sidecar path is a symlink
+    /// pointing at the `--provenance-out` path, the two canonical paths are
+    /// equal, the COLLISION branch fires before the extension branch (the
+    /// function checks collision first, deliberately), and the JSON run header
+    /// is never written. The symlink case in
+    /// `provenance_out_cannot_clobber_a_parquet_table.rs` pins that through the
+    /// real binary.
     ///
     /// ## WHAT EACH CASE IS FOR
     ///
@@ -1063,8 +1079,12 @@ mod tests {
         .expect_err(".parquet must be refused");
         assert!(e.to_string().contains("ends in .parquet"), "got: {e}");
 
-        // 2. The collision alone -- the branch the CLI cannot reach, because a
-        //    tier sidecar is always a `.parquet`.
+        // 2. The collision alone -- the branch a `.parquet` sidecar path cannot
+        //    reach through the CLI, because the extension check fires first.
+        //    A SYMLINK at the sidecar path can still reach it (canonicalise
+        //    resolves symlinks, and collision is checked before extension);
+        //    that case is pinned through the real binary in
+        //    `provenance_out_cannot_clobber_a_parquet_table.rs`.
         let e = refuse_a_provenance_path_that_clobbers_a_table(&table, &table)
             .expect_err("the same path must be refused");
         assert!(e.to_string().contains("same file as"), "got: {e}");

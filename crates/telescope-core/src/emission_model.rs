@@ -2474,8 +2474,9 @@ mod tests {
     ///   * the key set and ORDER match the emission parquet exactly (an
     ///     unordered or short sidecar turns the downstream join into a
     ///     different, wrong join);
-    ///   * `n_anchor == 0` if and only if the tier is `L3_imputed` (the two
-    ///     encodings of "imputed" must not drift apart);
+    ///   * `n_anchor == 0` if and only if the tier is `L3_imputed` OR
+    ///     `L3_unexpressed` — since R141 "a row with no anchors of its own" has
+    ///     TWO labels, and the two encodings of "imputed" must not drift apart
     ///   * the tier histogram reproduces `FallbackTierCounts` (the counters the
     ///     CLI prints must describe the same partition the file records).
     #[test]

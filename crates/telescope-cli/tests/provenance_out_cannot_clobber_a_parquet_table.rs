@@ -216,21 +216,22 @@ fn a_provenance_out_equal_to_output_is_refused() {
 /// This is the shape that reached the frozen calibration run: the user named
 /// the tier table, and 654 bytes of JSON replaced it.
 ///
-/// ## WHICH OF THE TWO GUARDS FIRES, AND WHY THIS TEST DOES NOT SAY
+/// ## WHICH OF THE TWO GUARDS FIRES
 ///
 /// The run fails here at the FIRST call — the `.parquet`-extension check —
-/// because the tier sidecar is always written to `<stem>.provenance.parquet`
-/// and every `.parquet` path is refused before the build starts. So the
-/// collision check between `build_emission_from_anchors` and the write is
-/// **defence in depth that this input cannot reach**: it is retained because
-/// the sidecar's name is produced by the library, and a future change to that
-/// naming would silently unprotect it. The collision branch itself is covered
-/// by `a_collision_with_a_parquet_table_is_refused_whatever_its_name` in
-/// `main.rs`'s unit tests, which calls the guard directly.
+/// because the tier sidecar is always named `<stem>.provenance.parquet` and
+/// every `.parquet` path is refused before the build starts. So this test
+/// cannot say which of the two guards the SECOND call would have fired, and
+/// asserts the PROPERTY (refused, sidecar intact) rather than the message.
 ///
-/// So this test asserts the PROPERTY (refused, sidecar intact) and not the
-/// message. Asserting which guard fired would pin an implementation ordering
-/// that is not the property anyone depends on.
+/// ⚠ THIS PARAGRAPH USED TO GO ON: "the collision check between
+/// `build_emission_from_anchors` and the write is defence in depth that this
+/// input cannot reach". That was FALSE, and the symlink case below is what
+/// makes it false in writing: `same_file_or_path` canonicalises, canonicalise
+/// RESOLVES SYMLINKS, and `refuse_a_provenance_path_that_clobbers_a_table`
+/// checks collision BEFORE extension — so a symlink at the sidecar path
+/// pointing at the `--provenance-out` path makes the second call fire on the
+/// collision branch.
 #[test]
 fn a_provenance_out_named_at_the_tier_sidecar_is_refused_and_the_sidecar_survives() {
     let (bam, pool, emission) = prepared("provtiers");
@@ -260,7 +261,67 @@ fn a_provenance_out_named_at_the_tier_sidecar_is_refused_and_the_sidecar_survive
     );
 }
 
-/// POSITIVE CONTROL. A legal `--provenance-out` still works, so the three tests
+/// A SYMLINK AT THE TIER SIDECAR PATH PUTS THE SECOND GUARD ON THE LIVE PATH,
+/// AND IT FIRES ON THE COLLISION BRANCH — not on the extension check.
+///
+/// This is the fixture that pins, rather than argues, the reachability claim
+/// the module doc used to get wrong ("the collision check is defence in depth
+/// that this input cannot reach"). It is reachable, and the mechanism is
+/// `same_file_or_path`: it `canonicalize`s both sides, `canonicalize` is
+/// `realpath(3)` and RESOLVES SYMLINKS, and `refuse_a_provenance_path_that_
+/// clobbers_a_table` checks the collision BEFORE the extension. So when the
+/// sidecar path is a symlink pointing at the `--provenance-out` path:
+///
+///   * the extension check cannot fire — `prov` is `header.json`, not `.parquet`;
+///   * the collision check fires, because both paths canonicalise to the same
+///     file;
+///   * and the run header is never written, which is the property that matters.
+///
+/// The seed emission's real sidecar is DELETED first and replaced by the
+/// symlink: leaving the genuine sidecar in place would test nothing, because
+/// `build_emission_from_anchors` would then have a regular file there and the
+/// two paths would not collide.
+#[cfg(unix)]
+#[test]
+fn a_provenance_out_behind_a_symlink_at_the_tier_sidecar_hits_the_collision_guard() {
+    use std::os::unix::fs::symlink;
+
+    let (bam, pool, emission) = prepared("provsym");
+    let tiers = emission.with_extension("provenance.parquet");
+    let header = emission.with_extension("provenance.json");
+    let _ = std::fs::remove_file(&tiers);
+    let _ = std::fs::remove_file(&header);
+    symlink(&header, &tiers).expect("plant a symlink at the tier sidecar path");
+
+    let (ok, stderr) = build_emission_with_prov(&pool, &emission, &header);
+
+    let head = magic(&header);
+    cleanup(&[&bam, &pool, &emission, &tiers, &header]);
+
+    assert!(
+        !ok,
+        "CONTROL-GUARD: a --provenance-out that canonicalises onto the tier \
+         sidecar MUST fail.\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("same file as"),
+        "the COLLISION branch must be the one that fires here, which is the \
+         whole claim: a symlink at the sidecar path makes the second call in \
+         `build-emission` reachable, and `refuse_a_provenance_path_that_\
+         clobbers_a_table` checks collision before extension. If this says \
+         \"ends in .parquet\" instead, the ordering changed and this fixture no \
+         longer exercises what it says it does.\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        head,
+        Some(*b"PAR1"),
+        "the JSON run header must never have been written over the file the \
+         tier sidecar resolves to. A leading brace here would mean the guard \
+         was bypassed."
+    );
+}
+
+/// POSITIVE CONTROL. A legal `--provenance-out` still works, so the tests
 /// above are measuring the guard rather than a `build-emission` that fails for
 /// any reason at all.
 #[test]

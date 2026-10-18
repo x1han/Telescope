@@ -436,20 +436,29 @@ fn resolve_gene(tx: &str, tx_to_gene: &TxToGene) -> Result<String> {
 ///
 /// ## ⚠ WHY (b) COMES BEFORE (c), AGAINST THE ORDER THE RULING ENUMERATED
 ///
-/// The ruling lists (b) "c1 is ineligible" before (c) "exact raw tie". That
-/// ORDER IS NOT IMPLEMENTABLE and it is not a matter of taste: with the tie
-/// check second, the verdict of a read whose top two candidates tie exactly
-/// DEPENDS ON WHICH OF THE TWO SORTS FIRST, and that is an arbitrary
-/// tie-break. Measured on the Dataset B dev-set (`parity_craw.py`, 197,204
-/// reads): 19,398 reads have an exact raw top-2 tie in which the first-placed
-/// member is ineligible, against 1,545 genuine usurpations — a 12.5× swing
-/// decided by nothing but list order. The ruling's own prose for the
-/// usurpation branch ("only a LOWER-AS homolog survived") also describes a
-/// strict drop in AS, which an exact tie by definition is not. So the tie is
-/// evaluated first: it is the branch whose verdict is well defined on a tied
-/// pair, and it is the branch the independent Python implementation
-/// (`workspace/validation/benchmark/devset_calib/parity_craw.py`) evaluates
-/// first.
+/// The ruling lists (b) "c1 is ineligible" before (c) "exact raw tie", and
+/// THAT ORDER IS IMPLEMENTABLE AND DETERMINISTIC — this comment used to say
+/// it was "not implementable", and that was false. What the ruled order
+/// actually costs is narrower, and it is the only reason for deviating:
+///
+///   * **The ACCEPT SET is identical either way.** A read whose raw top two tie
+///     exactly emits no anchor under both orders; which branch says so is a
+///     question of labelling, not of which reads are anchored.
+///   * **The LABEL is not.** With the eligibility check first, such a read is
+///     filed as `rejected_usurpation` or `rejected_tie` according to WHICH OF
+///     THE TWO AS-IDENTICAL CANDIDATES the dedup happened to place first — a
+///     tie-break that carries no evidence about the read. Measured on the
+///     Dataset B dev-set (`parity_craw.py`, 197,204 reads): 19,398 reads have
+///     an exact raw top-2 tie in which the first-placed member is ineligible,
+///     against 1,545 genuine usurpations — so 92.6% of the bucket that order
+///     would call "usurpation" is really the tie branch, and the ledger would
+///     say so.
+///
+/// The ruling's own prose for the usurpation branch ("only a LOWER-AS homolog
+/// survived") also describes a strict drop in AS, which an exact tie by
+/// definition is not, which is the second reason the tie is evaluated first.
+/// That is also the order the independent Python implementation
+/// (`workspace/validation/benchmark/devset_calib/parity_craw.py`) uses.
 ///
 /// ## ⚠ THE GAP NOW APPLIES TO A READ WITH ONE RAW CANDIDATE
 ///
