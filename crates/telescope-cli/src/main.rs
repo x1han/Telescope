@@ -656,12 +656,15 @@ fn main() -> Result<()> {
                 }
             );
 
-            let tx_to_g = match tx_to_gene {
-                Some(p) => anchor_builder::TxToGene::from_tsv(&p)
-                    .with_context(|| format!("Failed to load tx-to-gene TSV: {:?}", p))?,
-                None => anchor_builder::TxToGene::new(),
-            };
+            let tx_to_g = load_tx_to_gene(&tx_to_gene)?;
             eprintln!("  tx_to_gene entries: {}", tx_to_g.len());
+            if tx_to_g.len() == 0 {
+                eprintln!(
+                    "  tx_to_gene:        (NONE — gene_veto_disabled=true; every \
+                     multi-candidate read is discarded because the same-gene \
+                     question cannot be answered without a map)"
+                );
+            }
 
             let params = anchor_builder::AnchorParams {
                 tes_slack,
@@ -800,6 +803,35 @@ fn main() -> Result<()> {
     }
 }
 
+/// Load the transcript -> gene map, FAILING CLOSED when one was asked for but
+/// yielded nothing.
+///
+/// `TxToGene::from_tsv` SKIPS every line it cannot split into two non-empty tab
+/// fields (`anchor_builder.rs`), so a header-only, space-delimited or truncated
+/// file returns `Ok` with ZERO entries. Downstream, `resolve_gene` treats a
+/// zero-entry map EXACTLY like no map at all and silently runs Universal Mode.
+/// A user who asked for a map and got none would then read `gene_veto_disabled`
+/// in the ledger and never learn the veto was disabled by their own typo.
+///
+/// So: no flag -> an empty map on purpose (and the caller says so out loud);
+/// a flag that parses to nothing -> an error.
+fn load_tx_to_gene(path: &Option<PathBuf>) -> Result<anchor_builder::TxToGene> {
+    let Some(p) = path else {
+        return Ok(anchor_builder::TxToGene::new());
+    };
+    let map = anchor_builder::TxToGene::from_tsv(&p)
+        .with_context(|| format!("Failed to load tx-to-gene TSV: {:?}", p))?;
+    anyhow::ensure!(
+        map.len() > 0,
+        "--tx-to-gene was given ({:?}) but parsed to ZERO entries. Every line \
+         after the header must be `transcript_id<TAB>gene_id`. Check for spaces \
+         instead of tabs, or a truncated file. Omit the flag entirely to run \
+         deliberately without a gene map.",
+        p
+    );
+    Ok(map)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -809,6 +841,48 @@ mod tests {
         pct, ALN_WEIGHT_LAMBDA_DEFAULT, FIVE_PRIME_WEIGHT_DEFAULT, FIVE_PRIME_WINDOW_DEFAULT,
         PRUNE_MAX_DELTA_AS_DEFAULT,
     };
+
+    fn write_tmp(name: &str, body: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("tel_q3_{}_{}", std::process::id(), name));
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    /// A SUPPLIED `--tx-to-gene` that parses to nothing must fail, not silently
+    /// become Universal Mode.
+    ///
+    /// This is the falsifiable form of the guard in `load_tx_to_gene`. Delete the
+    /// `anyhow::ensure!` from that function and `header_only_is_an_error` goes red,
+    /// because `from_tsv` happily returns a ZERO-entry map for a header-only file
+    /// and nothing downstream can tell it from "no flag was passed".
+    #[test]
+    fn a_supplied_but_empty_tx_to_gene_is_an_error_not_universal_mode() {
+        // Omitting the flag is the DELIBERATE no-map path and must keep working.
+        let none = load_tx_to_gene(&None).expect("no flag must stay legal");
+        assert_eq!(none.len(), 0, "no flag means an empty map, on purpose");
+
+        // Header only: parses fine, contains nothing.
+        let hdr = write_tmp("hdr", "transcript_id\tgene_id\n");
+        let e = load_tx_to_gene(&Some(hdr.clone()))
+            .expect_err("a header-only TSV must NOT pass as an empty-but-valid map");
+        assert!(e.to_string().contains("ZERO entries"), "got: {e}");
+
+        // Spaces instead of tabs: every line is skipped by from_tsv, zero entries.
+        let sp = write_tmp("sp", "transcript_id gene_id\ntx0 GA\ntx1 GB\n");
+        let e = load_tx_to_gene(&Some(sp.clone()))
+            .expect_err("a space-delimited TSV must not parse to zero and pass");
+        assert!(e.to_string().contains("ZERO entries"), "got: {e}");
+
+        // A real map still loads, unchanged.
+        let ok = write_tmp("ok", "transcript_id\tgene_id\ntx0\tGA\ntx1\tGB\n");
+        let m = load_tx_to_gene(&Some(ok.clone())).expect("a valid TSV must still load");
+        assert_eq!(m.len(), 2, "the guard must not reject a genuine map");
+        assert_eq!(m.get("tx0").map(String::as_str), Some("GA"));
+
+        for f in [hdr, sp, ok] {
+            let _ = std::fs::remove_file(f);
+        }
+    }
 
     /// A zero denominator must render as `n/a`, never as a percentage.
     ///
