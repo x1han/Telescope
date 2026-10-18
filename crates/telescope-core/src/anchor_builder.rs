@@ -784,30 +784,40 @@ fn extract_anchors_from_bam<P: AsRef<Path>>(
                 continue;
             }
 
-            // SAME-GENE VETO. With an EMPTY map `gene_id == transcript_id` for
-            // every candidate, so this comparison can NEVER fire and every
-            // intra-gene multi-candidate read would be filed as cross-gene —
-            // the precise inverse of the truth. That state is detected and
-            // counted, not worked around: `gene_veto_disabled` says the veto
-            // was unavailable, and the read is routed to `same_gene_unknown`
-            // rather than to a cross-gene class it does not belong to.
-            match relation(
+            // THE GATE IS THE ONLY ARITHMETIC GATE. There is deliberately no
+            // unconditional same-gene veto here any more, and the reason is
+            // physical rather than aesthetic.
+            //
+            // A read that scores AS_1 on T_1 and AS_2 << AS_1 on T_2, where T_1
+            // and T_2 are SIBLING ISOFORMS OF ONE GENE, has aligned over sequence
+            // that T_2 does not contain — that is the only way its score can be
+            // lower. The measured cost of a single mismatch on this data is 6 AS
+            // and of a 1 bp indel 6–8 AS, so a gap of even a few hundred is tens
+            // of edits, not aligner noise. Vetoing such a read on the ground that
+            // its rival "belongs to the same gene" declared every isoform of every
+            // multi-isoform gene unanchorable the moment minimap2 emitted a
+            // secondary alignment for it, and that is what removed 36% of HC2's
+            // anchors. A same-gene pair is now a CLASSIFICATION of a gap failure
+            // (see the `GeneRelation::Same` arm above), not an independent veto.
+            //
+            // What the veto used to protect against — a gene id invented on the
+            // spot when no map was supplied — is handled where it actually
+            // arises: `resolve_gene` refuses to fall back once a map exists, and
+            // with NO map the relation is `Unknown`, which is counted below and
+            // reported, never silently treated as "same gene" or "cross gene".
+            let rel = relation(
                 &resolve_gene(tx_name(&ref_seqs, best.ref_id), tx_to_gene)?,
                 &resolve_gene(tx_name(&ref_seqs, second.ref_id), tx_to_gene)?,
                 tx_to_gene,
-            ) {
-                GeneRelation::Same => {
-                    stats.rejected_same_gene += 1;
-                    stats.filtered_eligible_not_anchor += eligible_records;
-                    continue;
-                }
-                GeneRelation::Cross => {}
-                GeneRelation::Unknown => {
-                    stats.gene_veto_disabled += 1;
-                    stats.same_gene_unknown += 1;
-                    stats.filtered_eligible_not_anchor += eligible_records;
-                    continue;
-                }
+            );
+            if matches!(rel, GeneRelation::Unknown) {
+                // NOT a read-level rejection: this read still clears the gap and
+                // will be emitted. It is counted so the ledger states plainly that
+                // the relation was unavailable for it, and it is deliberately
+                // OUT of the read-level identity below — a read cannot both
+                // arrive here and be a destination of itself.
+                stats.gene_veto_disabled += 1;
+                stats.same_gene_unknown += 1;
             }
         }
 
@@ -877,15 +887,50 @@ fn extract_anchors_from_bam<P: AsRef<Path>>(
     // would break the read identity in the READ direction, and `unaccounted()`
     // cannot see that at all because it is denominated in records.
     //
-    // Dev-time tripwire only, like the `debug_assert!` in `unaccounted()`:
-    // `ci/gates.sh` runs `--release`, which compiles it out. The load-bearing
-    // version is
-    // `test_a_multi_record_read_over_the_cap_absorbs_every_record_it_contributed`.
-    debug_assert_eq!(
+    // UNCONDITIONAL, not a `debug_assert!`. The previous version was a dev-time
+    // tripwire and `ci/gates.sh` runs `--release`, which compiled it out — so
+    // the one check that stands between a terminal branch and a silently
+    // unbalanced ledger was absent from the profile the gate actually uses. The
+    // expert ruling of 2026-10-18 (Round 140, §4.1) requires the ledger to be
+    // closed by the PRODUCTION binary, not only by the test build.
+    assert_eq!(
         stats.filtered_cap, stats.reads_over_cap,
         "filtered_cap counts rejected READS and must stay equal to reads_over_cap; \
          {} vs {} means one of them was incremented without the other",
         stats.filtered_cap, stats.reads_over_cap
+    );
+
+    // THE READ IDENTITY ITSELF, in the release binary. `unaccounted()` proves the
+    // RECORD half closes; nothing proved the READ half did, which is precisely
+    // how HC2 shipped `reads_seen - sum(destinations) == filtered['cap']` for a
+    // round — the number looked balanced in every field it was printed in.
+    //
+    // `gene_veto_disabled` is deliberately absent: it counts reads that CLEARED
+    // the gap with no gene map and were therefore emitted, so it is not a
+    // destination of `reads_seen`. Including it would make this assert fail on
+    // correct output.
+    assert_eq!(
+        stats.reads_seen,
+        stats.anchors_emitted
+            + stats.rejected_tie
+            + stats.rejected_gap
+            + stats.rejected_same_gene
+            + stats.rejected_cross_gene
+            + stats.reads_no_eligible_candidate
+            + stats.reads_over_cap,
+        "every read that reached the per-read stage must land in exactly one \
+         outcome. reads_seen={} anchors={} tie={} gap={} same_gene={} \
+         cross_gene={} no_eligible={} over_cap={} (gene_veto_disabled={} is \
+         NOT a destination: those reads cleared the gap and were emitted)",
+        stats.reads_seen,
+        stats.anchors_emitted,
+        stats.rejected_tie,
+        stats.rejected_gap,
+        stats.rejected_same_gene,
+        stats.rejected_cross_gene,
+        stats.reads_no_eligible_candidate,
+        stats.reads_over_cap,
+        stats.gene_veto_disabled,
     );
 
     Ok((anchors, stats))
@@ -1048,14 +1093,21 @@ pub struct SampleStats {
     //
     //   reads_seen == anchors_emitted
     //               + rejected_tie + rejected_gap + rejected_same_gene
-    //               + rejected_cross_gene + gene_veto_disabled
+    //               + rejected_cross_gene
     //               + reads_no_eligible_candidate + reads_over_cap
     //
     // which `test_anchors_emitted_never_exceed_reads_seen_and_the_read_block_closes`
-    // asserts. `same_gene_unknown` is deliberately OUTSIDE that identity: see
-    // its own doc comment. `reads_over_cap` is INSIDE it, and `filtered_cap` is
+    // asserts. `reads_over_cap` is INSIDE it, and `filtered_cap` is
     // NOT — those two name the same population in the two denominations, and
     // only the read-denominated one belongs in a read identity.
+    //
+    // `gene_veto_disabled` is OUTSIDE, and its exclusion is not bookkeeping: it
+    // counts reads that CLEARED the gap with no gene map available and were
+    // therefore EMITTED. Listing it as a destination would count those reads
+    // twice — once here and once in `anchors_emitted` — and the identity would
+    // then "close" on a number smaller than `reads_seen` for a reason that has
+    // nothing to do with the rule. `same_gene_unknown` is outside for the same
+    // reason and counts the same population.
     // ------------------------------------------------------------------
     /// Reads that reached the per-read decision stage — i.e. that contributed
     /// at least one record clearing the record-level chain.
@@ -1999,14 +2051,19 @@ mod tests {
         );
     }
 
-    /// SAME-GENE VETO. The read's best alignment is 10 AS ahead of its second,
-    /// which clears the gap floors — so the ONLY thing that can reject it is
-    /// the veto, and if the veto did not fire this read would become an anchor.
+    /// A SAME-GENE PAIR WHOSE GAP IS CLEAR **EMITS**. This is the falsifiable
+    /// form of the removed unconditional veto.
     ///
-    /// The pre-selection code emitted an anchor here, because it never looked
-    /// at the second candidate at all.
+    /// The read's best alignment is 10 AS ahead of its second and both
+    /// transcripts sit in ONE gene. Under the rule this replaced, the shared gene
+    /// alone refused the read and no same-gene multi-candidate read could ever
+    /// produce an anchor — which on HC2 meant every isoform of every
+    /// multi-isoform gene was unanchorable the moment minimap2 emitted a
+    /// secondary alignment for it.
+    ///
+    /// Restore the veto (or make it fire at any gap) and this goes red.
     #[test]
-    fn test_a_same_gene_pair_is_vetoed_even_when_the_gap_is_clear() {
+    fn test_a_same_gene_pair_with_a_clear_gap_emits_rather_than_being_vetoed() {
         let tsv = tx2gene_tsv("samegene", "tx0\tGA\ntx1\tGA\ntx2\tGA\n");
         let map = TxToGene::from_tsv(&tsv).unwrap();
         assert_eq!(map.len(), 3);
@@ -2025,19 +2082,66 @@ mod tests {
         assert_record_ledger_closes(&s);
         assert_eq!(
             anchors.len(),
-            0,
-            "both candidates are in one gene: the read cannot choose an isoform"
+            1,
+            "AS 100 vs 90 means the read aligned over sequence the runner-up does \
+             not contain; on this data a single mismatch costs 6 AS, so 10 AS is \
+             real isoform evidence and the read is an anchor"
         );
-        assert_eq!(s.passed, 0);
-        assert_eq!(s.rejected_same_gene, 1);
+        assert_eq!(anchors[0].transcript_id, "tx0");
+        assert_eq!(s.passed, 1);
+        assert_eq!(
+            s.rejected_same_gene, 0,
+            "rejected_same_gene is a CLASSIFICATION of a gap failure, not a veto; \
+             nothing failed the gap here"
+        );
         assert_eq!(
             s.rejected_cross_gene, 0,
             "a same-gene pair must not be counted as cross-gene"
         );
         assert_eq!(s.rejected_tie, 0, "AS 100 vs 90 is not a tie");
         assert_eq!(
+            s.filtered_eligible_not_anchor, 1,
+            "two records were eligible, one became the anchor"
+        );
+        assert_eq!(record_deficit(&s), 0);
+    }
+
+    /// ...AND WITH A GAP THAT IS **NOT** CLEAR, THE SAME PAIR IS REJECTED AND
+    /// CLASSIFIED AS SAME-GENE. The veto did not die; it became a bucket.
+    ///
+    /// Identical to the test above except the floors are raised above the 10 AS
+    /// the read actually has. Without this, `rejected_same_gene` would have lost
+    /// its only producer and would print 0 forever — the same defect that
+    /// `rejected_cross_gene` had before its own producer was added.
+    #[test]
+    fn test_a_same_gene_pair_rejected_by_the_gap_is_classified_as_same_gene() {
+        let tsv = tx2gene_tsv("samegenegap", "tx0\tGA\ntx1\tGA\ntx2\tGA\n");
+        let map = TxToGene::from_tsv(&tsv).unwrap();
+
+        let p = AnchorParams {
+            gap_abs: 15.0,
+            gap_rel: 0.0,
+            ..params()
+        };
+        let (anchors, s) = run_extract(
+            "samegenegap",
+            vec![
+                synth_record("r", 0, Some(100), 0, 60),
+                synth_record("r", 1, Some(90), 0, 60),
+            ],
+            &map,
+            p,
+        );
+        let _ = std::fs::remove_file(&tsv);
+
+        assert_record_ledger_closes(&s);
+        assert_eq!(anchors.len(), 0, "10 AS does not clear a floor of 15");
+        assert_eq!(s.rejected_same_gene, 1);
+        assert_eq!(s.rejected_cross_gene, 0);
+        assert_eq!(s.rejected_tie, 0);
+        assert_eq!(
             s.filtered_eligible_not_anchor, 2,
-            "both records were physically eligible and neither was emitted"
+            "both records were eligible and neither was emitted"
         );
         assert_eq!(record_deficit(&s), 0);
     }
@@ -2478,7 +2582,11 @@ mod tests {
                 // 3. exact tie -> rejected_tie
                 synth_record("tie", 0, Some(100), 0, 60),
                 synth_record("tie", 1, Some(100), 0, 60),
-                // 4. same gene (tx0/GA, tx2/GA), gap clear -> vetoed
+                // 4. same gene (tx0/GA, tx2/GA) but gap 30 > 0 -> EMITS.
+                //    Under the removed unconditional veto this read was refused
+                //    for having a sibling isoform in the same gene, which made
+                //    every isoform of every multi-isoform gene unanchorable as
+                //    soon as minimap2 emitted a secondary for it.
                 synth_record("samegene", 0, Some(100), 0, 60),
                 synth_record("samegene", 2, Some(70), 0, 60),
                 // 5. physically ineligible everywhere -> no eligible candidate
@@ -2496,7 +2604,7 @@ mod tests {
             s.reads_seen, 5,
             "the unmapped record never formed a group, so there are 5 reads"
         );
-        assert_eq!(s.anchors_emitted, 2);
+        assert_eq!(s.anchors_emitted, 3);
         assert_eq!(anchors.len() as u64, s.anchors_emitted);
         assert!(
             s.anchors_emitted <= s.reads_seen,
@@ -2510,7 +2618,10 @@ mod tests {
         );
 
         assert_eq!(s.rejected_tie, 1);
-        assert_eq!(s.rejected_same_gene, 1);
+        // NOT 1 any more: `rejected_same_gene` is now only how a GAP failure is
+        // CLASSIFIED, never an independent veto. With `params()` the floors are
+        // 0.0, nothing fails the gap, so both same-gene and cross-gene are 0.
+        assert_eq!(s.rejected_same_gene, 0);
         assert_eq!(s.rejected_cross_gene, 0);
         assert_eq!(s.gene_veto_disabled, 0);
         assert_eq!(s.reads_no_eligible_candidate, 1);
@@ -2522,12 +2633,12 @@ mod tests {
                 + s.rejected_gap
                 + s.rejected_same_gene
                 + s.rejected_cross_gene
-                + s.gene_veto_disabled
                 + s.reads_no_eligible_candidate
                 + s.reads_over_cap,
             "every read that reached the per-read stage must land in exactly one \
              outcome; reads_seen={} tie={} gap={} same_gene={} cross_gene={} \
-             veto_disabled={} no_eligible={} over_cap={} anchors={}",
+             no_eligible={} over_cap={} anchors={} (gene_veto_disabled={} is NOT \
+             a destination: those reads cleared the gap and were emitted)",
             s.reads_seen,
             s.rejected_tie,
             s.rejected_gap,
@@ -2690,14 +2801,14 @@ mod tests {
     /// facts that make that state visible instead: `gene_veto_disabled` and
     /// `same_gene_unknown` are non-zero, and `rejected_cross_gene` is zero.
     #[test]
-    fn test_an_empty_tx_to_gene_routes_multi_candidate_reads_to_the_unknown_class() {
+    fn test_an_empty_tx_to_gene_emits_but_records_the_unknown_relation() {
         let (anchors, s) = run_extract(
             "vetooff",
             vec![
                 synth_record("r", 0, Some(100), 0, 60),
                 synth_record("r", 1, Some(90), 0, 60),
                 // A solo read is unaffected: with one candidate there is no
-                // pair to classify, so the veto has nothing to do.
+                // pair to classify.
                 synth_record("solo", 2, Some(100), 0, 60),
             ],
             &TxToGene::new(),
@@ -2705,15 +2816,21 @@ mod tests {
         );
 
         assert_record_ledger_closes(&s);
+        // Universal Mode no longer refuses a read for having an unclassifiable
+        // rival. It applies the same score/gap criteria as the mapped case and
+        // counts the fact that the RELATION was unavailable. Refusing outright
+        // discarded every multi-candidate read — about 47% of HC2's reads — and
+        // that population had never been exercised on real data.
         assert_eq!(
             anchors.len(),
-            1,
-            "only the single-candidate read is emitted"
+            2,
+            "the pair clears the gap, so it emits; the missing gene map is \
+             recorded, not used as grounds for refusal"
         );
         assert_eq!(s.gene_veto_disabled, 1);
         assert_eq!(
             s.same_gene_unknown, 1,
-            "the read must be routed to the UNKNOWN class, not to cross_gene"
+            "the read must be recorded in the UNKNOWN class, not to cross_gene"
         );
         assert_eq!(
             s.rejected_cross_gene, 0,
@@ -2722,15 +2839,49 @@ mod tests {
         );
         assert_eq!(
             s.rejected_same_gene, 0,
-            "the veto cannot fire on an empty map"
+            "nothing failed the gap, and 'unknown' must not be invented into \
+             'same gene' either"
         );
-        assert_eq!(s.filtered_eligible_not_anchor, 2);
+        assert_eq!(s.filtered_eligible_not_anchor, 1);
 
         // And the empty-map fallback for the EMITTED gene_id is unchanged:
         // it is still `gene_id := transcript_id`, which is what the degenerate
-        // gene pool warning keys on. That behaviour is orthogonal to the veto
-        // and two existing tests depend on it.
+        // gene pool warning keys on.
         assert_eq!(anchors[0].gene_id, anchors[0].transcript_id);
+    }
+
+    /// ...AND WITH NO MAP **AND** A GAP THAT IS NOT CLEAR, THE READ IS REJECTED
+    /// AND LANDS IN `rejected_gap` — the Unknown arm of the gap classification.
+    ///
+    /// This is what gives `rejected_gap` a producer at all. With a map supplied
+    /// the relation is always Same or Cross, so `rejected_gap` can only be
+    /// non-zero in Universal Mode, and a reader who sets `--gap-abs 20` against
+    /// a real map sees `gap=0` because none was possible, not because none was
+    /// needed.
+    #[test]
+    fn test_an_empty_tx_to_gene_with_an_unmet_gap_is_rejected_as_rejected_gap() {
+        let p = AnchorParams {
+            gap_abs: 15.0,
+            gap_rel: 0.0,
+            ..params()
+        };
+        let (anchors, s) = run_extract(
+            "vetooffgap",
+            vec![
+                synth_record("r", 0, Some(100), 0, 60),
+                synth_record("r", 1, Some(90), 0, 60),
+            ],
+            &TxToGene::new(),
+            p,
+        );
+
+        assert_record_ledger_closes(&s);
+        assert_eq!(anchors.len(), 0, "10 AS does not clear a floor of 15");
+        assert_eq!(s.rejected_gap, 1, "the Unknown arm of the gap block");
+        assert_eq!(s.rejected_same_gene, 0, "no map means never Same");
+        assert_eq!(s.rejected_cross_gene, 0, "no map means never Cross");
+        assert_eq!(s.gene_veto_disabled, 0, "it never cleared the gap");
+        assert_eq!(s.filtered_eligible_not_anchor, 2);
     }
 
     /// A NON-EMPTY `tx_to_gene` THAT DOES NOT COVER THE BAM ERRORS OUT.

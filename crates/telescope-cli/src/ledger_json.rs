@@ -64,8 +64,15 @@ level, assigned by build_anchor_pool and NOT summed over samples";
 const READ_SCOPE: &str = "READS, not records; NOT part of `deficit`, which is a \
 RECORDS identity. Every read contributes at most one anchor, so \
 reads_seen == anchors_emitted + rejected_tie + rejected_gap + \
-rejected_same_gene + rejected_cross_gene + gene_veto_disabled + \
-reads_no_eligible_candidate + reads_over_cap";
+rejected_same_gene + rejected_cross_gene + \
+reads_no_eligible_candidate + reads_over_cap. \
+`gene_veto_disabled` is DELIBERATELY ABSENT from that identity: it counts reads \
+that CLEARED the gap with the gene relation unavailable (no map supplied) and \
+were therefore EMITTED, so counting it as a destination would double-count them \
+against `anchors_emitted`. `rejected_same_gene` and `rejected_cross_gene` are \
+the same-gene / cross-gene classifications of a read the GAP rejected; there is \
+no unconditional same-gene veto, so no read is refused merely for competing with \
+a sibling isoform.";
 
 /// Render the `record_level` half: the evidence-stage ledger.
 ///
@@ -504,7 +511,6 @@ mod tests {
                 + int_field(&json, "rejected_gap")
                 + int_field(&json, "rejected_same_gene")
                 + int_field(&json, "rejected_cross_gene")
-                + int_field(&json, "gene_veto_disabled")
                 + int_field(&json, "reads_no_eligible_candidate")
                 + int_field(&json, "reads_over_cap"),
             "the READS identity does not close on the rendered artifact:\n{json}"

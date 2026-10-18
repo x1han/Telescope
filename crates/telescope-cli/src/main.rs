@@ -656,6 +656,32 @@ fn main() -> Result<()> {
                 }
             );
 
+            // RANGE-CHECK THE GAP FLOORS BEFORE THEY REACH THE RULE.
+            //
+            // `gap < p.gap_abs` is false for every `gap` when `p.gap_abs` is NaN,
+            // and false for every non-negative `gap` when `p.gap_abs` is negative.
+            // Both therefore switch the criterion OFF while the run banner keeps
+            // printing the number the user typed — the ledger would say the gap was
+            // 20 while the rule had no gap in it at all, and `rejected_gap` would
+            // be 0 for a reason that looks exactly like "the data never failed the
+            // gap". `g_rel >= 1.0` is the mirror trap: it can never be satisfied by
+            // a positive relative gap, so it is also a silent disable.
+            anyhow::ensure!(
+                gap_abs.is_finite() && gap_abs >= 0.0,
+                "--gap-abs must be a finite, non-negative number of AS points \
+                 (got {:?}). NaN compares false against every gap and a negative \
+                 value is unsatisfiable by a real score difference; either one \
+                 silently switches the criterion off.",
+                gap_abs
+            );
+            anyhow::ensure!(
+                gap_rel.is_finite() && (0.0..1.0).contains(&gap_rel),
+                "--gap-rel must be a finite fraction in [0.0, 1.0) (got {:?}). \
+                 A value >= 1.0 demands a relative gap no positive score \
+                 difference can supply, which switches the criterion off.",
+                gap_rel
+            );
+
             let tx_to_g = load_tx_to_gene(&tx_to_gene)?;
             eprintln!("  tx_to_gene entries: {}", tx_to_g.len());
             if tx_to_g.len() == 0 {
