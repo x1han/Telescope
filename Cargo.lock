@@ -1086,7 +1086,7 @@ dependencies = [
 
 [[package]]
 name = "telescope"
-version = "0.1.3"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1095,7 +1095,7 @@ dependencies = [
 
 [[package]]
 name = "telescope-core"
-version = "0.1.3"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "arrow",

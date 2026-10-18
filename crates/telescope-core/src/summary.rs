@@ -95,6 +95,15 @@ fn load_provenance<P: AsRef<Path>>(path: P) -> Result<Vec<(String, ProvenanceRow
                 "L2" => "L2",
                 "L3_anchored" => "L3_anchored",
                 "L3_imputed" => "L3_imputed",
+                // R141: the third status in the tier table. `L3_imputed` and
+                // `L3_unexpressed` are BOTH written by `build-emission` into
+                // `<stem>.provenance.parquet`, and this function fails closed on
+                // any tier it does not know. Without this arm, a shipped
+                // `summarize --provenance <sidecar>` over a shipped artefact
+                // dies with `provenance 'tier' has unknown value
+                // "L3_unexpressed"` — a version-mismatch message for a value
+                // this repository itself writes.
+                "L3_unexpressed" => "L3_unexpressed",
                 other => bail!("provenance 'tier' has unknown value {:?}", other),
             };
             out.push((

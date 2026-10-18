@@ -821,20 +821,31 @@ pub fn read_reference_universe<P: AsRef<Path>>(bam_path: P) -> Result<Vec<String
         .collect())
 }
 
-/// The four provenance tiers, exactly as written into
+/// The five provenance tiers, exactly as written into
 /// `<stem>.provenance.parquet`'s `tier` column.
 ///
-/// WHY THESE FOUR AND NOT THREE. The L1/L2/L3 cascade has three levels, and
+/// WHY THESE FIVE AND NOT THREE. The L1/L2/L3 cascade has three levels, and
 /// an IMPUTED row is not one of them: it has no anchors at all, so it never
 /// entered the cascade. Folding it into `L3` would make "L3" mean both "this
 /// transcript's own gene pool was too small" and "this transcript was never
 /// observed", which are different facts with different consequences downstream.
 /// `L3_imputed` and `L3_anchored` are therefore separate enum values even
 /// though both carry the cohort fit.
+///
+/// `L3_unexpressed` (R141) splits the imputed population a second time, on the
+/// only line the data supports: whether the transcript's OWN GENE has an entry
+/// in `gene_fit`. When it does, the cohort fit this row carries is standing in
+/// for a gene that WAS measured from pooled anchors of sibling transcripts —
+/// a legal imputation derived from real measurements of the same locus. When
+/// it does not, nothing in this dataset informs the transcript beyond the
+/// cohort-wide prior, and calling that an imputation overstates it. It is a
+/// LABEL split only: no fitted value, no `is_polyA_competent`, and no row
+/// changes.
 pub const TIER_L1: &str = "L1";
 pub const TIER_L2: &str = "L2";
 pub const TIER_L3_ANCHORED: &str = "L3_anchored";
 pub const TIER_L3_IMPUTED: &str = "L3_imputed";
+pub const TIER_L3_UNEXPRESSED: &str = "L3_unexpressed";
 
 /// Schema of the per-transcript provenance sidecar: exactly four columns.
 ///
@@ -1173,6 +1184,26 @@ where
                     let gene = tx_to_gene
                         .and_then(|m| m.get(tx_id).cloned())
                         .unwrap_or_else(|| (*tx_id).clone());
+                    // THE THIRD STATUS (R141). `gene_fit` holds a fit for every
+                    // gene whose POOLED anchors reached `gene_min_reads`, so it
+                    // answers exactly one question about a never-anchored
+                    // transcript: did anything in this dataset measure this
+                    // LOCUS? A gene with an entry here is backed by real
+                    // measurements of sibling transcripts, which makes borrowing
+                    // the cohort fit for one of its isoforms a legal
+                    // imputation. A gene with no entry is not: nothing beyond
+                    // the cohort-wide prior informs this row, and labelling
+                    // that `L3_imputed` presents a fabricated fit as a
+                    // derivation.
+                    //
+                    // LABEL ONLY. The fitted values, `is_polyA_competent` and
+                    // the row count are identical in both arms — this changes
+                    // what the table SAYS, not what it computes.
+                    let tier = if gene_fit.contains_key(&gene) {
+                        TIER_L3_IMPUTED
+                    } else {
+                        TIER_L3_UNEXPRESSED
+                    };
                     (
                         gene,
                         1.0_f64,
@@ -1182,7 +1213,7 @@ where
                             mu: cohort_fit.mu,
                             sigma2: cohort_fit.sigma2,
                         },
-                        TIER_L3_IMPUTED,
+                        tier,
                     )
                 }
                 Some(acc) => {
@@ -2536,19 +2567,34 @@ mod tests {
         );
 
         for (tx, gene, tier, n_anchor) in &prov {
-            let imputed = *tier == TIER_L3_IMPUTED;
+            // `n_anchor == 0` marks a row with NO anchors of its own. Since R141
+            // that population has TWO tiers, not one: `L3_imputed` (the gene was
+            // measured) and `L3_unexpressed` (it was not). The invariant is
+            // therefore over the SET, and this fixture has no gene map, so
+            // every padded row is `L3_unexpressed` — which is why this test
+            // exercises the label but not the split.
+            let never_anchored = *tier == TIER_L3_IMPUTED || *tier == TIER_L3_UNEXPRESSED;
             assert_eq!(
                 *n_anchor == 0,
-                imputed,
-                "{tx}: n_anchor == 0 must mean exactly 'imputed', and this row \
-                 is tier {tier} with n_anchor {n_anchor} (gene {gene})"
+                never_anchored,
+                "{tx}: n_anchor == 0 must mean exactly 'a row with no anchors of \
+                 its own' (L3_imputed or L3_unexpressed), and this row is tier \
+                 {tier} with n_anchor {n_anchor} (gene {gene})"
             );
         }
 
         let n_l1 = prov.iter().filter(|r| r.2 == TIER_L1).count();
         let n_l2 = prov.iter().filter(|r| r.2 == TIER_L2).count();
         let n_l3a = prov.iter().filter(|r| r.2 == TIER_L3_ANCHORED).count();
-        let n_l3i = prov.iter().filter(|r| r.2 == TIER_L3_IMPUTED).count();
+        // `n_imputed` counts ROWS with no anchors of their own, and since R141
+        // that population carries two labels. The histogram is over ROWS, so
+        // the imputed bucket is the SUM — counting only `L3_imputed` would make
+        // this test assert 0 against a counter that says 2, and "fixing" it by
+        // relaxing the comparison would leave the histogram unchecked.
+        let n_l3i = prov
+            .iter()
+            .filter(|r| r.2 == TIER_L3_IMPUTED || r.2 == TIER_L3_UNEXPRESSED)
+            .count();
         assert_eq!(
             (n_l1, n_l2, n_l3a, n_l3i),
             (tiers.l1, tiers.l2, tiers.l3, tiers.n_imputed),
@@ -2564,6 +2610,15 @@ mod tests {
             n_l3i
         );
         assert_eq!(n_l3i, 2, "the fixture pads exactly two transcripts");
+        // This fixture supplies NO gene map, so every padded transcript's gene
+        // is its own id and nothing anchors it: the two rows are BOTH
+        // `L3_unexpressed`. The split itself is covered by
+        // `the_tier_label_splits_a_padded_transcript_by_whether_its_gene_was_measured`.
+        assert_eq!(
+            prov.iter().filter(|r| r.2 == TIER_L3_UNEXPRESSED).count(),
+            2,
+            "with no gene map, no padded transcript has a measured gene"
+        );
         assert!(
             n_l1 > 0 && n_l2 > 0,
             "CONTROL: the fixture must exercise L1 and L2, or the L2 row above \
@@ -2684,6 +2739,145 @@ mod tests {
              imputed rows into l3 would silently rebase every published tier \\
              percentage onto the padded denominator."
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// THE THIRD STATUS (R141): a never-anchored transcript is `L3_imputed`
+    /// when its OWN GENE has an entry in `gene_fit`, and `L3_unexpressed` when
+    /// it does not.
+    ///
+    /// ## THE CUT, AND WHY IT IS THE ONLY ONE AVAILABLE
+    ///
+    /// `gene_fit` is built from genes whose POOLED anchors reach
+    /// `gene_min_reads`. Its membership therefore answers exactly one question
+    /// about a transcript with no anchors of its own: **did this dataset
+    /// measure this locus at all?** A gene that made the cut has real
+    /// measurements behind it, so filling in one of its isoforms is a
+    /// derivation. A gene that did not has nothing but the cohort-wide prior,
+    /// and calling that an imputation states more than the arithmetic supports.
+    /// It is the cut the expert named (独立拟合 / 合法插补 / 不可用), and
+    /// `gene_fit` is the only measured quantity on the tier table that
+    /// separates the second from the third.
+    ///
+    /// ## IT IS A LABEL AND NOTHING ELSE
+    ///
+    /// Every fitted value, `is_polyA_competent` and the row COUNT is asserted
+    /// identical across the two arms. That is the load-bearing half of this
+    /// test: a change that quietly started fitting the gene instead of the
+    /// cohort would keep the tier label and move `(mu, sigma2)`.
+    ///
+    /// ## THE FIXTURE
+    ///
+    /// A real `tx_to_gene`, because with no map `gene_id := transcript_id` and
+    /// every padded transcript's gene is its own id, which nobody anchors — so
+    /// the split would collapse to "everything is unexpressed" and the test
+    /// would pass for the wrong reason. `gene_a` pools 16 + 14 = 30 anchors,
+    /// exactly `gene_min_reads`; `gene_b` pools 2. `tx_pad_a` is padded into
+    /// `gene_a` and `tx_pad_b` into `gene_b`.
+    #[test]
+    fn the_tier_label_splits_a_padded_transcript_by_whether_its_gene_was_measured() {
+        let tmp = local_scratch("telescope_test_tiersplit");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+
+        // `FallbackConfig::default()` gene_min_reads is 30; gene_a pools 15
+        // here, so raise nothing and instead give gene_a enough anchors by
+        // adding a second transcript under the same gene.
+        let fxs = vec![
+            TxFixture {
+                gene_id: "gene_a".into(),
+                tx_id: "tx_a1".into(),
+                pals: (80..=95).collect(),
+            },
+            TxFixture {
+                gene_id: "gene_a".into(),
+                tx_id: "tx_a2".into(),
+                pals: (81..=94).collect(),
+            },
+            TxFixture {
+                gene_id: "gene_b".into(),
+                tx_id: "tx_b1".into(),
+                pals: vec![85, 86],
+            },
+        ];
+        let anchor_pool = tmp.join("anchor_pool.parquet");
+        let out = tmp.join("emission.parquet");
+        write_anchor_pool_parquet(&anchor_pool, &fxs);
+
+        // gene_a: 16 + 14 = 30 pooled anchors == gene_min_reads -> a gene_fit
+        // entry. gene_b: 2 -> none.
+        let tsv = tmp.join("tx_to_gene.tsv");
+        std::fs::write(
+            &tsv,
+            "transcript_id\tgene_id\n\
+             tx_a1\tgene_a\n\
+             tx_a2\tgene_a\n\
+             tx_pad_a\tgene_a\n\
+             tx_b1\tgene_b\n\
+             tx_pad_b\tgene_b\n",
+        )
+        .expect("write tx2gene");
+        let map = TxToGene::from_tsv(&tsv).expect("parse tx2gene");
+        assert_eq!(
+            map.len(),
+            5,
+            "the map must not be empty, or nothing classifies"
+        );
+        let universe: Vec<String> = vec![
+            "tx_a1".into(),
+            "tx_a2".into(),
+            "tx_b1".into(),
+            "tx_pad_a".into(),
+            "tx_pad_b".into(),
+        ];
+        let tiers = build_emission_from_anchors(
+            &anchor_pool,
+            None::<&str>,
+            &out,
+            &FallbackConfig::default(),
+            Some(&universe),
+            Some(&map),
+        )
+        .expect("Universal mode run with a reference universe");
+
+        let prov = read_provenance_parquet(&tiers.provenance_path);
+        let tier_of = |tx: &str| -> String {
+            prov.iter()
+                .find(|r| r.0 == tx)
+                .unwrap_or_else(|| panic!("{tx} missing from the provenance table"))
+                .2
+                .to_string()
+        };
+
+        assert_eq!(
+            tier_of("tx_pad_a"),
+            TIER_L3_IMPUTED,
+            "gene_a pooled 30 anchors and reached gene_min_reads, so this locus \
+             WAS measured — filling in one of its isoforms is a legal imputation"
+        );
+        assert_eq!(
+            tier_of("tx_pad_b"),
+            TIER_L3_UNEXPRESSED,
+            "gene_b pooled 2 anchors and has no gene_fit entry, so nothing in \
+             this dataset informs tx_pad_b beyond the cohort-wide prior"
+        );
+        assert_ne!(
+            tier_of("tx_pad_a"),
+            tier_of("tx_pad_b"),
+            "the whole point of the third status: two identical cohort fits, \
+             labelled by what is known about their loci"
+        );
+
+        // And it really is label-only: same fit, same competence, same count.
+        let rows = read_emission_parquet(&out);
+        let idx = |tx: &str| rows.iter().position(|r| r.0 == tx).expect("row");
+        let (a, b) = (idx("tx_pad_a"), idx("tx_pad_b"));
+        assert_eq!(rows[a].5, rows[b].5, "mu unchanged by the label");
+        assert_eq!(rows[a].6, rows[b].6, "sigma2 unchanged by the label");
+        assert_eq!(rows[a].3, rows[b].3, "is_polyA_competent unchanged");
+        assert_eq!(rows[a].4, 0, "n_cohort_flnc unchanged");
+        assert_eq!(tiers.n_imputed, 2);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

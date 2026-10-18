@@ -24,7 +24,7 @@ use std::process::Command;
 
 use telescope_core::evidence::test_support::{
     synth_record, synth_record_no_position, synth_record_no_read_id, synth_record_no_refid,
-    synth_record_with_flags, write_synthetic_bam, SamFlags as Flags,
+    synth_record_with_flags, synth_record_with_gap, write_synthetic_bam, SamFlags as Flags,
 };
 
 const SCHEMA: &str = "telescope.filter_ledger/v1";
@@ -52,6 +52,12 @@ const ANCHOR_BUCKETS: [&str; 12] = [
 /// proving those buckets are countable in the artifact — which is exactly the
 /// `deficit == 0` ambiguity the whole ticket exists to remove.
 ///
+/// ⚠ EVERY "record that passes" HERE CARRIES `AS:i = 100`. Since R141 the gap is
+/// `AS_1 - (AS_2 or 0)` against a shipped floor of 12, so a record with no `AS`
+/// tag measures 0 and is rejected — these fixtures used to pass `None` and
+/// built an empty pool, which the `passed == 2` assertion below would have
+/// reported as a missing record rather than as a floor that had moved.
+///
 /// **THE THREE DEFECT COUNTS ARE 1, 2 AND 3, NOT 1, 1 AND 1, AND THAT IS THE
 /// POINT.** The first version of this fixture used one record per defect. A
 /// mutation that transposes the `no_position` and `no_read_id` arguments in
@@ -65,8 +71,8 @@ fn three_defect_bam(tag: &str) -> PathBuf {
     write_synthetic_bam(
         tag,
         vec![
-            synth_record("ok0", 0, Some(0), 0, 60),
-            synth_record("ok1", 1, Some(1), 0, 60),
+            synth_record("ok0", 0, Some(100), 0, 60),
+            synth_record("ok1", 1, Some(100), 0, 60),
             // 1 x no_refid
             synth_record_no_refid("norid", Some(2), 0, 60),
             // 2 x no_position
@@ -84,8 +90,8 @@ fn all_good_bam(tag: &str) -> PathBuf {
     write_synthetic_bam(
         tag,
         vec![
-            synth_record("a0", 0, Some(0), 0, 60),
-            synth_record("b0", 1, Some(1), 0, 60),
+            synth_record("a0", 0, Some(100), 0, 60),
+            synth_record("b0", 1, Some(100), 0, 60),
         ],
     )
 }
@@ -115,6 +121,30 @@ fn three_new_buckets_bam(tag: &str) -> PathBuf {
     )
 }
 
+/// A BAM that drives the RUNNER-UP USURPATION branch end to end.
+///
+/// One read, two records, two transcripts:
+///   * `tx0` at AS 100, reverse-strand with a 100 bp 5' gap — its 3' end lands
+///     100 bp short of the TES, beyond the slack of 35, so it is the read's RAW
+///     argmax and it is physically disqualified.
+///   * `tx1` at AS 50, full length, physically eligible — the runner-up.
+///
+/// Before R141 the rule argmaxed over the eligible subset, `tx0` simply ceased
+/// to exist, and `tx1` was emitted as the read's anchor. It is now refused.
+///
+/// The two AS values are 100 and 50 on purpose: DISTINCT is what makes this
+/// fixture different from a tie fixture, and the assertion on `rejected_tie`
+/// below is what says the two branches were not confused.
+fn usurpation_bam(tag: &str) -> PathBuf {
+    write_synthetic_bam(
+        tag,
+        vec![
+            synth_record_with_gap("u0", 0, 100, true, Some(100), 0, 60),
+            synth_record("u0", 1, Some(50), 0, 60),
+        ],
+    )
+}
+
 /// A BAM whose every record carries MAPQ BELOW the old gate's threshold of 20.
 ///
 /// This is the input `filtered_unique` used to absorb. It exists so the retired
@@ -126,9 +156,9 @@ fn retired_mapq_gate_bam(tag: &str) -> PathBuf {
         tag,
         vec![
             // MAPQ 3. Used to die at `if mapq < 20`.
-            synth_record("lowq", 0, Some(0), 0, 3),
+            synth_record("lowq", 0, Some(100), 0, 3),
             // MAPQ 11, on a different transcript so the two do not tie.
-            synth_record("lowq2", 1, Some(1), 0, 11),
+            synth_record("lowq2", 1, Some(100), 0, 11),
         ],
     )
 }
@@ -520,4 +550,196 @@ fn build_anchors_reports_a_retired_unique_bucket_of_zero() {
     // And both reads reached the per-read stage, as anchors.
     assert_eq!(int_field(&json, "reads_seen"), 2);
     assert_eq!(int_field(&json, "anchors_emitted"), 2);
+}
+
+/// `rejected_usurpation` REACHES THE ARTIFACT, WITH THE COUNT THE TOOL
+/// ACTUALLY PRODUCED — AND IT IS NOT A TIE.
+///
+/// The renderer unit test proves the key is formatted; only a real
+/// `build-anchors` run proves the CLI reaches the branch at all. Delete
+/// `if !scratch[0].2 { ... }` from `anchor_builder.rs` and this goes red at
+/// `anchors_emitted == 1` — the runner-up is emitted instead of refused.
+///
+/// FOUR ASSERTIONS, because any one alone is satisfiable by accident:
+///   * `rejected_usurpation == 1`  — the branch fired;
+///   * `rejected_tie == 0`         — and it was NOT the tie branch (the two
+///                                    candidates are 100 and 50, not equal);
+///   * `anchors_emitted == 0`      — the runner-up was not emitted;
+///   * `eligible_not_anchor == 1`  — the physically-passing record was
+///                                    absorbed, so the record ledger still
+///                                    closes at `deficit == 0`.
+#[test]
+fn build_anchors_serializes_rejected_usurpation_and_refuses_the_runner_up() {
+    let bam = usurpation_bam("usurp");
+    let out = scratch("usurp", "parquet");
+    let led = scratch("usurp", "json");
+    run(&[
+        "build-anchors",
+        "--bam",
+        bam.to_str().unwrap(),
+        "--sample-id",
+        "S1",
+        "--output",
+        out.to_str().unwrap(),
+        "--ledger",
+        led.to_str().unwrap(),
+    ]);
+    let json = read(&led);
+    cleanup(&[&bam, &out, &led]);
+
+    assert_eq!(
+        int_field(&json, "rejected_usurpation"),
+        1,
+        "the read's RAW argmax (tx0, AS 100) is 3'-truncated and ineligible; \
+         only the lower-AS tx1 survives, and that is a refusal, not an anchor.\n{json}"
+    );
+    assert_eq!(
+        int_field(&json, "rejected_tie"),
+        0,
+        "100 vs 50 is not a tie — if this is 1 the branches were swapped.\n{json}"
+    );
+    assert_eq!(
+        int_field(&json, "anchors_emitted"),
+        0,
+        "the runner-up must not inherit the read.\n{json}"
+    );
+    assert_eq!(
+        int_field(&json, "passed"),
+        0,
+        "no record became an anchor.\n{json}"
+    );
+    assert_eq!(
+        int_field(&json, "eligible_not_anchor"),
+        1,
+        "tx1 WAS physically eligible and is still not emitted, so its record \
+         must be absorbed here or the record ledger leaks.\n{json}"
+    );
+    assert_eq!(
+        int_field(&json, "3p_anchor"),
+        1,
+        "the disqualified tx0 record went to its own bucket.\n{json}"
+    );
+
+    // The twelve-bucket RECORD identity is untouched by the new read counter.
+    let buckets: i64 = ANCHOR_BUCKETS.iter().map(|k| int_field(&json, k)).sum();
+    assert_eq!(
+        int_field(&json, "total_records") - buckets - int_field(&json, "passed"),
+        int_field(&json, "deficit"),
+        "the twelve-bucket identity must still hold:\n{json}"
+    );
+    assert_eq!(
+        int_field(&json, "deficit"),
+        0,
+        "a balanced fixture:\n{json}"
+    );
+
+    // And the READ identity closes with usurpation as a destination.
+    assert_eq!(
+        int_field(&json, "reads_seen"),
+        int_field(&json, "anchors_emitted")
+            + int_field(&json, "rejected_tie")
+            + int_field(&json, "rejected_usurpation")
+            + int_field(&json, "rejected_gap")
+            + int_field(&json, "rejected_same_gene")
+            + int_field(&json, "rejected_cross_gene")
+            + int_field(&json, "reads_no_eligible_candidate")
+            + int_field(&json, "reads_over_cap"),
+        "the READS identity does not close on the rendered artifact:\n{json}"
+    );
+    assert_eq!(
+        int_field(&json, "reads_seen"),
+        1,
+        "the fixture holds ONE read"
+    );
+    assert!(
+        json.contains("rejected_usurpation"),
+        "the key must be present in the artifact itself:\n{json}"
+    );
+}
+
+/// THE SHIPPED `--gap-abs` DEFAULT IS 12.0, NOT THE 0.0 THIS COMMAND USED TO
+/// SHIP.
+///
+/// The other twenty-odd `anchor_builder` tests deliberately run at 0.0 (see
+/// `params()` there), so NOTHING in the library suite can see the CLI default —
+/// a change to `default_value_t` would leave every one of them green. This test
+/// reads it off the run banner, which prints the resolved value the rule
+/// actually receives.
+///
+/// It also pins the two facts that make the banner trustworthy: the banner says
+/// `active` at 12.0 (the `== 0.0` branch), and the effect is real — two reads
+/// identical except for a 12 AS gap behave differently under the DEFAULT.
+#[test]
+fn a_build_anchors_run_without_gap_abs_uses_the_ruled_default_of_twelve() {
+    let bam = write_synthetic_bam(
+        "gapdefault",
+        vec![
+            // 100 vs 50 -> raw gap 50, clears a floor of 12.
+            synth_record("wide", 0, Some(100), 0, 60),
+            synth_record("wide", 1, Some(50), 0, 60),
+            // 100 vs 95 -> raw gap 5, BELOW a floor of 12. Under the old 0.0
+            // default both reads emitted; exactly one does now.
+            synth_record("narrow", 0, Some(100), 0, 60),
+            synth_record("narrow", 1, Some(95), 0, 60),
+        ],
+    );
+    let out = scratch("gapdefault", "parquet");
+    let led = scratch("gapdefault", "json");
+    let st = Command::new(env!("CARGO_BIN_EXE_telescope"))
+        .args([
+            "build-anchors",
+            "--bam",
+            bam.to_str().unwrap(),
+            "--sample-id",
+            "S1",
+            "--output",
+            out.to_str().unwrap(),
+            "--ledger",
+            led.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to spawn the telescope binary");
+    assert!(
+        st.status.success(),
+        "build-anchors failed: {}\nstderr:\n{}",
+        st.status,
+        String::from_utf8_lossy(&st.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&st.stderr).into_owned();
+    let json = read(&led);
+    cleanup(&[&bam, &out, &led]);
+
+    assert!(
+        stderr.contains("gap_abs:    12 (active)"),
+        "the SHIPPED default must be 12.0 and the banner must say `active`. \
+         A banner reading `gap_abs: 0 (OFF ...)` is the pre-R141 default and \
+         every gap-based rejection on this data would silently disappear.\n\
+         stderr:\n{stderr}"
+    );
+
+    // The default is not merely printed; it is APPLIED.
+    assert_eq!(int_field(&json, "reads_seen"), 2);
+    assert_eq!(
+        int_field(&json, "anchors_emitted"),
+        1,
+        "the wide read (gap 50) emits; the narrow one (gap 5) is refused by the \
+         12-point default.\n{json}"
+    );
+    assert_eq!(
+        int_field(&json, "rejected_gap"),
+        1,
+        "the narrow read fails the 12-point default. No --tx-to-gene was \
+         passed, so the gene relation is Unknown and the gap failure is \
+         classified into `rejected_gap` rather than same/cross.\n{json}"
+    );
+    assert_eq!(
+        int_field(&json, "rejected_same_gene"),
+        0,
+        "no map was supplied, so `same_gene` must never be invented.\n{json}"
+    );
+    assert_eq!(
+        int_field(&json, "rejected_usurpation"),
+        0,
+        "both candidates of both reads are physically eligible.\n{json}"
+    );
 }

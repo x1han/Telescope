@@ -205,18 +205,31 @@ enum Cmd {
         #[arg(long, default_value_t = 200)]
         max_reads_per_sample: usize,
 
-        /// Absolute floor on the per-read `AS_best - AS_second` gap.
+        /// Absolute floor on the per-read `delta_AS_raw` gap (default 12).
         ///
-        /// ⚠ THE DEFAULT 0.0 IS NOT A CALIBRATED PRODUCTION VALUE. It means
-        /// "no gap requirement" — this criterion is switched off unless you set
-        /// it. Nothing in this repository measures what it should be; the owner
-        /// declined to ship an uncalibrated default. Read 0.0 as "off", never as
-        /// "zero gap is correct".
-        #[arg(long, default_value_t = 0.0)]
+        /// **12.0 IS A RULED VALUE, NOT A LEFTOVER.** It was 0.0 — read as "no
+        /// gap requirement" — until the R141 ruling, and the text this replaces
+        /// said so repeatedly. The number that replaced it is 12 because a
+        /// single mismatch on this data costs 6 AS and a 1 bp indel 6–8 AS: a
+        /// 12-point floor is above the cost of one edit and far below the cost
+        /// of the isoform divergence this stage exists to resolve.
+        ///
+        /// `delta_AS_raw = AS_1 - (AS_2 or 0)`, measured on the read's FULL
+        /// deduped candidate set, before the physical filters — so a read with a
+        /// single candidate is measured against 0 and this floor applies to it
+        /// too. A read whose best RAW alignment fails a physical filter is
+        /// refused rather than attributed to its runner-up.
+        #[arg(long, default_value_t = 12.0)]
         gap_abs: f64,
 
-        /// Floor on the per-read `AS_best - AS_second` gap as a fraction of
-        /// `AS_best`. Same caveat as `--gap-abs`: the 0.0 default means "off".
+        /// Floor on the per-read `delta_AS_raw` gap as a fraction of `AS_1`.
+        ///
+        /// **THE 0.0 DEFAULT IS A FROZEN CHOICE, NOT AN OMISSION.** It used to
+        /// be 0.0 because the owner declined to ship an uncalibrated value,
+        /// which made it read as "off". It is still 0.0, and it is now ruled:
+        /// the two floors combine with `max`, so a relative floor of 0.0 is
+        /// arithmetically inert beside a non-zero `--gap-abs` and means "the
+        /// absolute floor is the only floor". Read it that way, never as "off".
         #[arg(long, default_value_t = 0.0)]
         gap_rel: f64,
 
@@ -356,6 +369,10 @@ fn main() -> Result<()> {
                 q.set_file_name(format!("{stem}.provenance.json"));
                 q
             });
+            // GUARD, PART 1 OF 2: the parts of the check that need nothing but
+            // the arguments. See `refuse_a_provenance_path_that_clobbers_a_table`
+            // for what this is protecting and why the second half has to wait.
+            refuse_a_provenance_path_that_clobbers_a_table(&prov_path, &output)?;
             let reference_source_for_prov = reference_bam.clone();
             let tiers = emission_model::build_emission_from_anchors(
                 anchor_pool,
@@ -366,6 +383,9 @@ fn main() -> Result<()> {
                 tx2g.as_ref(),
             )
             .context("Module 1 build_emission_from_anchors (Universal) failed")?;
+            // GUARD, PART 2 OF 2: the tier sidecar. `tiers` does not exist until
+            // the call above returns, so this half cannot sit next to the first.
+            refuse_a_provenance_path_that_clobbers_a_table(&prov_path, &tiers.provenance_path)?;
             // L1/L2/L3 split, read off the RETURN VALUE rather than scraped
             // from the library's stderr. The denominator is the number of
             // emitted rows, guarded against the zero-transcript case.
@@ -633,10 +653,12 @@ fn main() -> Result<()> {
             eprintln!("  min_cov:    {}", min_coverage);
             eprintln!("  cap_per_tx: {}", max_reads_per_sample);
             eprintln!("  output:     {}", output.display());
-            // The gap floors are printed even at their defaults precisely
-            // BECAUSE the defaults are "off" and not calibrated values: a run
-            // log that reads `gap_abs=0.0` without this line is indistinguishable
-            // from a run where somebody believes zero is the right threshold.
+            // The gap floors are printed with their ACTIVE/OFF state on every
+            // run. At the ruled default of 12.0 this prints "active", which is
+            // the fact a run log needs: the floor is applied, and its value is
+            // on the same line as the verdict. A run log that reads
+            // `gap_abs=0.0` with no state beside it is indistinguishable from a
+            // run where somebody believes zero is the right threshold.
             eprintln!(
                 "  gap_abs:    {} ({})",
                 gap_abs,
@@ -685,10 +707,18 @@ fn main() -> Result<()> {
             let tx_to_g = load_tx_to_gene(&tx_to_gene)?;
             eprintln!("  tx_to_gene entries: {}", tx_to_g.len());
             if tx_to_g.len() == 0 {
+                // NOT A VETO MESSAGE, and the old one was false since R140. There
+                // is no gene veto: a read is refused only by the tie, the
+                // usurpation, the gap or the cap, and none of those consults the
+                // map. What an empty map changes is the CLASSIFICATION of a gap
+                // failure — `Unknown` instead of Same/Cross — and the
+                // bookkeeping counters that record that the relation was
+                // unavailable. The reads are still emitted.
                 eprintln!(
-                    "  tx_to_gene:        (NONE — gene_veto_disabled=true; every \
-                     multi-candidate read is discarded because the same-gene \
-                     question cannot be answered without a map)"
+                    "  tx_to_gene:        (NONE — no veto applies; a gap failure \
+                     cannot be classified as same- or cross-gene, so it is \
+                     counted as rejected_gap and gene_veto_disabled records the \
+                     reads whose relation was unavailable)"
                 );
             }
 
@@ -829,6 +859,77 @@ fn main() -> Result<()> {
     }
 }
 
+/// REFUSE a `--provenance-out` that would destroy a PARQUET table.
+///
+/// WHY THIS EXISTS. `--provenance-out` names the JSON run header, written with
+/// `std::fs::write`. Nothing constrained it: a path ending `.parquet` was
+/// accepted, and so was a path equal to `--output` or to the per-transcript
+/// provenance table. On the frozen Dataset B calibration run,
+/// `--provenance-out .../tiers.parquet` overwrote that file with 654 bytes of
+/// JSON — the per-transcript tier table is the ONLY record of which fallback
+/// level (L1 / L2 / L3) produced each row, so the calibration became
+/// unidentifiable from its own artefacts, with no error anywhere.
+///
+/// Two checks, in two places, because they have different inputs:
+///
+///   * this function: `prov` must not have a `.parquet` extension and must not
+///     be the same path as `table`. Called once before
+///     `build_emission_from_anchors` (against `--output`) and once after it
+///     returns (against `tiers.provenance_path`, which does not exist until
+///     then).
+///   * `same_file_or_path`: canonicalise where the file exists, fall back to a
+///     plain comparison where it does not. The fallback is what makes the
+///     guard fire on the FIRST call, where `--output` has usually not been
+///     written yet and `canonicalize` would fail.
+///
+/// `std::fs::write` TRUNCATES. There is no window in which both files survive.
+fn refuse_a_provenance_path_that_clobbers_a_table(
+    prov: &std::path::Path,
+    table: &std::path::Path,
+) -> Result<()> {
+    // COLLISION FIRST, EXTENSION SECOND — the order is chosen for the MESSAGE,
+    // not for the arithmetic. A user who pointed `--provenance-out` at the tier
+    // sidecar gets told WHICH TABLE they are about to destroy; told only that
+    // the extension is unusual, they have no way to tell that case from a
+    // typo, because `--output` is `.parquet` too and half the flags in this
+    // crate take parquet paths.
+    anyhow::ensure!(
+        !same_file_or_path(prov, table),
+        "--provenance-out {:?} is the same file as {:?}, which this run has \
+         already written or is about to write as a PARQUET table. The run \
+         header is JSON and truncates it. Choose a different --provenance-out.",
+        prov,
+        table
+    );
+    let is_parquet = prov
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("parquet"));
+    anyhow::ensure!(
+        !is_parquet,
+        "--provenance-out {:?} ends in .parquet. This flag writes the JSON run \
+         header, and writing it to a parquet path replaces that table with JSON \
+         with no error. If you meant the per-transcript tier table, it is \
+         written automatically beside --output and its path is printed by this \
+         command; do not name it here.",
+        prov
+    );
+    Ok(())
+}
+
+/// Do two paths name the same file?
+///
+/// Canonicalise where the file exists, because `a/../b.parquet` and `b.parquet`
+/// are one file and a plain string comparison calls them two. Where NEITHER
+/// exists yet — which is the normal state for `--output` at the point the guard
+/// runs — `canonicalize` fails and the plain comparison is the best available
+/// answer, which is why it is the fallback rather than the only case.
+fn same_file_or_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
 /// Load the transcript -> gene map, FAILING CLOSED when one was asked for but
 /// yielded nothing.
 ///
@@ -908,6 +1009,97 @@ mod tests {
         for f in [hdr, sp, ok] {
             let _ = std::fs::remove_file(f);
         }
+    }
+
+    /// A `--provenance-out` that would destroy a parquet table is refused — both
+    /// halves of the guard, called directly.
+    ///
+    /// ## WHY THIS IS A UNIT TEST AND NOT ONLY THE PROCESS-LEVEL ONE
+    ///
+    /// `crates/telescope-cli/tests/provenance_out_cannot_clobber_a_parquet_table.rs`
+    /// drives the real binary and covers the two inputs a user can actually
+    /// type. It CANNOT cover the collision branch for the tier sidecar: that
+    /// file is always named `<stem>.provenance.parquet`, so the `.parquet`
+    /// extension check fires first, before the build starts, and the collision
+    /// branch is never reached through the CLI. Calling the guard directly is
+    /// what covers it — with a table whose name does NOT end in `.parquet`, so
+    /// only the collision can reject it.
+    ///
+    /// ## WHAT EACH CASE IS FOR
+    ///
+    ///   * `.parquet` extension: the shape that cost the Dataset B calibration.
+    ///   * same path as a table: the shape that destroys whatever it names,
+    ///     whatever the file is called — and the branch the extension check
+    ///     would miss if the library ever renamed the sidecar.
+    ///   * a name that collides only AFTER canonicalisation (`x/../x`): a plain
+    ///     string comparison calls that two files, and `std::fs::write` calls
+    ///     it one.
+    ///   * a legal `.json` path next to a table: the positive control, so the
+    ///     three above are measuring the guard and not a guard that refuses
+    ///     everything.
+    ///
+    /// Cases 2 and 3 name the table `.tbl`, not `.parquet`, ON PURPOSE: a
+    /// `.parquet` table would be caught by the extension check first and the
+    /// collision branch would never run, which is the whole reason this test
+    /// exists.
+    #[test]
+    fn a_collision_with_a_parquet_table_is_refused_whatever_its_name() {
+        let dir = std::env::temp_dir();
+        let table = dir.join("tel_prov_guard_table.tbl");
+        let legal = dir.join("tel_prov_guard_header.json");
+        // The table EXISTS for the whole test. `canonicalize` is `realpath(3)`
+        // and fails on a path that does not resolve, so a guard exercised
+        // against a non-existent table silently takes the string-comparison
+        // fallback on BOTH sides and the canonicalise branch never runs. The
+        // scenario the guard protects is a table that is already on disk.
+        std::fs::write(&table, b"not really parquet, but a file that exists")
+            .expect("seed the table file");
+
+        // 1. The extension alone.
+        let e = refuse_a_provenance_path_that_clobbers_a_table(
+            &dir.join("anything.parquet"),
+            &dir.join("some_other_file.json"),
+        )
+        .expect_err(".parquet must be refused");
+        assert!(e.to_string().contains("ends in .parquet"), "got: {e}");
+
+        // 2. The collision alone -- the branch the CLI cannot reach, because a
+        //    tier sidecar is always a `.parquet`.
+        let e = refuse_a_provenance_path_that_clobbers_a_table(&table, &table)
+            .expect_err("the same path must be refused");
+        assert!(e.to_string().contains("same file as"), "got: {e}");
+
+        // 3. The collision by CANONICALISATION, with a name that spells neither
+        //    path the way the other does. The intermediate directory is CREATED
+        //    on purpose: `canonicalize` is `realpath(3)`, which fails with
+        //    ENOENT through a directory that is not there, and the guard's
+        //    fallback is then a plain string comparison, which calls these two
+        //    spellings different. That fallback is safe rather than merely
+        //    convenient — `std::fs::write` through a non-existent directory
+        //    also fails with ENOENT, so there is nothing there to destroy — but
+        //    it means this case can only exercise the canonicalise branch with
+        //    a real directory, and asserting otherwise would be a fixture that
+        //    silently tests the fallback.
+        let sub = dir.join("tel_prov_guard_sub");
+        std::fs::create_dir_all(&sub).expect("mkdir");
+        let indirect = sub.join("..").join("tel_prov_guard_table.tbl");
+        assert_ne!(
+            indirect.as_os_str(),
+            table.as_os_str(),
+            "the fixture must spell the two paths differently as strings, or \
+             case 3 is just case 2 again"
+        );
+        let e = refuse_a_provenance_path_that_clobbers_a_table(&indirect, &table)
+            .expect_err("a path that canonicalises onto the table must be refused");
+        assert!(e.to_string().contains("same file as"), "got: {e}");
+        let _ = std::fs::remove_dir(&sub);
+
+        // 4. The positive control: a `.json` beside a table is the documented
+        //    use and must still be accepted.
+        refuse_a_provenance_path_that_clobbers_a_table(&legal, &table)
+            .expect("a legal JSON run-header path must be accepted");
+
+        let _ = std::fs::remove_file(&table);
     }
 
     /// A zero denominator must render as `n/a`, never as a percentage.

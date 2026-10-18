@@ -62,14 +62,20 @@ use telescope_core::evidence::test_support::{synth_record, write_synthetic_bam_n
 
 /// Anchor-pool BAM: tx0 and tx1, both with reads that clear the anchor
 /// criteria (MAPQ 60, full-length, `pt:i = 100`).
+///
+/// `AS:i = 100` is load-bearing since R141: the gap is `AS_1 - (AS_2 or 0)`, so
+/// a record with no `AS` tag measures a delta of 0 against the shipped floor of
+/// 12 and is rejected into `rejected_gap`. An empty pool would make this
+/// file's conservation tests vacuous — the subject here is a universe, and a
+/// universe over zero anchored transcripts is a different scenario.
 fn anchor_bam(tag: &str) -> PathBuf {
     write_synthetic_bam_named(
         &format!("{tag}_pool"),
         &["tx0", "tx1"],
         vec![
-            synth_record("a0", 0, None, 0, 60),
-            synth_record("a1", 0, None, 0, 60),
-            synth_record("b0", 1, None, 0, 60),
+            synth_record("a0", 0, Some(100), 0, 60),
+            synth_record("a1", 0, Some(100), 0, 60),
+            synth_record("b0", 1, Some(100), 0, 60),
         ],
     )
 }

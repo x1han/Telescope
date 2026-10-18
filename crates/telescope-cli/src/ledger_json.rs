@@ -63,8 +63,8 @@ level, assigned by build_anchor_pool and NOT summed over samples";
 /// buckets gets a number that is neither a population nor an imbalance.
 const READ_SCOPE: &str = "READS, not records; NOT part of `deficit`, which is a \
 RECORDS identity. Every read contributes at most one anchor, so \
-reads_seen == anchors_emitted + rejected_tie + rejected_gap + \
-rejected_same_gene + rejected_cross_gene + \
+reads_seen == anchors_emitted + rejected_tie + rejected_usurpation + \
+rejected_gap + rejected_same_gene + rejected_cross_gene + \
 reads_no_eligible_candidate + reads_over_cap. \
 `gene_veto_disabled` is DELIBERATELY ABSENT from that identity: it counts reads \
 that CLEARED the gap with the gene relation unavailable (no map supplied) and \
@@ -72,7 +72,9 @@ were therefore EMITTED, so counting it as a destination would double-count them 
 against `anchors_emitted`. `rejected_same_gene` and `rejected_cross_gene` are \
 the same-gene / cross-gene classifications of a read the GAP rejected; there is \
 no unconditional same-gene veto, so no read is refused merely for competing with \
-a sibling isoform.";
+a sibling isoform. `rejected_usurpation` is a read whose best RAW alignment \
+(measured BEFORE the physical filters) failed one of them, so only a LOWER-AS \
+homolog survived; the read is refused rather than attributed to that homolog.";
 
 /// Render the `record_level` half: the evidence-stage ledger.
 ///
@@ -157,7 +159,8 @@ pub fn render_anchor(s: &AnchorStats) -> String {
          \"gene_veto_disabled\": {},\n\
          \"same_gene_unknown\": {},\n\
          \"reads_no_eligible_candidate\": {},\n\
-         \"reads_over_cap\": {}\n\
+         \"reads_over_cap\": {},\n\
+         \"rejected_usurpation\": {}\n\
          }}\n\
          }}\n\
          }}\n",
@@ -190,6 +193,7 @@ pub fn render_anchor(s: &AnchorStats) -> String {
         s.same_gene_unknown,
         s.reads_no_eligible_candidate,
         s.reads_over_cap,
+        s.rejected_usurpation,
     )
 }
 
@@ -293,6 +297,13 @@ mod tests {
     /// the same defect `three_defect_bam`'s doc comment in the integration test
     /// records having already been caught once. Distinct values are the only
     /// thing that makes a per-bucket sum able to fail.
+    ///
+    /// `rejected_usurpation` carries **2** for exactly that reason. It is a READ
+    /// counter, so it does not enter `bucket_sum` — but a zero here would make
+    /// the read-identity term `+ int_field(&json, "rejected_usurpation")`
+    /// arithmetically inert, and dropping the term from the identity would then
+    /// leave the identity unchanged and green. 26+10+2+4+3 = 45 is only closed
+    /// when the new term is both serialized AND in the sum.
     fn balanced_stats() -> AnchorStats {
         AnchorStats {
             samples: 3,
@@ -312,11 +323,13 @@ mod tests {
             filtered_eligible_not_anchor: 7,
             passed: 26,
             // A closed read block, so the fixture is internally coherent in
-            // BOTH denominations: 43 reads, 26 anchors, 10 rejected ties, 4
-            // with no eligible candidate, 3 over the per-transcript cap.
-            reads_seen: 43,
+            // BOTH denominations: 45 reads, 26 anchors, 10 rejected ties, 2
+            // runner-up usurpations, 4 with no eligible candidate, 3 over the
+            // per-transcript cap.
+            reads_seen: 45,
             anchors_emitted: 26,
             rejected_tie: 10,
+            rejected_usurpation: 2,
             rejected_gap: 0,
             rejected_same_gene: 0,
             rejected_cross_gene: 0,
@@ -475,9 +488,10 @@ mod tests {
         );
 
         for (k, want) in [
-            ("reads_seen", 43),
+            ("reads_seen", 45),
             ("anchors_emitted", 26),
             ("rejected_tie", 10),
+            ("rejected_usurpation", 2),
             ("reads_no_eligible_candidate", 4),
             ("reads_over_cap", 3),
         ] {
@@ -500,14 +514,16 @@ mod tests {
         }
 
         // The reads block's own identity, recomputed from the ARTIFACT rather
-        // than from the struct. `reads_over_cap` is a NEW term here, so this is
-        // the assertion that would catch its omission from either the JSON or
-        // `READ_SCOPE`: without it the sum is 40 against a reads_seen of 43 and
-        // the read ledger is short by exactly the three capped reads.
+        // than from the struct. `reads_over_cap` and `rejected_usurpation` are
+        // the two terms that were added to it, so this is the assertion that
+        // would catch either being omitted from the JSON or from `READ_SCOPE`:
+        // without `reads_over_cap` the sum is 42 against a reads_seen of 45, and
+        // without `rejected_usurpation` it is 43 — both short, both visible.
         assert_eq!(
             int_field(&json, "reads_seen"),
             int_field(&json, "anchors_emitted")
                 + int_field(&json, "rejected_tie")
+                + int_field(&json, "rejected_usurpation")
                 + int_field(&json, "rejected_gap")
                 + int_field(&json, "rejected_same_gene")
                 + int_field(&json, "rejected_cross_gene")
@@ -516,13 +532,13 @@ mod tests {
             "the READS identity does not close on the rendered artifact:\n{json}"
         );
         assert!(
-            READ_SCOPE.contains("reads_over_cap"),
+            READ_SCOPE.contains("reads_over_cap") && READ_SCOPE.contains("rejected_usurpation"),
             "READ_SCOPE quotes the identity, so a new term has to appear in the \
              artifact's own scope string too: {READ_SCOPE}"
         );
 
         // The whole read block, added to the records identity, must break it.
-        // 43 reads added to a 110-record ledger is not a rounding error.
+        // 45 reads added to a 110-record ledger is not a rounding error.
         assert_eq!(
             bucket_sum(&json) + int_field(&json, "passed"),
             110,
@@ -530,7 +546,7 @@ mod tests {
         );
         assert_eq!(
             bucket_sum(&json) + int_field(&json, "passed") + int_field(&json, "reads_seen"),
-            153,
+            155,
             "sanity: this is the arithmetic that would be reported if a \
              consumer mixed the two denominations"
         );

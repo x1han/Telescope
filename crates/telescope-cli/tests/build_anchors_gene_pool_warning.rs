@@ -18,16 +18,25 @@ use std::process::Command;
 use telescope_core::evidence::test_support::{synth_record, write_synthetic_bam};
 
 /// A three-transcript synthetic BAM (tx0/tx1/tx2) whose reads all clear the
-/// anchor criteria: MAPQ 60, full-length so 3'-anchored with coverage 1.0, and
-/// `pt:i = 100`.
+/// anchor criteria: MAPQ 60, full-length so 3'-anchored with coverage 1.0,
+/// `pt:i = 100`, and `AS:i = 100`.
+///
+/// ⚠ THE `AS:i = 100` IS LOAD-BEARING SINCE R141, and its absence is the reason
+/// this fixture has to carry it explicitly. The gap is measured on C_raw as
+/// `AS_1 - (AS_2 or 0)`, so a record with NO `AS` tag scores 0 and its lone
+/// candidate measures a delta of 0 — below the shipped `--gap-abs` of 12, and
+/// therefore rejected into `rejected_gap`. These fixtures were written with
+/// `None` and used to pass; under the new rule they build an EMPTY pool, and
+/// this file's `passed=4` assertion reports it as "the fixture lost its
+/// records" rather than as what it is.
 fn three_tx_bam(tag: &str) -> PathBuf {
     write_synthetic_bam(
         tag,
         vec![
-            synth_record("a0", 0, None, 0, 60),
-            synth_record("a1", 0, None, 0, 60),
-            synth_record("b0", 1, None, 0, 60),
-            synth_record("c0", 2, None, 0, 60),
+            synth_record("a0", 0, Some(100), 0, 60),
+            synth_record("a1", 0, Some(100), 0, 60),
+            synth_record("b0", 1, Some(100), 0, 60),
+            synth_record("c0", 2, Some(100), 0, 60),
         ],
     )
 }
