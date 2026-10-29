@@ -1,4 +1,4 @@
-<h1 align="center"><span style="font-size:2.2em;font-weight:700">Telescope</span> <span style="font-size:1.05em;font-weight:700">(TELESCOPE)</span></h1>
+<h1 align="center"><strong>Telescope</strong> <small>(TELESCOPE)</small></h1>
 
 <p align="center"><strong>Transcript-level Expression and tail-Length Estimation via Single-molecule deConvOlution with Poly(A) Evidence</strong></p>
 
