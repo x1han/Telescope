@@ -1,46 +1,16 @@
-//! Module 0: Transcript Evidence Resolver
+//! Transcript evidence resolver.
 //!
-//! Resolves cohort-level evidence per transcript (Tier A/B/C classification,
-//! subsumption detection, EM/PAL eligibility) per spec v0.2.1 F1.3 and F5.3.
+//! Resolves cohort-level evidence per transcript: Tier A/B/C classification,
+//! subsumption detection, and EM/PAL eligibility.
 //!
-//! Inputs:
-//! - `FlatEvidenceGraph` produced by Module 2 (`evidence::extract_evidence`).
-//! - `tx_to_gene` map (TSV with header `transcript_id\tgene_id`).
-//! - `cohort_size` (number of BAMs pooled). Required parameter (P0 correction).
-//! - `tes_cluster_radius` (default 50 bp per F6.4).
+//! Input: the `FlatEvidenceGraph` from `evidence::extract_evidence`, plus a
+//! `tx_to_gene` map (TSV with header `transcript_id\tgene_id`).
+//! Output: `telescope.transcript_evidence.parquet` (10 columns).
 //!
-//! Outputs:
-//! - `telescope.transcript_evidence.parquet` with the 10-column F5.3 schema.
-//!
-//! ## P0 corrections baked into this implementation
-//! 1. Output field is `pal_candidate` (structural pre-filter), not
-//!    `pal_eligible`. The latter is decided post-EM in `summary.rs`.
-//! 2. `cohort_size` is an explicit required parameter, not inferred.
-//! 3. Per-transcript molecule membership is stored as sorted `Vec<u32>`
-//!    (binary search), NOT `HashSet<usize>` — avoids ~640 MB overhead on
-//!    200K-transcript catalogues.
-//! 4. Transcripts with no `tx_to_gene` mapping are tagged
-//!    `"missing_gene_id"` and emit a single deduplicated `eprintln!`
-//!    warning per transcript.
-//! 5. Output schema is 10 columns per F5.3 (the table; spec narrative
-//!    said "12" but the locked table has 10).
-//! 6. TES-cluster gating: enforced via the proxy heuristic
-//!    `is_alter_tes_marker(tx_id)` — transcripts containing `AlterTes`
-//!    or `_Alter` substrings are excluded from the subsumption scan
-//!    (F6.4 AlterTES protection). Fine-grained TES coordinate
-//!    clustering from reference annotation is deferred (D-zone).
-//!
-//! ## Complexity
-//! - Inverse-index build: O(N_reads × avg candidates).
-//! - Per-(gene) subsumption scan: O(|TierB_gene| × |TierA_gene| ×
-//!   avg |molecules(T_B)| × log avg |molecules(T_A)|). With the sorted
-//!   `Vec<u32>` + binary-search representation this avoids the
-//!   ~640 MB HashSet overhead that F6.5 forbids. It is NOT strictly
-//!   O(K) in the absolute sense (worst case is superlinear in Tier A ×
-//!   Tier B per gene) but is tractable for typical inputs (~10 tx/gene,
-//!   ~100 reads/tx → ~70K ops/gene → seconds for a 20K-gene catalogue).
-//!   True per-transcript 3' end clustering (F6.4 condition #2) would
-//!   further prune the per-gene Tier A × Tier B product; deferred to v0.2.2.
+//! `cohort_size` (number of BAMs pooled) is an explicit required parameter.
+//! `tes_cluster_radius` (default 50 bp) is recorded metadata only: the
+//! subsumption scan clusters by `gene_id`, because transcript-level 3' end
+//! coordinates are not read from reference annotations.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -56,26 +26,23 @@ use parquet::file::properties::WriterProperties;
 
 use crate::evidence::FlatEvidenceGraph;
 
-/// Magic gene_id string written when `tx_to_gene` has no entry (F5.3 + P0 #4).
+/// `gene_id` written when `tx_to_gene` has no entry for the transcript.
 pub const MISSING_GENE_ID: &str = "missing_gene_id";
 
-/// Structural pre-filter for `pal_candidate`: compatible reads must be at least
-/// this value at the Module 0 stage. The *final* `pal_eligible` decision is
-/// `weight_sum >= 10` post-EM in `summary.rs` (F5.4).
+/// Minimum compatible reads for a transcript to be a `pal_candidate`.
+/// The final `pal_eligible` decision is made post-EM in `summary.rs`.
 pub const PAL_CANDIDATE_MIN_READS: u32 = 10;
 
-/// Default TES cluster radius (bp) per F6.4.
+/// Default TES cluster radius in base pairs.
 pub const DEFAULT_TES_CLUSTER_RADIUS: usize = 50;
 
-/// Resolver configuration (P0 #2: cohort_size is required, explicit).
+/// Resolver configuration.
 #[derive(Debug, Clone)]
 pub struct ResolverConfig {
     /// Number of BAMs pooled into the cohort. Must be ≥ 1.
     pub cohort_size: usize,
-    /// Excluded from subsumption scan iff transcript IDs contain the
-    /// `AlterTes` / `_Alter` substring. The bp radius itself is
-    /// structural metadata for logging; transcript-level 3' end coordinates
-    /// are not yet read from reference annotations (D-zone).
+    /// TES cluster radius in base pairs. Recorded metadata only: the
+    /// subsumption scan clusters by `gene_id`, not by TES coordinate.
     pub tes_cluster_radius: usize,
 }
 
@@ -88,7 +55,7 @@ impl Default for ResolverConfig {
     }
 }
 
-/// One row of `telescope.transcript_evidence.parquet` (10 cols per F5.3).
+/// One row of `telescope.transcript_evidence.parquet`.
 #[derive(Debug, Clone)]
 pub struct TranscriptEvidence {
     pub transcript_id: String,
@@ -105,12 +72,9 @@ pub struct TranscriptEvidence {
 
 /// Build per-transcript sorted `Vec<u32>` of molecule indices.
 ///
-/// For every molecule `m` in the graph, append `m`'s index into the
-/// `Vec<u32>` of every transcript that is a candidate for `m`.
-///
-/// Post-condition: for any `(mol_idx, tx_idx)`, `tx_idx ∈ candidates[m]`
-/// iff `mol_idx ∈ inv[tx_idx]`. This inverse index is what makes the
-/// "sorted Vec<u32> + binary search" subsumption check tractable (P0 #3).
+/// Post-condition: `tx_idx ∈ candidates[m]` iff `mol_idx ∈ inv[tx_idx]`.
+/// Membership is stored as a sorted `Vec<u32>`, not a `HashSet`, so that a
+/// 200K-transcript catalogue does not pay ~640 MB of hash-table overhead.
 fn build_molecule_inverse_index(graph: &FlatEvidenceGraph) -> Vec<Vec<u32>> {
     let num_tx = graph.transcript_names.len();
     let mut inv: Vec<Vec<u32>> = vec![Vec::new(); num_tx];
@@ -123,8 +87,8 @@ fn build_molecule_inverse_index(graph: &FlatEvidenceGraph) -> Vec<Vec<u32>> {
     }
     for v in &mut inv {
         // Sort + dedup: a mol appearing in a tx's candidate set more than
-        // once would be a graph bug (Module 2 already dedups within a
-        // molecule), but defensive dedup costs O(N) per tx.
+        // once would be a graph bug (`evidence::extract_evidence` already
+        // dedups within a molecule), but defensive dedup costs O(N) per tx.
         v.sort_unstable();
         v.dedup();
     }
@@ -133,22 +97,18 @@ fn build_molecule_inverse_index(graph: &FlatEvidenceGraph) -> Vec<Vec<u32>> {
 
 /// Resolve cohort-level evidence for every transcript in the graph.
 ///
-/// `missing_gene_warn_set` deduplicates the per-transcript warning: one
-/// `eprintln!` per transcript with no `tx_to_gene` mapping. The caller
-/// should pass a long-lived set so warnings don't repeat across multiple
-/// invocations (e.g., for tests).
+/// `missing_gene_warn_set` deduplicates the per-transcript "no gene_id"
+/// warning; pass a long-lived set so warnings do not repeat across calls.
 pub fn resolve_transcript_evidence(
     graph: &FlatEvidenceGraph,
     tx_to_gene: &HashMap<String, String>,
     config: &ResolverConfig,
     missing_gene_warn_set: &mut HashSet<String>,
 ) -> Vec<TranscriptEvidence> {
-    // P1 reviewer finding: enforce basic cohort_size sanity at the resolver
-    // level (not just CLI). Library embedders that bypass the CLI would
-    // otherwise silently use cohort_size=0, defeating the F6.2 cohort-scope
-    // guard. The CLI additionally enforces cohort_size == len(bams);
-    // that cross-check cannot be performed here since the graph does not
-    // carry the BAM list.
+    // Enforce cohort_size sanity here, not only in the CLI: a library embedder
+    // that bypasses the CLI would otherwise silently use cohort_size=0. The
+    // CLI additionally checks cohort_size == len(bams), which is impossible
+    // here because the graph does not carry the BAM list.
     assert!(
         config.cohort_size >= 1,
         "ResolverConfig::cohort_size must be >= 1, got {}",
@@ -158,7 +118,7 @@ pub fn resolve_transcript_evidence(
     let num_tx = graph.transcript_names.len();
     let inv = build_molecule_inverse_index(graph);
 
-    // 1. Per-transcript statistics + Tier classification (F6.2).
+    // 1. Per-transcript statistics + tier classification.
     let mut records: Vec<TranscriptEvidence> = Vec::with_capacity(num_tx);
     for (tx_idx, tx_id_ref) in graph.transcript_names.iter().enumerate() {
         let tx_id = tx_id_ref.as_str();
@@ -204,18 +164,18 @@ pub fn resolve_transcript_evidence(
         });
     }
 
-    // 2. Subsumption scan within each gene (F6.4-F6.5).
+    // 2. Subsumption scan within each gene.
     apply_subsumption_scan(&mut records, &inv);
 
-    // 3. Finalize em_eligible / pal_candidate per F6.3.
+    // 3. Finalize em_eligible / pal_candidate.
     for r in &mut records {
         r.em_eligible = (r.tier == "TierA") || (r.tier == "TierB" && !r.is_subsumed);
         r.pal_candidate = r.em_eligible && (r.compatible_reads >= PAL_CANDIDATE_MIN_READS);
     }
 
     // Informational only: cohort_size must be ≥ 1; if user passes 0 they
-    // are explicitly bypassing the cohort-scope guard (F6.2). Record the
-    // fact in stderr rather than fail.
+    // are explicitly bypassing the cohort-scope guard. Record the fact in
+    // stderr rather than fail.
     if config.cohort_size == 0 {
         eprintln!(
             "[telescope][WARN] ResolverConfig.cohort_size == 0; F6.2 cohort scope guard bypassed"
@@ -225,7 +185,8 @@ pub fn resolve_transcript_evidence(
     records
 }
 
-/// F6.2 Tier classification: high → TierA; ambiguous → TierB; none → TierC.
+/// Tier classification: TierA if the transcript has a unique read, TierB if
+/// it has only compatible reads, else TierC.
 fn classify_tier(unique: u32, compatible: u32) -> String {
     if unique >= 1 {
         "TierA".to_string()
@@ -236,20 +197,17 @@ fn classify_tier(unique: u32, compatible: u32) -> String {
     }
 }
 
-/// Proxy heuristic for F6.4 AlterTES protection: transcripts whose ID
-/// contains `AlterTes` or `_Alter` represent alternative TES isoforms
-/// and must not be the subject or the target of a subsumption check.
+/// AlterTES protection: transcripts whose ID contains `AlterTes` or `_Alter`
+/// represent alternative TES isoforms and are excluded from the subsumption
+/// scan, as subject and as target.
 fn is_alter_tes_marker(tx_id: &str) -> bool {
     tx_id.contains("AlterTes") || tx_id.contains("_Alter")
 }
 
-/// Apply F6.4 subsumption scan within (gene_id) groups.
+/// Apply the subsumption scan within each `gene_id` group.
 ///
-/// For v0.2.1: cluster by `gene_id` only. Transcript-level 3' end
-/// coordinates (for fine-grained TES-radius clustering) would require
-/// reading transcript annotation tables; documented as a v-next
-/// improvement. The string proxy above enforces the AlterTES protection
-/// guarantee that the spec requires.
+/// Clustering is by `gene_id` only; transcript-level 3' end coordinates are
+/// not read, so the TES radius cannot be applied.
 fn apply_subsumption_scan(records: &mut [TranscriptEvidence], inv: &[Vec<u32>]) {
     // Group records by gene_id (records is parallel to `inv` by index).
     let mut by_gene: HashMap<String, Vec<usize>> = HashMap::new();
@@ -306,11 +264,8 @@ fn apply_subsumption_scan(records: &mut [TranscriptEvidence], inv: &[Vec<u32>]) 
 
 /// Compute `(|a ∩ b|, |a ⊇ b|)` for two sorted `u32` slices.
 ///
-/// - `a` = candidate molecules of the Tier A target (assumed superset candidate).
-/// - `b` = candidate molecules of the Tier B subject.
-///
 /// `all_in` is true iff every element of `b` is also in `a` (i.e. `b ⊆ a`),
-/// which is the F6.4 "fully subsumed" condition.
+/// which is the "fully subsumed" condition.
 fn subset_score(a: &[u32], b: &[u32]) -> (usize, bool) {
     let mut overlap = 0usize;
     let mut all_in = true;
@@ -324,7 +279,7 @@ fn subset_score(a: &[u32], b: &[u32]) -> (usize, bool) {
     (overlap, all_in)
 }
 
-/// Write `telescope.transcript_evidence.parquet` (10-column F5.3 schema).
+/// Write `telescope.transcript_evidence.parquet` (10-column schema).
 pub fn write_transcript_evidence_parquet<P: AsRef<Path>>(
     records: &[TranscriptEvidence],
     path: P,
@@ -399,10 +354,8 @@ pub fn write_transcript_evidence_parquet<P: AsRef<Path>>(
 
 /// Pool molecules across multiple BAMs into a single graph.
 ///
-/// All BAMs must share the same reference catalog (`@SQ` lines). Read IDs
-/// are namespaced by sample to avoid collisions across BAMs from distinct
-/// samples (Module 2 already dedups within one molecule's primary +
-/// supplementary alignments; this guards against the cross-BAM case).
+/// All BAMs must share the same reference catalog (`@SQ` lines). Read IDs are
+/// namespaced by sample so they cannot collide across samples.
 pub fn pool_evidence_graphs<P, S>(
     bam_paths: &[(P, S)],
     tes_slack: usize,
@@ -421,9 +374,9 @@ where
         candidate_mapq: Vec::new(),
         candidate_5p_gap: Vec::new(),
         transcript_names: Vec::new(),
-        // Pools graphs that came from `extract_evidence`, i.e. real
-        // measurements, never a `PolyASource::None` placeholder. The flag is
-        // re-derived below from the graphs being pooled rather than assumed.
+        // Pools graphs built by `extract_evidence`, i.e. real measurements,
+        // never a `PolyASource::None` placeholder; the flag is re-derived
+        // below from the graphs being pooled rather than assumed.
         poly_a_is_placeholder: false,
         stats: crate::evidence::FilterCounts::default(),
     };
@@ -432,16 +385,13 @@ where
     for (bam_path, sample_id) in bam_paths {
         let g = extract_evidence(bam_path.as_ref(), tes_slack)
             .with_context(|| format!("extract_evidence failed for {:?}", bam_path.as_ref()))?;
-        // Propagate the provenance flag rather than leaving the `false` above as
-        // a claim: `pooled` is only a placeholder graph if EVERY input was one.
+        // `pooled` is a placeholder graph only if EVERY input was one.
         pooled.poly_a_is_placeholder &= g.poly_a_is_placeholder;
         // The filter ledger is ADDITIVE across pooled BAMs: each input's counts
         // describe records from that BAM only, and the pooled graph's records
-        // are the disjoint union of them. Copying one input's ledger here
-        // instead of summing would make `records_entered` describe one sample
-        // while the pools describe ten -- the same numerator-over-denominator
-        // shape the workspace rule singles out. `FilterCounts` is `Copy` and
-        // every field is a plain `u64`, so this is a field-wise sum.
+        // are the disjoint union of them. Copying one input's ledger instead
+        // of summing would make `records_entered` describe one sample while
+        // the pools describe several.
         pooled.stats.records_entered += g.stats.records_entered;
         pooled.stats.dropped_unmapped += g.stats.dropped_unmapped;
         pooled.stats.dropped_supplementary += g.stats.dropped_supplementary;
@@ -474,34 +424,14 @@ where
         pooled.candidate_nm.extend(g.candidate_nm);
         pooled.candidate_mapq.extend(g.candidate_mapq);
         pooled.candidate_5p_gap.extend(g.candidate_5p_gap);
-        // Lockstep invariant across pooled BAMs: the alignment-evidence pools
-        // stay index-aligned with `candidate_pool`.
-        //
-        // THIS IS THE HIGHEST-SEVERITY SILENT-FAILURE SITE IN THE 5' CHANGE.
-        // Every `extend` above MUST be present: omitting one leaves that pool
-        // short while `candidate_pool` grows, and `candidate_5p_gap[o + c]` is
-        // then read from the WRONG BAM's coordinate frame — a wrong 5' gap, not
-        // a crash. `cargo test` stayed green for exactly this reason: the guard
-        // was a `debug_assert_eq!` on LENGTHS, which is compiled out of a
-        // release build, so a shipped binary had no check at all.
-        //
-        // PROMOTED from `debug_assert_eq!` to `assert_eq!` by ruling 2026-10-08.
-        // The trade is explicit, not incidental: a misaligned pool now aborts
-        // the process instead of silently emitting 5' gaps from the wrong
-        // coordinate frame. Fail-fast is the right call in scientific software,
-        // where a wrong number is worse than a missing one -- but it does mean
-        // a defect of this class is now a crash rather than a bad result, and
-        // that is a deliberate change in the failure mode.
-        //
-        // Safety was traced before promoting, not assumed: the five pools are
-        // grown by five ADJACENT, UNCONDITIONAL `extend`s inside one loop
-        // iteration, and within a single BAM all five were pushed by one
-        // `for c in &entry.candidates` loop body in `extract_evidence_with`, so
-        // they are equal by construction on every path that reaches here. The
-        // paths that exit earlier (0 BAMs -> the loop body never runs; `?` and
-        // `bail!` -> `Err` returned) never reach the assert. The assert can only
-        // fire if one of the five `extend`s is deleted or made conditional,
-        // which is the defect class it exists to catch.
+        // LOCKSTEP INVARIANT: the alignment-evidence pools stay index-aligned
+        // with `candidate_pool`. Every `extend` above MUST be present —
+        // omitting one leaves that pool short while `candidate_pool` grows, and
+        // `candidate_5p_gap[o + c]` is then read from the WRONG BAM's
+        // coordinate frame: a wrong 5' gap, not a crash. The `assert_eq!`s
+        // below are unconditional (not `debug_assert`), so they also run in a
+        // release build; the trade is that this defect class now aborts the
+        // process instead of silently emitting wrong 5' gaps.
         assert_eq!(pooled.candidate_pool.len(), pooled.candidate_as.len());
         assert_eq!(pooled.candidate_pool.len(), pooled.candidate_nm.len());
         assert_eq!(pooled.candidate_pool.len(), pooled.candidate_mapq.len());
@@ -528,18 +458,12 @@ mod tests {
     /// Guards the cohort pooling path against a MISSING `extend`.
     ///
     /// `pool_evidence_graphs` concatenates five lockstep pools across BAMs. A
-    /// forgotten `extend` for any one of them leaves that pool short while
-    /// `candidate_pool` grows, and every index `o + c` then reads the WRONG
-    /// BAM's coordinate frame — a silently wrong 5' gap, not a crash. The
-    /// in-function `assert_eq!` is the other guard (promoted from
-    /// `debug_assert_eq!` on 2026-10-08, so it now also runs in release);
-    /// before this test existed, deleting
-    /// `pooled.candidate_5p_gap.extend(..)` left the ENTIRE suite green,
-    /// because nothing called `pool_evidence_graphs` at all.
+    /// forgotten `extend` leaves that pool short while `candidate_pool` grows,
+    /// and every index `o + c` then reads the WRONG BAM's coordinate frame — a
+    /// silently wrong 5' gap, not a crash.
     ///
     /// Two BAMs with DISTINCT gaps are used so the assertion is about the
-    /// pooled FRAME, not just the length: if the second BAM's gap overwrote or
-    /// dropped the first's, the values below would not match.
+    /// pooled FRAME, not just the length.
     ///
     /// Mutation target: removing any one of the five `extend` calls in
     /// `pool_evidence_graphs` turns this red.
@@ -575,10 +499,8 @@ mod tests {
             .sum();
         assert_eq!(total, pooled.candidate_pool.len());
 
-        // Every pool must be exactly as long as `candidate_pool`. This is the
-        // test-level duplicate of the in-function check, which is itself now
-        // unconditional; the test states the invariant for the two-BAM case
-        // where the frame, not just the length, is what can go wrong.
+        // Every pool must be exactly as long as `candidate_pool`: the test-level
+        // duplicate of the unconditional in-function check.
         assert_eq!(pooled.candidate_as.len(), pooled.candidate_pool.len());
         assert_eq!(pooled.candidate_nm.len(), pooled.candidate_pool.len());
         assert_eq!(pooled.candidate_mapq.len(), pooled.candidate_pool.len());
@@ -623,8 +545,7 @@ mod tests {
         // tx_a: unique=1, compat=2 → TierA, em_eligible
         // tx_b: unique=0, compat=2 → TierB, em_eligible (NOT subsumed)
         // tx_c: unique=0, compat=1 → TierB, em_eligible
-        //
-        // Plus a tx_d that never appears in any molecule → TierC.
+        // tx_d never appears in any molecule → TierC.
         let graph = FlatEvidenceGraph {
             molecules: vec![
                 mk_mol("r0", 0, 1, 6.0),
@@ -780,9 +701,7 @@ mod tests {
         assert_eq!(warn2.len(), 1, "warning set is deduplicated across calls");
     }
 
-    /// Compile-time + runtime assertion that the Module 0 output field is
-    /// named `pal_candidate` (NOT `pal_eligible`).
-    /// See F5.3 critical naming note + P0 #1.
+    /// Assert the output field is named `pal_candidate` (NOT `pal_eligible`).
     #[test]
     fn test_pal_candidate_field_naming() {
         // Construct a record via the field set explicitly.
@@ -798,8 +717,8 @@ mod tests {
             em_eligible: true,
             pal_candidate: true,
         };
-        // The test name itself is documentation; the assertion is the
-        // existence of `pal_candidate: bool` in the struct literal above.
+        // The assertion is the existence of `pal_candidate: bool` in the struct
+        // literal above.
         assert!(r.pal_candidate);
         assert!(r.em_eligible);
         // Verify the boolean value comes through struct-copy semantics.

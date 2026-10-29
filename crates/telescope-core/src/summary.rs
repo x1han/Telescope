@@ -1,23 +1,18 @@
-//! Module: Profile Summary Engine (`summary.rs`)
+//! Profile summary engine.
 //!
-//! Streams `telescope.profile.parquet`, performs memory-efficient aggregation,
-//! computes Kish's effective sample size $n_{\text{eff}}$ and posterior-weighted
-//! moments per (sample × gene × transcript).
+//! Streams `telescope.profile.parquet` and writes
+//! `telescope.sample_summary.parquet`: Kish effective sample size and
+//! posterior-weighted moments per (sample × gene × transcript).
 //!
-//! Architecture (spec v0.2.0 F5):
-//! - Output: `telescope.sample_summary.parquet`.
-//! - Memory profile: **O(K_txs)**, not O(N_reads). Sufficient statistics only;
-//!   individual read points are NOT stored.
-//! - Quantile columns (q05, q25, q50, q75, q95) are deliberately NOT in the
-//!   locked schema; they move to a separate `distribution_summary.parquet`
-//!   gated by `--with-quantiles` (D7, not yet implemented).
+//! Memory profile is O(K_txs), not O(N_reads): only sufficient statistics are
+//! kept, individual read points are never stored, and the moments are computed
+//! analytically from them.
 //!
 //! Math:
 //! - Kish $n_{\text{eff}} = (\sum w)^2 / \sum w^2$
 //! - Weighted mean: $\bar{y}_w = \sum w \log_2 L / \sum w$
-//! - Posterior-weighted variance (reliability weights):
+//! - Posterior-weighted variance:
 //!   $\sigma^2_w = \frac{\sum w (y - \bar{y}_w)^2}{\sum w - \sum w^2 / \sum w}$
-//!   computed analytically from sufficient statistics; no point iteration.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -34,8 +29,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
-/// One row of the per-transcript provenance sidecar written by
-/// `build-emission`. See `emission_model::provenance_schema`.
+/// One row of the per-transcript provenance sidecar written by `build-emission`.
 struct ProvenanceRow {
     gene_id: String,
     tier: &'static str,
@@ -44,11 +38,9 @@ struct ProvenanceRow {
 
 /// Read the provenance sidecar into `transcript_id -> ProvenanceRow`.
 ///
-/// The sidecar is the AUTHORITY on which transcripts exist. `telescope quant`
-/// can only ever emit a profile row for a transcript the emission model
-/// evaluated, so the profile is a strict subset of the universe, and a
-/// transcript with zero weight is invisible in the profile. This is what makes
-/// an inner join silently lose 1,334 HC2 rows.
+/// The sidecar is the AUTHORITY on which transcripts exist: the profile is a
+/// strict subset of the universe, and a transcript with zero weight is
+/// invisible in the profile.
 fn load_provenance<P: AsRef<Path>>(path: P) -> Result<Vec<(String, ProvenanceRow)>> {
     let file = File::open(&path)
         .with_context(|| format!("Failed to open provenance parquet: {:?}", path.as_ref()))?;
@@ -86,23 +78,20 @@ fn load_provenance<P: AsRef<Path>>(path: P) -> Result<Vec<(String, ProvenanceRow
             .downcast_ref::<UInt32Array>()
             .context("provenance 'n_anchor' is not a UInt32Array")?;
         for i in 0..batch.num_rows() {
-            // `tier` is an enum in the writer; an unknown value here means the
+            // `tier` is an enum in the writer; an unknown value means the
             // sidecar came from a different version, and defaulting it to
-            // something plausible is exactly the silent-wrong-answer this
+            // something plausible is exactly the silent wrong answer this
             // table exists to prevent.
             let t = match tier.value(i) {
                 "L1" => "L1",
                 "L2" => "L2",
                 "L3_anchored" => "L3_anchored",
                 "L3_imputed" => "L3_imputed",
-                // R141: the third status in the tier table. `L3_imputed` and
-                // `L3_unexpressed` are BOTH written by `build-emission` into
-                // `<stem>.provenance.parquet`, and this function fails closed on
-                // any tier it does not know. Without this arm, a shipped
-                // `summarize --provenance <sidecar>` over a shipped artefact
-                // dies with `provenance 'tier' has unknown value
-                // "L3_unexpressed"` — a version-mismatch message for a value
-                // this repository itself writes.
+                // `L3_imputed` and `L3_unexpressed` are BOTH written by
+                // `build-emission`, and this function fails closed on any tier
+                // it does not know. Without this arm, summarizing a shipped
+                // artefact dies with an unknown-value error for a value this
+                // repository itself writes.
                 "L3_unexpressed" => "L3_unexpressed",
                 other => bail!("provenance 'tier' has unknown value {:?}", other),
             };
@@ -119,7 +108,7 @@ fn load_provenance<P: AsRef<Path>>(path: P) -> Result<Vec<(String, ProvenanceRow
     Ok(out)
 }
 
-/// Per-(sample, gene, transcript) accumulator. Streaming: only 7 f64 scalars.
+/// Per-(sample, gene, transcript) accumulator. Streaming: only 4 f64 scalars.
 #[derive(Debug, Default, Clone)]
 struct TranscriptAccumulator {
     weight_sum: f64,
@@ -143,8 +132,7 @@ impl TranscriptAccumulator {
 
     /// Kish's effective sample size: $n_{\text{eff}} = (\sum w)^2 / \sum w^2$.
     /// Equals $N$ when all weights are equal; approaches 1 when one weight
-    /// dominates. Captures the *statistical* information content of the
-    /// weighted sample, not the raw read count.
+    /// dominates.
     #[inline]
     fn effective_n(&self) -> f64 {
         if self.sum_w2 > 0.0 {
@@ -164,14 +152,10 @@ impl TranscriptAccumulator {
     }
 
     /// Posterior-weighted dispersion (reliability-weight variance).
-    /// Posterior weights $w_{rk}$ are NOT sampling weights — they are
-    /// probabilities of transcript assignment from TEL-EM. So this is a
-    /// *posterior-weighted dispersion estimate*, not an unbiased sample
-    /// variance in the classical frequentist sense.
     ///
-    /// Algebraically closed form (no per-point iteration):
-    /// $\sigma^2_w = (\sum w y^2 - (\sum w y)^2 / \sum w)
-    ///              / (\sum w - \sum w^2 / \sum w)$
+    /// Posterior weights $w_{rk}$ are assignment PROBABILITIES from TEL-EM,
+    /// not sampling weights, so this is a posterior-weighted dispersion
+    /// estimate rather than an unbiased sample variance.
     #[inline]
     fn posterior_weighted_variance(&self) -> f64 {
         let sw = self.weight_sum;
@@ -190,30 +174,17 @@ impl TranscriptAccumulator {
 
 /// Stream `telescope.profile.parquet` and write `telescope.sample_summary.parquet`.
 ///
-/// HashMap key: `(sample_id, gene_id, transcript_id)` — gene_id is part of the
-/// key to prevent silent overwrites when AIDRS emits the same transcript_id
-/// under multiple gene_ids (e.g. novel transcripts at gene boundaries).
+/// Key: `(sample_id, gene_id, transcript_id)` — `gene_id` is part of the key so
+/// a transcript id reused across gene boundaries cannot overwrite another row.
 ///
-/// `provenance_path`, when given, is the per-transcript sidecar written by
-/// `build-emission`. It changes the output in three ways, all of which are
-/// the reason it exists:
+/// With `provenance_path`, the sidecar is the output universe: every transcript
+/// it names gets a row, including the zero-weight ones, and the `tier` /
+/// `n_anchor` columns appear. Without it, only transcripts that received weight
+/// appear, in unspecified order.
 ///
-/// 1. **The key set becomes the reference universe, not the profile.** Every
-///    transcript in the sidecar gets a row. Without it, a transcript that no
-///    read landed on is absent from the output entirely -- an inner join, which
-///    on HC2 silently drops 1,334 of 70,511 transcripts.
-/// 2. **`tier` and `n_anchor` columns appear.** These are not recoverable from
-///    the profile or the frozen 7-column emission parquet.
-/// 3. **Row order becomes deterministic.** See the sort below.
-///
-/// When it is `None` the function behaves exactly as it did before: one row
-/// per (sample, gene, transcript) that received weight, in unspecified order.
-///
-/// A `sample_id` is required for the zero-filled rows and there is no way to
-/// derive one: the sidecar is per-transcript and carries no sample column. It
-/// is taken from the profile, and a profile covering MORE THAN ONE sample is
-/// rejected rather than guessed, because attributing 1,334 zero-weight
-/// transcripts to an arbitrary sample is a silent wrong answer.
+/// A `sample_id` is required for the zero-filled rows and cannot be derived
+/// (the sidecar has no sample column), so a profile covering more than one
+/// sample is rejected rather than attributed to an arbitrary sample.
 pub fn summarize_profile_parquet<P, Q>(
     profile_parquet_path: P,
     output_summary_path: Q,
@@ -236,8 +207,8 @@ where
         .build()
         .context("Failed to build parquet reader")?;
 
-    // Key: (sample_id, gene_id, transcript_id). Triple key avoids silent
-    // gene_id overwrite when transcript_id is reused across gene boundaries.
+    // Triple key avoids a silent gene_id overwrite when a transcript id is
+    // reused across gene boundaries.
     let mut map: HashMap<(String, String, String), TranscriptAccumulator> = HashMap::new();
 
     while let Some(batch_result) = reader.next() {
@@ -290,12 +261,10 @@ where
 
     // Resolve the output key set and fill in the zero-weight rows.
     //
-    // `rows` is a Vec of fully-resolved output rows rather than the HashMap,
-    // for two reasons that are both correctness requirements and not style:
+    // `rows` is a Vec of fully-resolved output rows rather than the HashMap:
     // the universe must be able to contribute rows the HashMap has no entry
     // for, and the output order must not depend on HashMap iteration order
-    // (Rust's default hasher is seeded per process, so `for (k, v) in map`
-    // yields a different order on every run).
+    // (Rust's default hasher is seeded per process).
     let provenance = match provenance_path {
         Some(p) => Some(load_provenance(p)?),
         None => None,
@@ -331,9 +300,8 @@ where
         let sample_id = sample_ids[0].to_string();
 
         // A profile row outside the universe means the two artifacts disagree
-        // about which transcripts exist. That is exactly the class of bug the
-        // provenance chain exists to catch, so it is a hard error rather than
-        // a row with a guessed tier.
+        // about which transcripts exist: a hard error, not a row with a
+        // guessed tier.
         let orphans: Vec<&str> = map
             .keys()
             .map(|(_, _, tx)| tx.as_str())
@@ -358,19 +326,18 @@ where
         }
 
         // Iterate the UNIVERSE, in the sidecar's order, so the output is the
-        // full 70,511-row closure with the profile's aggregates left-joined
-        // onto it. A transcript no read landed on simply has no HashMap entry
-        // and keeps the default accumulator: weight_sum, effective_n and cpm
-        // are all 0.0 by construction, not by special-casing.
+        // full closure with the profile's aggregates left-joined onto it. A
+        // transcript no read landed on has no HashMap entry and keeps the
+        // default accumulator: weight_sum, effective_n and cpm are 0.0 by
+        // construction, not by special-casing.
         for (tx, p) in prov {
             let acc = map
                 .get(&(sample_id.clone(), p.gene_id.clone(), tx.clone()))
                 .or_else(|| {
-                    // The HashMap key is (sample, gene, tx) and a transcript's
-                    // gene_id can, in principle, differ between the profile and
-                    // the sidecar. Falling back to any entry for this
-                    // transcript keeps the aggregate rather than silently
-                    // zeroing a transcript that demonstrably has weight.
+                    // A transcript's gene_id can differ between the profile and
+                    // the sidecar. Falling back to any entry for this transcript
+                    // keeps the aggregate rather than silently zeroing a
+                    // transcript that demonstrably has weight.
                     map.iter()
                         .find(|((s, _, t), _)| s == &sample_id && t == tx)
                         .map(|(_, a)| a)
@@ -396,8 +363,8 @@ where
     }
 
     // DETERMINISTIC ORDER. Not cosmetic: a byte-comparison between two runs on
-    // the same input is only meaningful if the row order is fixed, and
-    // HashMap iteration order is not fixed across processes.
+    // the same input is only meaningful if the row order is fixed, and HashMap
+    // iteration order is not fixed across processes.
     rows.sort_by(|a, b| {
         a.0.cmp(&b.0)
             .then_with(|| a.2.cmp(&b.2))
@@ -410,14 +377,11 @@ where
     //
     // cpm = 1e6 * weight_sum / SUM(weight_sum over the sample)
     //
-    // There is NO transcript-length normalisation anywhere in this path, and
-    // that is correct rather than an oversight. Direct RNA sequencing samples
-    // native molecules one read per molecule; it does not shear transcripts
-    // into length-biased fragments, so the fragment-count-per-length term that
-    // defines RNA-seq TPM has no physical referent here. The column was
-    // named `tpm` until 2026-10-12 and was mislabelled: arithmetically it has
-    // always been CPM. Renamed rather than aliased so the unit in the schema
-    // matches the quantity in the formula.
+    // There is NO transcript-length normalisation here, and that is correct:
+    // direct RNA sequencing samples native molecules one read per molecule and
+    // does not shear transcripts into length-biased fragments, so the
+    // fragment-count-per-length term that defines RNA-seq TPM has no physical
+    // referent.
     let total_weight: f64 = rows.iter().map(|r| r.3.weight_sum).sum();
     let cpm_scale = if total_weight > 0.0 {
         1.0e6 / total_weight
@@ -464,10 +428,6 @@ where
         Field::new("sum_w_logPAL2", DataType::Float64, false),
         Field::new("weighted_mean_logPAL", DataType::Float64, false),
         Field::new("posterior_weighted_variance", DataType::Float64, false),
-        // Added 2026-10-06. The previous 9-column schema is NOT preserved as
-        // an alternative: `tier` is the whole point of the provenance work,
-        // and `cpm` is what a downstream differential pipeline consumes.
-        // Both are described where they are produced.
         Field::new("tier", DataType::Utf8, false),
         Field::new("n_anchor", DataType::UInt32, false),
         Field::new("cpm", DataType::Float64, false),
@@ -551,11 +511,9 @@ mod tests {
 
     // ---- fixtures for the provenance / closure tests ---------------------
     //
-    // Local xfs `/tmp`, NOT `$TMPDIR`: `$TMPDIR` here is `/datg/hanxi/tmp` on
-    // nfs4, where a parquet written and immediately re-read under concurrent
-    // test load comes back as 0 bytes ("EOF: Parquet file too small"). That
-    // flaked a different test in this crate once already; see the
-    // `local_scratch` note in em.rs.
+    // Local xfs `/tmp`, NOT `$TMPDIR`: on a network filesystem a parquet
+    // written and immediately re-read under concurrent test load can come back
+    // as 0 bytes ("EOF: Parquet file too small").
 
     fn scratch(name: &str) -> std::path::PathBuf {
         std::path::PathBuf::from("/tmp").join(format!(
@@ -702,10 +660,9 @@ mod tests {
     /// THE CLOSURE. The profile covers 2 of 4 universe transcripts; the output
     /// must carry all 4, with the 2 unobserved ones zeroed and still labelled.
     ///
-    /// This is the test the expert's A-0 ruling turns on. Without the
-    /// provenance argument the engine is an INNER JOIN and the two zero-weight
-    /// transcripts simply do not appear -- which is a plausible-looking file,
-    /// not an error, and is exactly how 1,334 HC2 transcripts went missing.
+    /// Without the provenance argument the engine is an INNER JOIN and the two
+    /// zero-weight transcripts simply do not appear -- a plausible-looking file,
+    /// not an error.
     #[test]
     fn test_provenance_turns_an_inner_join_into_a_full_universe_closure() {
         let p = scratch("closure_profile");
@@ -815,8 +772,7 @@ mod tests {
     /// DETERMINISM. Same rows, opposite insertion order, byte-identical
     /// output. Rust's default hasher is seeded per process and `HashMap`
     /// iteration order is not fixed, so an unsorted `for (k, v) in map` passes
-    /// every assertion above while emitting a different file order on every
-    /// run -- and a byte comparison between two runs then means nothing.
+    /// every assertion above while emitting a different file order on every run.
     #[test]
     fn test_output_order_does_not_depend_on_profile_row_order() {
         let v = scratch("order_prov");

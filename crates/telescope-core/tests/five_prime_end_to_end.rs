@@ -1,35 +1,18 @@
 //! End-to-end: real BAM on disk → `extract_evidence` → `solve_and_write_profile`
 //! → read the profile back. Nothing here injects `candidate_5p_gap`.
 //!
-//! # Why this file exists
+//! Every 5'-term test in `em.rs` built its graph with `synth_graph_with_gaps`,
+//! which writes the 5' gap pool **directly** — so all of them are blind to the
+//! BAM → `g_k` path in `evidence.rs`, where `gap5p` is computed. The acceptance
+//! criterion is therefore a mutation, not a number: **forcing `gap5p` to a
+//! constant must turn the assertion in this file red.**
 //!
-//! Every 5'-term test that lived in `em.rs` built its graph with
-//! `synth_graph_with_gaps`, which writes the 5' gap pool **directly**. That
-//! makes all of them blind to the half of the feature that could actually be
-//! wrong: the BAM → `g_k` path in `evidence.rs`. The gap a test hands the E-step
-//! and the gap a real BAM produces are the same number only if
-//! `CandidateAlign::gap5p` is computed correctly — and if it were not, not one
-//! of the 37 unit tests would go red.
-//!
-//! So the acceptance criterion for this file is a mutation, not a number:
-//! **forcing `gap5p` to a constant must turn the assertion in this file red.**
-//! `test_the_5p_gap_survives_the_bam_to_em_step_seam` is that tripwire; it is
-//! written so that a neutered `gap5p` makes the two candidates identical, and
-//! identical candidates are 50/50 under *any* implementation of the likelihood,
-//! including one where the 5' term does not exist.
-//!
-//! # The fixture
-//!
-//! One ambiguous read, aligned to `tx0` and `tx1` with **equal `AS:i`**, so the
-//! alignment term `ln A_rk` is exactly 0 in both directions. The two
-//! candidates differ in exactly one observable: `tx0`'s alignment starts at
-//! base 1 (`g_k = 0`, inside the 20 bp window) and `tx1`'s starts 500 bp in
-//! (`g_k = 500`, outside it). The emission gives the two transcripts the *same*
-//! `mu_logPAL`, so the poly(A) term is symmetric too and cannot break the tie.
-//!
-//! That leaves the 5' term as the only thing that can move the posterior, which
-//! is what makes "the posterior moved" evidence about the seam rather than
-//! about the emission model.
+//! # The fixture: one ambiguous read, aligned to `tx0` and `tx1` with
+//! **equal `AS:i`**, so the alignment term is exactly 0 in both directions.
+//! They differ in one observable: `tx0`'s alignment starts at base 1 (`g_k = 0`,
+//! inside the 20 bp window) and `tx1`'s starts 500 bp in (`g_k = 500`,
+//! outside it), and the emission gives both transcripts the same `mu_logPAL`.
+//! The 5' term is therefore the only thing that can move the posterior.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -42,8 +25,7 @@ use parquet::file::properties::WriterProperties;
 use telescope_core::em::solve_and_write_profile;
 use telescope_core::evidence::{extract_evidence, test_support};
 
-/// λ, β, window and prune are the shipped frozen values. See
-/// `workspace/notes/EXPERIMENT.md` for provenance.
+/// λ, β, window and prune are the shipped values.
 const POLY_A_ON: f64 = 1.0;
 const LAMBDA: f64 = 20.0;
 const BETA_ON: f64 = 1.8;
@@ -51,8 +33,8 @@ const BETA_OFF: f64 = 0.0;
 const WINDOW: u32 = 20;
 const PRUNE: i32 = 50;
 /// Truncation OFF, so the two arms are scored on the same support. At the 0.01
-/// default the β-on arm emits more rows than the β-off arm (measured on GNG11:
-/// 2726 vs 1816) and the comparison would not be like-for-like.
+/// default the β-on arm emits more rows than the β-off arm and the comparison
+/// would not be like-for-like.
 const MIN_WEIGHT: f64 = 0.0;
 
 /// Read `(transcript_id, posterior_weight)` back out of a profile parquet.
@@ -101,15 +83,9 @@ fn scratch(name: &str) -> PathBuf {
 /// Deliberately NOT shared with `em.rs`'s test writer: that one is a
 /// `#[cfg(test)]` item in a different crate. The drift risk is bounded and
 /// fails LOUDLY — `load_emission_parameters` `context()`s on any column it
-/// needs and cannot find, so adding a sixth column to the reader breaks this
-/// test at the first read instead of quietly reading a default.
-///
-/// That prediction was tested for real on 2026-10-06: the sixth column
-/// (`n_cohort_flnc`, the in-schema marker of an IMPUTED row) went in, and
-/// `cargo test --lib` stayed green because it only builds the lib's own
-/// fixtures. The breakage appeared in `cargo test --release` on this file
-/// only. A required column is a change to the READ CONTRACT, and a lib-only
-/// test run cannot see one.
+/// needs and cannot find, so adding a sixth column breaks this test at the
+/// first read instead of quietly reading a default. A required column is a
+/// change to the READ CONTRACT, and a lib-only test run cannot see one.
 fn write_emission(path: &PathBuf, rows: &[(&str, &str, f64, f64)]) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("transcript_id", DataType::Utf8, false),
@@ -156,9 +132,9 @@ fn write_emission(path: &PathBuf, rows: &[(&str, &str, f64, f64)]) {
 /// The real pipeline, run end to end. Returns `(pi_tx0, rows)` as percentages
 /// and counts, with the 5' term set to `beta`.
 fn run_pipeline(beta: f64, tag: &str) -> (f64, usize) {
-    // `pt:i = 100` in every record, so the molecule's log-pal is log2(100). Both
-    // transcripts get that same value as their emission μ, making the poly(A)
-    // term symmetric across the pair.
+    // `pt:i = 100` in every record, so the molecule's log-pal is log2(100), and
+    // both transcripts get that same value as their emission μ — the poly(A)
+    // term is symmetric across the pair.
     let mu = (100.0_f64).log2();
     let records = vec![
         test_support::synth_record_with_gap("r1", 0, 0, false, Some(100), 0, 60),
@@ -173,7 +149,7 @@ fn run_pipeline(beta: f64, tag: &str) -> (f64, usize) {
     );
 
     // Module 2. No id mapping: this fixture's BAM and emission already share a
-    // key space, which is the case `solve_and_write_profile` now refuses if it
+    // key space, which is the case `solve_and_write_profile` refuses if it
     // is not.
     let graph = extract_evidence(&bam, 35).expect("extract_evidence");
     assert_eq!(
@@ -241,10 +217,9 @@ fn test_the_5p_gap_survives_the_bam_to_em_step_seam() {
     //     π_0 = e^β / (e^β + 1) = 6.0496 / 7.0496 = 85.81%   at β = 1.8
     //
     // Pinning THAT number to 0.1 pp is much stronger than "the posterior moved":
-    // it says the gap the E-step used is the gap the BAM encodes, because any
-    // other value of `gap5p` — constant, `u32::MAX`, off-by-one from the 1-based
-    // start, or derived from the wrong end — either fails to break the tie (50%)
-    // or breaks it by some other amount.
+    // any other value of `gap5p` — constant, `u32::MAX`, off-by-one from the
+    // 1-based start, or derived from the wrong end — either fails to break the
+    // tie (50%) or breaks it by some other amount.
     let expected = 100.0 * BETA_ON.exp() / (BETA_ON.exp() + 1.0);
     assert!(
         (pi_on - expected).abs() < 0.1,

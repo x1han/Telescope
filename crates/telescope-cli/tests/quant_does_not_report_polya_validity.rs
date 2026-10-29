@@ -1,43 +1,18 @@
 //! End-to-end: `telescope quant` must NOT report a poly(A) validity number.
 //!
-//! WHY THIS TEST EXISTS. `TelEmStats` carried two counters —
-//! `n_polya_zero_power` and `n_polya_zero_power_resolved` — which `quant`
-//! printed under the header `poly(A) discriminative power:`. Both counters were
-//! measured to be uninformative about deconvolution accuracy. The counter
-//! FIRES when a read's candidates share one identical `(mu, sigma2)`, so a low
-//! value means non-degenerate and NOT discriminative; on HC2 it read
-//! `zero-power_all: 886 of 4,380,726 ambiguous (0.02%)`. The trap was its
-//! complement — an earlier round of notes read 0.02% as "poly(A) discriminates
-//! on 99.98% of contested reads", which is false, since the poly(A) term's
-//! per-read SNR is 0.255. The expert ruling was to remove the counters from user-facing
-//! output while KEEPING them in `TelEmStats` as internal solver monitoring, so
-//! this asserts on the OUTPUT, never on the fields.
+//! `TelEmStats` carries two poly(A) zero-power counters, which measure how
+//! often a read's candidates share one identical `(mu, sigma2)`. A LOW value
+//! means the term is degenerate, not discriminative, so printing it under a
+//! "poly(A) discriminative power" header invites a validity claim it cannot
+//! support. The counters stay in `TelEmStats` as internal solver monitoring;
+//! only the OUTPUT is asserted here.
 //!
-//! WHY AN END-TOEND TEST. The defect is not in the counter, it is in the fact
-//! that the counter is printed. A unit test of the predicate cannot see that:
-//! delete the `eprintln!` block in `main.rs` and `em.rs`'s three tests stay
-//! green, because they assert on `TelEmStats` fields. Only running the binary
-//! and reading its stderr can see this regression.
+//! A unit test of the predicate cannot see this: delete the `eprintln!`
+//! block in `main.rs` and the `em.rs` tests stay green, so this drives the
+//! real CLI chain `build-anchors` -> `build-emission` -> `quant`.
 //!
-//! WHY THE CHAIN. `quant` needs `--emission <parquet>`, and the helper that
-//! writes an emission table (`write_test_emission`) lives inside
-//! `#[cfg(test)] mod tests` in `em.rs` and is therefore invisible to an
-//! integration test. So this drives the real three-step CLI chain:
-//! `build-anchors` -> `build-emission` -> `quant`. This is also the first test
-//! in the repo to run `quant` at all.
-//!
-//! WHY THE POSITIVE PIN. A negative assertion on stderr is a tautology unless a
-//! sibling assertion proves the capture is live. `emission model coverage` was
-//! the first telemetry line of the block the removed lines sat in, and it
-//! prints only after `solve_and_write_profile` returned `Ok`, so it proves the
-//! run reached the print zone rather than merely having started. Without it, a
-//! fixture that bailed early would leave stderr empty and both negative
-//! assertions below would pass for the wrong reason.
-//!
-//! Before this test existed, `quant`'s stderr contained `zero-power_all`, so it
-//! failed on first run. That red is the evidence the fixture reaches the print
-//! block: had the fixture died early, it would have been green and proved
-//! nothing.
+//! The negative assertions are only meaningful because a positive one proves
+//! the capture is live: `emission model coverage` prints only after the solve returns `Ok`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -94,9 +69,8 @@ fn quant_stderr(tag: &str) -> String {
     ]);
     assert!(ok, "build-anchors failed:\n{err}");
 
-    // Defaults are 10/30/30; a 4-anchor fixture cannot clear them, and the
-    // thresholds are the point of the Universal-Mode fallback, so lower them
-    // rather than inflate the fixture.
+    // Defaults are 10/30/30; a 4-anchor fixture cannot clear them, so lower
+    // them rather than inflate the fixture.
     let (ok, err) = run(&[
         "build-emission",
         "--anchor-pool",
@@ -137,6 +111,7 @@ fn cleanup(paths: &[&Path]) {
     }
 }
 
+/// Pins that `quant` reports no poly(A) validity number to the user.
 #[test]
 fn quant_does_not_report_a_polya_validity_number() {
     let stderr = quant_stderr("nopya_validity");

@@ -1,12 +1,12 @@
-//! Telescope core library
+//! Telescope core library.
 //!
-//! Phase v0.2.1 scaffold. Provides:
-//!   Module 0: Transcript Evidence Resolver (`resolver`)
-//!   Module 1: Emission Model Builder (`emission_model`)
-//!   Module 2: Transcriptome Evidence Extractor (`evidence`)
-//!   Module 3: TEL-EM Solver (`em`)
-//!   Step 2:   Profile Summary Engine (`summary`)
-//! Module 4 R + Step 3 (Universal Mode) follow per `specs/telescope-v0.2.1.md`.
+//! Modules:
+//! - `resolver` — transcript evidence resolution (tier classification, subsumption)
+//! - `evidence` — transcriptome evidence extraction from alignments
+//! - `anchor_builder` — anchor pool construction
+//! - `emission_model` — per-transcript poly(A) emission model
+//! - `em` — TEL-EM solver
+//! - `summary` — profile summary engine
 
 #![deny(rust_2018_idioms)]
 #![warn(missing_debug_implementations)]

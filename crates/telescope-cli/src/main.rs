@@ -1,23 +1,23 @@
-//! Telescope CLI entry point (Phase C scaffold).
+//! Telescope CLI entry point.
 //!
-//! Currently exposes three subcommands:
-//! - `build-emission`: drives Module 1 (Emission Model Builder).
-//! - `extract-evidence`: drives Module 2 (Transcriptome Evidence Extractor).
-//! - `quant`: drives Modules 2 → 3 (BAM → evidence → TEL-EM profile).
-//!
-//! Module 4 R to follow per `specs/telescope-v0.1.7.md`.
+//! Subcommands: `build-emission` (Module 1), `extract-evidence` (Module 2),
+//! `quant` (Modules 2 → 3), `summarize` (profile → sample summary),
+//! `build-anchors` (poly(A) anchor pool from BAMs), `resolve-evidence`
+//! (Module 0, cohort transcript evidence).
 
 use std::collections::HashSet;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use telescope::diff::DiffArgs;
 use telescope::quant::QuantArgs;
 use telescope::{ledger_json, POLY_A_SOURCE_HELP};
 use telescope::{maybe_write_filter_ledger, print_filter_ledger};
 use telescope_core::emission_model::FallbackConfig;
 use telescope_core::{anchor_builder, emission_model, evidence, resolver, summary};
 
+/// The production `telescope` CLI.
 #[derive(Parser, Debug)]
 #[command(
     name = "telescope",
@@ -29,22 +29,20 @@ struct Cli {
     cmd: Cmd,
 }
 
+/// The subcommands of the production `telescope` binary.
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Module 1: build `telescope.emission.parquet` from an anchor pool
-    /// (Universal mode).
+    /// Module 1: build `telescope.emission.parquet` from an anchor pool.
     ///
     /// `--anchor-pool` is the sole input; there is no alternative input mode.
-    /// An external poly(A) initializer (the former "AIDRS mode") remains in
+    /// An external poly(A) initializer remains in
     /// `telescope-core::emission_model` but is deferred and is NOT reachable
     /// from any CLI subcommand — see that module's docs.
     ///
-    /// `--output` is always required. The `--tx-min-reads`,
-    /// `--gene-min-reads`, `--cohort-min-reads` flags configure
-    /// the Universal-Mode 3-level fallback (Tx → Gene → Cohort).
-    /// They used to be conditional on `--anchor-pool`; that is now this
-    /// subcommand's only input, so there is nothing left to condition on
-    /// and no `requires = "anchor_pool"` is attached to them.
+    /// `--output` is always required. `--tx-min-reads`, `--gene-min-reads` and
+    /// `--cohort-min-reads` configure the 3-level fallback (Tx → Gene → Cohort)
+    /// and carry no `requires` attribute, because `--anchor-pool` is the only
+    /// input.
     BuildEmission {
         /// Universal mode: path to `telescope.anchor_pool.parquet`
         /// (produced by `telescope build-anchors`).
@@ -80,10 +78,9 @@ enum Cmd {
         /// header names every transcript the alignment can assign to.
         ///
         /// Without it the model covers only transcripts the anchor pool
-        /// observed, and a read whose candidate is outside that set is
-        /// dropped with no profile row -- 705,289 of them on HC2, 14.7% of all
-        /// reads. With it, every universe transcript missing from the pool is
-        /// emitted as a cohort-prior row carrying `n_cohort_flnc == 0`.
+        /// observed, and a read whose candidate is outside that set is dropped
+        /// with no profile row. With it, every universe transcript missing from
+        /// the pool is emitted as a cohort-prior row carrying `n_cohort_flnc == 0`.
         ///
         /// Only the HEADER is read; no alignment record is touched.
         #[arg(long)]
@@ -93,8 +90,8 @@ enum Cmd {
         /// rows a real `gene_id` instead of falling back to the transcript id.
         ///
         /// The fallback is a different convention from the anchored rows in
-        /// the same file, which is harmless numerically -- `gene_id` feeds no
-        /// likelihood -- but it is a join trap for a downstream reader, so it
+        /// the same file — harmless numerically, since `gene_id` feeds no
+        /// likelihood — but it is a join trap for a downstream reader, so it
         /// is worth passing when the mapping is on hand.
         #[arg(long)]
         tx_to_gene: Option<PathBuf>,
@@ -118,12 +115,9 @@ enum Cmd {
         #[arg(long, default_value_t = 35)]
         tes_slack: usize,
 
-        // The ruling specifies this spelling, and the FATAL message in
-        // `evidence.rs` quotes it -- the flag and the error that names it have
-        // to agree, or the error tells the user to type something that does not
-        // exist. The lowercase form is accepted as an alias for the same
-        // reason the flag itself is spelled in both cases: a quant command
-        // invoked from a shell script should not fail on letter case alone.
+        // The FATAL message in `evidence.rs` quotes this spelling, so the flag
+        // and the error that names it must agree; the lowercase alias is
+        // accepted so a shell script does not fail on letter case alone.
         #[arg(
             long = "polyA-source",
             alias = "polya-source",
@@ -136,19 +130,24 @@ enum Cmd {
         /// (`telescope.filter_ledger/v1`).
         ///
         /// OPT-IN, not a default sidecar: `--provenance-out` on
-        /// `build-emission` writes by default, and a second flag with the
-        /// opposite default invites a reader to assume both run. The path is
-        /// explicit so the record-level and anchor-level ledgers cannot land in
-        /// one file — they are different stages with different denominators,
-        /// and a single merged document would invite exactly the "summed the
-        /// two totals" mistake the schema's two top-level keys exist to
-        /// prevent.
+        /// `build-emission` writes by default, and two flags with opposite
+        /// defaults invite a reader to assume both run. The path is explicit so
+        /// the record-level and anchor-level ledgers cannot land in one file —
+        /// they are different stages with different denominators.
         #[arg(long)]
         ledger: Option<PathBuf>,
     },
 
     /// Modules 2 + 3: BAM -> evidence -> TEL-EM profile.
     Quant(QuantArgs),
+
+    /// Module 4: profile -> differential statistics (usage and tail length).
+    ///
+    /// The statistics are NOT implemented in Rust: DEXSeq and limma are called
+    /// in an R subprocess. This subcommand does the one step that cannot be
+    /// delegated — the per-read to per-(transcript x sample) aggregation — and
+    /// then runs the R engine on the result.
+    Diff(DiffArgs),
 
     /// Profile Summary Engine: aggregate profile.parquet → sample_summary.parquet.
     Summarize {
@@ -168,14 +167,14 @@ enum Cmd {
         /// against the reference universe: a transcript no read landed on is
         /// absent from the output entirely. With it, every transcript in the
         /// universe gets a row, zero-filled, carrying its `tier` and
-        /// `n_anchor` -- which is what Tier 3 needs, because NanoCount
-        /// transcripts that are missing there must be filled with 0 rather than
-        /// dropped by a join.
+        /// `n_anchor` — which is what Tier 3 needs, because transcripts that
+        /// are missing there must be filled with 0 rather than dropped by a
+        /// join.
         #[arg(long)]
         provenance: Option<PathBuf>,
     },
 
-    /// D1 Universal Mode: build poly(A) anchor pool from BAMs (no AIDRS needed).
+    /// Universal Mode: build the poly(A) anchor pool from BAMs.
     BuildAnchors {
         /// BAM files (one per sample). Pass multiple `--bam <path>` flags.
         #[arg(long = "bam", required = true)]
@@ -208,11 +207,10 @@ enum Cmd {
         /// Absolute floor on the per-read `delta_AS_raw` gap (default 12).
         ///
         /// **12.0 IS A RULED VALUE, NOT A LEFTOVER.** It was 0.0 — read as "no
-        /// gap requirement" — until the R141 ruling, and the text this replaces
-        /// said so repeatedly. The number that replaced it is 12 because a
-        /// single mismatch on this data costs 6 AS and a 1 bp indel 6–8 AS: a
-        /// 12-point floor is above the cost of one edit and far below the cost
-        /// of the isoform divergence this stage exists to resolve.
+        /// gap requirement" — until it was ruled to 12: a single mismatch on
+        /// this data costs 6 AS and a 1 bp indel 6–8 AS, so a 12-point floor is
+        /// above the cost of one edit and far below the cost of the isoform
+        /// divergence this stage exists to resolve.
         ///
         /// `delta_AS_raw = AS_1 - (AS_2 or 0)`, measured on the read's FULL
         /// deduped candidate set, before the physical filters — so a read with a
@@ -224,10 +222,8 @@ enum Cmd {
 
         /// Floor on the per-read `delta_AS_raw` gap as a fraction of `AS_1`.
         ///
-        /// **THE 0.0 DEFAULT IS A FROZEN CHOICE, NOT AN OMISSION.** It used to
-        /// be 0.0 because the owner declined to ship an uncalibrated value,
-        /// which made it read as "off". It is still 0.0, and it is now ruled:
-        /// the two floors combine with `max`, so a relative floor of 0.0 is
+        /// **THE 0.0 DEFAULT IS A FROZEN CHOICE, NOT AN OMISSION.** The two
+        /// floors combine with `max`, so a relative floor of 0.0 is
         /// arithmetically inert beside a non-zero `--gap-abs` and means "the
         /// absolute floor is the only floor". Read it that way, never as "off".
         #[arg(long, default_value_t = 0.0)]
@@ -264,7 +260,6 @@ enum Cmd {
         tx_to_gene: Option<PathBuf>,
 
         /// Cohort size (must equal the number of `--bam` arguments).
-        /// Required and explicit per F6.2 (P0 correction).
         #[arg(long)]
         cohort_size: usize,
 
@@ -408,13 +403,13 @@ fn main() -> Result<()> {
 
             // The L1/L2/L3 percentages above keep describing the ANCHORED
             // population: imputed rows are counted separately so those
-            // percentages stay comparable with every earlier run rather than
-            // silently rebasing onto the padded denominator.
+            // percentages stay comparable rather than silently rebasing onto
+            // the padded denominator.
             //
             // ---- EMISSION COMPLETENESS -------------------------------------
-            // Four counters, none inferable from the others. The point of
-            // printing `n_emission_after` on its own line is that a reader can
-            // check it against `n_reference` without trusting the summary.
+            // Four counters, none inferable from the others. `n_emission_after`
+            // is printed on its own line so a reader can check it against
+            // `n_reference` without trusting the summary.
             let n_anchored = tiers.l1 + tiers.l2 + tiers.l3;
             let n_after = n_anchored + tiers.n_imputed;
             eprintln!(
@@ -453,63 +448,15 @@ fn main() -> Result<()> {
             // NOT `n_after == n_reference`: that one is false whenever an
             // anchored transcript is absent from the universe, which is a
             // configuration the code above deliberately WARNS about rather than
-            // rejects. Asserting the strict form would turn a tolerated
-            // configuration into a hard failure on runs that work today.
+            // rejects.
             //
-            // WHAT THIS ACTUALLY GUARDS AGAINST, corrected 2026-10-15. The
-            // comment here used to say this is "fail-closed against the
-            // regression it was added for ... (the `em_eligible`-suppressed
-            // resurrection bug was exactly that)". THAT WAS FALSE, and it is
-            // worth being precise because the two bugs are easy to conflate:
-            //
-            //   * P0-2, the bug this assertion was added alongside, was a
-            //     COMPETENCE-FLAG error. The suppressed transcript was emitted
-            //     either way — universe padding had already re-added it — so
-            //     the ROW COUNT NEVER CHANGED and a row-count law could not
-            //     have seen it. Its coverage is
-            //     `test_suppressed_transcripts_emitted_as_incompetent`, at the
-            //     library layer, where the flag is written.
-            //   * The defect this law DOES cover is padding STOPPING a key it
-            //     should emit (the "drop the row" alternative to the fix). Then
-            //     `n_after` falls one short per dropped key.
-            //
-            // It is fail-closed against the second, and the distinction matters:
-            // reading the old comment would credit this assertion with covering
-            // P0-2, and dropping it on the strength of that credit would remove
-            // a check without anyone knowing P0-2 was ever unprotected.
-            //
-            // MEASURED LIMITATION, 2026-10-15. This assertion currently CANNOT
-            // fire from the CLI. Both sides are the cardinality of
-            // `anchored UNION universe`, so the law is an identity on any two
-            // SETS; the only input that breaks it is a universe naming a
-            // transcript twice, and `read_reference_universe` returns noodles'
-            // header map, which collapses duplicate `@SQ` names before this
-            // code sees them. Measured: `@SQ SN:tx0, SN:tx1, SN:tx1` yields a
-            // two-entry universe and this run exits 0.
-            //
-            // So it is kept because the expert ruling locks it and because a
-            // future `noodles` upgrade could make it reachable -- NOT because it
-            // is currently load-bearing. The precondition is pinned by
-            // `a_duplicated_universe_entry_is_collapsed_by_the_header_reader`
-            // in `crates/telescope-cli/tests/`, and the failure mode itself, at
-            // the layer where it IS reachable, by
-            // `a_duplicated_universe_key_is_rejected_at_the_entry_point` in
-            // `emission_model.rs`.
-            //
-            // UPDATED 2026-10-15. The line above used to end by filing "moving
-            // the law into `build_emission_from_anchors`" as a thawing-zone
-            // draft. That draft has since been taken, and it closed this rather
-            // than opening it: `build_emission_from_anchors` now (a) `bail!`s
-            // at its entry point if `reference_universe` contains a duplicate
-            // name, so the malformed input is refused before a row is built
-            // rather than after; and (b) asserts
-            // `n_imputed == n_imputed_padded + n_imputed_suppressed` on the way
-            // out, where the emitted counts are known. So the CLI guard's
-            // soundness no longer rests on noodles' map semantics ALONE -- the
-            // library entry point refuses the input in its own right. This
-            // assertion remains an identity on well-formed input, which is
-            // still true and is now a second line of defence rather than the
-            // only one.
+            // Trap: this assertion is currently an identity on well-formed
+            // input — `build_emission_from_anchors` refuses a universe with a
+            // duplicate name at its own entry point, so the CLI guard's
+            // soundness no longer rests on the header reader's map semantics
+            // alone. It is kept as a second line of defence, and it covers
+            // padding STOPPING a key it should emit: then `n_after` falls one
+            // short per dropped key.
             //
             // Only meaningful when a universe was supplied; with none,
             // `n_reference == 0` and the sum is not the universe size.
@@ -612,10 +559,15 @@ fn main() -> Result<()> {
         Cmd::Quant(quant_args) => {
             // The shipped path passes literal `None`, which the library
             // resolves to the frozen Model A constant. This binary cannot
-            // reach the parameterised entry's argument: `ci/gates.sh`
-            // asserts both that the argument's name is absent here and
-            // that this call passes `None`.
+            // reach the parameterised entry's argument: the release gate
+            // asserts both that the argument's name is absent here and that
+            // this call passes `None`.
             telescope::quant::run_quant(quant_args, None)?;
+            Ok(())
+        }
+        Cmd::Diff(diff_args) => {
+            eprintln!("[telescope] Module 4: differential statistics");
+            telescope::diff::run(&diff_args)?;
             Ok(())
         }
         Cmd::Summarize {
@@ -713,13 +665,12 @@ fn main() -> Result<()> {
             let tx_to_g = load_tx_to_gene(&tx_to_gene)?;
             eprintln!("  tx_to_gene entries: {}", tx_to_g.len());
             if tx_to_g.len() == 0 {
-                // NOT A VETO MESSAGE, and the old one was false since R140. There
-                // is no gene veto: a read is refused only by the tie, the
-                // usurpation, the gap or the cap, and none of those consults the
-                // map. What an empty map changes is the CLASSIFICATION of a gap
-                // failure — `Unknown` instead of Same/Cross — and the
-                // bookkeeping counters that record that the relation was
-                // unavailable. The reads are still emitted.
+                // NOT A VETO MESSAGE. There is no gene veto: a read is refused
+                // only by the tie, the usurpation, the gap or the cap, and none
+                // of those consults the map. What an empty map changes is the
+                // CLASSIFICATION of a gap failure — `Unknown` instead of
+                // Same/Cross — and the bookkeeping counters that record that
+                // the relation was unavailable. The reads are still emitted.
                 eprintln!(
                     "  tx_to_gene:        (NONE — no veto applies; a gap failure \
                      cannot be classified as same- or cross-gene, so it is \
@@ -867,14 +818,11 @@ fn main() -> Result<()> {
 
 /// REFUSE a `--provenance-out` that would destroy a PARQUET table.
 ///
-/// WHY THIS EXISTS. `--provenance-out` names the JSON run header, written with
-/// `std::fs::write`. Nothing constrained it: a path ending `.parquet` was
-/// accepted, and so was a path equal to `--output` or to the per-transcript
-/// provenance table. On the frozen Dataset B calibration run,
-/// `--provenance-out .../tiers.parquet` overwrote that file with 654 bytes of
-/// JSON — the per-transcript tier table is the ONLY record of which fallback
-/// level (L1 / L2 / L3) produced each row, so the calibration became
-/// unidentifiable from its own artefacts, with no error anywhere.
+/// `--provenance-out` names the JSON run header, written with
+/// `std::fs::write`, which TRUNCATES — there is no window in which both files
+/// survive. The per-transcript tier table is the ONLY record of which
+/// fallback level (L1 / L2 / L3) produced each row, so overwriting it makes
+/// the run unidentifiable from its own artefacts, with no error anywhere.
 ///
 /// Two checks, in two places, because they have different inputs:
 ///
@@ -887,8 +835,6 @@ fn main() -> Result<()> {
 ///     plain comparison where it does not. The fallback is what makes the
 ///     guard fire on the FIRST call, where `--output` has usually not been
 ///     written yet and `canonicalize` would fail.
-///
-/// `std::fs::write` TRUNCATES. There is no window in which both files survive.
 fn refuse_a_provenance_path_that_clobbers_a_table(
     prov: &std::path::Path,
     table: &std::path::Path,
@@ -940,14 +886,10 @@ fn same_file_or_path(a: &std::path::Path, b: &std::path::Path) -> bool {
 /// yielded nothing.
 ///
 /// `TxToGene::from_tsv` SKIPS every line it cannot split into two non-empty tab
-/// fields (`anchor_builder.rs`), so a header-only, space-delimited or truncated
-/// file returns `Ok` with ZERO entries. Downstream, `resolve_gene` treats a
-/// zero-entry map EXACTLY like no map at all and silently runs Universal Mode.
-/// A user who asked for a map and got none would then read `gene_veto_disabled`
-/// in the ledger and never learn the veto was disabled by their own typo.
-///
-/// So: no flag -> an empty map on purpose (and the caller says so out loud);
-/// a flag that parses to nothing -> an error.
+/// fields, so a header-only, space-delimited or truncated file returns `Ok`
+/// with ZERO entries, and downstream a zero-entry map is treated EXACTLY like
+/// no map at all. So: no flag -> an empty map on purpose (and the caller says
+/// so out loud); a flag that parses to nothing -> an error.
 fn load_tx_to_gene(path: &Option<PathBuf>) -> Result<anchor_builder::TxToGene> {
     let Some(p) = path else {
         return Ok(anchor_builder::TxToGene::new());
@@ -968,7 +910,6 @@ fn load_tx_to_gene(path: &Option<PathBuf>) -> Result<anchor_builder::TxToGene> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // moved to the lib by this change; `use super::*` no longer reaches them
     use clap::CommandFactory;
     use telescope::{
         pct, ALN_WEIGHT_LAMBDA_DEFAULT, FIVE_PRIME_WEIGHT_DEFAULT, FIVE_PRIME_WINDOW_DEFAULT,
@@ -984,10 +925,10 @@ mod tests {
     /// A SUPPLIED `--tx-to-gene` that parses to nothing must fail, not silently
     /// become Universal Mode.
     ///
-    /// This is the falsifiable form of the guard in `load_tx_to_gene`. Delete the
-    /// `anyhow::ensure!` from that function and `header_only_is_an_error` goes red,
-    /// because `from_tsv` happily returns a ZERO-entry map for a header-only file
-    /// and nothing downstream can tell it from "no flag was passed".
+    /// This is the falsifiable form of the guard in `load_tx_to_gene`: delete the
+    /// `anyhow::ensure!` from that function and this goes red, because
+    /// `from_tsv` returns a ZERO-entry map for a header-only file and nothing
+    /// downstream can tell it from "no flag was passed".
     #[test]
     fn a_supplied_but_empty_tx_to_gene_is_an_error_not_universal_mode() {
         // Omitting the flag is the DELIBERATE no-map path and must keep working.
@@ -1020,33 +961,20 @@ mod tests {
     /// A `--provenance-out` that would destroy a parquet table is refused — both
     /// halves of the guard, called directly.
     ///
-    /// ## WHY THIS IS A UNIT TEST AND NOT ONLY THE PROCESS-LEVEL ONE
-    ///
+    /// The process-level test
     /// `crates/telescope-cli/tests/provenance_out_cannot_clobber_a_parquet_table.rs`
-    /// drives the real binary and covers the inputs a user can actually type,
-    /// INCLUDING the tier-sidecar collision (its symlink case). This unit test
-    /// is still the cheaper half of the pair: it calls the guard directly, so
-    /// the collision branch is exercised against a table whose name does NOT
-    /// end in `.parquet` and with no BAM, no pool and no build in the way.
-    ///
-    /// ⚠ THIS PARAGRAPH USED TO CLAIM THE OPPOSITE — that the collision branch
-    /// "is never reached through the CLI", because a tier sidecar is always
-    /// named `<stem>.provenance.parquet` and the `.parquet` extension check
-    /// fires first. That is FALSE. `same_file_or_path` canonicalises, and
-    /// `canonicalize` RESOLVES SYMLINKS: if the tier sidecar path is a symlink
-    /// pointing at the `--provenance-out` path, the two canonical paths are
-    /// equal, the COLLISION branch fires before the extension branch (the
-    /// function checks collision first, deliberately), and the JSON run header
-    /// is never written. The symlink case in
-    /// `provenance_out_cannot_clobber_a_parquet_table.rs` pins that through the
-    /// real binary.
+    /// drives the real binary and covers the inputs a user can actually type.
+    /// This unit test is the cheaper half of the pair: it calls the guard
+    /// directly, so the collision branch is exercised against a table whose
+    /// name does NOT end in `.parquet` and with no BAM, no pool and no build
+    /// in the way.
     ///
     /// ## WHAT EACH CASE IS FOR
     ///
-    ///   * `.parquet` extension: the shape that cost the Dataset B calibration.
-    ///   * same path as a table: the shape that destroys whatever it names,
-    ///     whatever the file is called — and the branch the extension check
-    ///     would miss if the library ever renamed the sidecar.
+    ///   * `.parquet` extension.
+    ///   * same path as a table: destroys whatever it names, whatever the file
+    ///     is called — and the branch the extension check would miss if the
+    ///     library ever renamed the sidecar.
     ///   * a name that collides only AFTER canonicalisation (`x/../x`): a plain
     ///     string comparison calls that two files, and `std::fs::write` calls
     ///     it one.
@@ -1056,8 +984,13 @@ mod tests {
     ///
     /// Cases 2 and 3 name the table `.tbl`, not `.parquet`, ON PURPOSE: a
     /// `.parquet` table would be caught by the extension check first and the
-    /// collision branch would never run, which is the whole reason this test
-    /// exists.
+    /// collision branch would never run.
+    ///
+    /// Trap: the collision branch IS reachable through the CLI. `same_file_or_path`
+    /// canonicalises, and `canonicalize` RESOLVES SYMLINKS: if the tier
+    /// sidecar path is a symlink pointing at the `--provenance-out` path, the
+    /// two canonical paths are equal and the COLLISION branch fires before the
+    /// extension branch.
     #[test]
     fn a_collision_with_a_parquet_table_is_refused_whatever_its_name() {
         let dir = std::env::temp_dir();
@@ -1096,10 +1029,8 @@ mod tests {
         //    fallback is then a plain string comparison, which calls these two
         //    spellings different. That fallback is safe rather than merely
         //    convenient — `std::fs::write` through a non-existent directory
-        //    also fails with ENOENT, so there is nothing there to destroy — but
-        //    it means this case can only exercise the canonicalise branch with
-        //    a real directory, and asserting otherwise would be a fixture that
-        //    silently tests the fallback.
+        //    also fails with ENOENT — but it means this case can only exercise
+        //    the canonicalise branch with a real directory.
         let sub = dir.join("tel_prov_guard_sub");
         std::fs::create_dir_all(&sub).expect("mkdir");
         let indirect = sub.join("..").join("tel_prov_guard_table.tbl");
@@ -1125,15 +1056,11 @@ mod tests {
     /// A zero denominator must render as `n/a`, never as a percentage.
     ///
     /// `n_reads_multi_emission_candidate` is legitimately 0 whenever no read
-    /// has two candidates carrying an emission row — which is the normal state
-    /// of a badly-covered model, and precisely the state the `_all` / `_resolved`
-    /// split was created to characterise. The tempting guard is
-    /// `denominator.max(1)`, which removes the `NaN` and simultaneously reports
-    /// "no read qualified" as a confident `0.0%`.
-    ///
-    /// (The `_all` / `_resolved` lines no longer print — removed 2026-10-07. The
-    /// coverage counters `pct` is still called on can also be legitimately 0,
-    /// which is why this guard and this test stay.)
+    /// has two candidates carrying an emission row — the normal state of a
+    /// badly-covered model. The tempting guard is `denominator.max(1)`, which
+    /// removes the `NaN` and simultaneously reports "no read qualified" as a
+    /// confident `0.0%`. The coverage counters `pct` is still called on can
+    /// also be legitimately 0, which is why this guard and this test stay.
     ///
     /// Asserting the STRING rather than the absence of a panic is the point:
     /// a test that only checked "does not produce NaN" would still pass under
@@ -1154,16 +1081,10 @@ mod tests {
 
     /// Pins the shipped defaults.
     ///
-    /// This file previously had NO test module, so nothing in the repository
-    /// asserted the value of any default: every `em.rs` test passes λ (and now
-    /// the 5' weight, window and prune threshold) EXPLICITLY, by the existing
-    /// convention of not letting a unit test read a CLI default. The
-    /// consequence was that bumping `ALN_WEIGHT_LAMBDA_DEFAULT` back to the
-    /// superseded 1000.0 left the entire suite green — verified by mutation.
-    ///
-    /// The defaults are the frozen parameters, and the whole change is
-    /// "ship these numbers", so the numbers themselves need a guard. The
-    /// backend tests pin what each value DOES; this pins what is SHIPPED.
+    /// Every `em.rs` test passes λ (and the 5' weight, window and prune
+    /// threshold) EXPLICITLY, so without this test nothing in the repository
+    /// would assert the value of any default. The backend tests pin what each
+    /// value DOES; this pins what is SHIPPED.
     ///
     /// Mutation target: changing any of the four constants, or changing a
     /// `default_value_t` to diverge from its constant, turns this red — which
@@ -1182,12 +1103,10 @@ mod tests {
 
     /// The `default_value_t` attributes must resolve to the SAME constants.
     ///
-    /// clap derives the shipped default from `default_value_t`, and renders it
-    /// into `[default: N]` in `--help`. A literal typed into the attribute
-    /// instead of the constant would therefore print a help block
-    /// contradicting the telemetry and the doc comment — exactly the drift
-    /// that happened before this change, when the prose said
-    /// `(default: 1000.0)` while the const said something else.
+    /// clap derives the shipped default from `default_value_t` and renders it
+    /// into `[default: N]` in `--help`, so a literal typed into the attribute
+    /// would print a help block contradicting the telemetry and the doc
+    /// comment.
     ///
     /// Asserted by PARSING rather than by matching the rendered string, because
     /// clap formats `f64` its own way (20.0 renders as `20`, not `20.0`) and

@@ -1,59 +1,18 @@
-//! W1 — the emission-conservation `ensure!` in `main.rs`, and the measurement
-//! that says it CANNOT fire from here.
+//! The emission-conservation `ensure!` in `main.rs`, and the measurement that
+//! says it CANNOT fire from here.
 //!
-//! WHY A PROCESS-LEVEL TEST. The guard is `anyhow::ensure!` inside `fn main()`.
-//! It does not panic; it returns `Err` from `main`, so the process exits
-//! non-zero with the message on **stderr**. A `#[should_panic]` unit test
-//! cannot see that at all, and a library-level test cannot see it either: the
-//! assert lives in the binary, and nothing in `telescope-core` owns it. So this
-//! test spawns the real binary via `CARGO_BIN_EXE_telescope` and asserts on the
-//! exit code and on stderr.
+//! WHY A PROCESS-LEVEL TEST. The guard is `anyhow::ensure!` inside `fn main()`:
+//! it returns `Err`, not a panic, so the process exits non-zero with the
+//! message on **stderr** — which a `#[should_panic]` unit test cannot see.
 //!
-//! WHY A DUPLICATED `@SQ` IS THE ONLY INPUT THAT REACHES IT. Both sides of
-//! the law are the cardinality of `anchored UNION universe`:
+//! THE LAW IS AN IDENTITY: both sides count `anchored UNION universe`, so for
+//! any two SETS it holds; only a universe naming a transcript twice breaks it.
 //!
-//! ```text
-//!   LHS = n_after                   = |anchored| + |universe \ anchored|
-//!   RHS = n_reference + n_anch_not_ref = |universe| + |anchored \ universe|
-//! ```
-//!
-//! and those are equal for any two SETS. So on well-formed input the guard is
-//! an identity and cannot fail — which is a property worth stating plainly,
-//! because "the guard passed" would otherwise be read as evidence the emitted
-//! table adds up, and it is not: it is arithmetic over the CLI's own counters,
-//! never against the parquet that was actually written.
-//!
-//! CORRECTION 2026-10-15. The paragraph this one replaced claimed that
-//! `read_reference_universe` explicitly does NOT de-duplicate `@SQ` names, and
-//! that this is "exactly what makes the guard reachable": a duplicated name
-//! entering `universe` twice, the padding loop pushing the key into `tx_keys`
-//! twice so the row is emitted TWICE, `n_imputed` (a `HashSet`) counting it
-//! ONCE, and `n_after` falling one short. **Every clause of that was FALSE** —
-//! `reference_sequences()` is a MAP keyed by reference name, so a header naming
-//! a transcript twice arrives already collapsed (measured below). The paragraph
-//! also directly contradicted the next one in this same file.
-//!
-//! It is kept in the record because the failure it describes is the real one and
-//! the reasoning is what made it invisible: a stated non-dedup invariant, once
-//! believed, makes an unreachable guard look load-bearing. The guard's soundness
-//! now rests on OUR OWN check rather than on that belief — see
-//! `build_emission_from_anchors`, which `bail!`s at its entry point if
-//! `reference_universe` ever does contain a duplicate.
-//!
-//! MEASURED OUTCOME, and it is not the one this file was written to produce:
-//! the guard CANNOT fire from the CLI, because `read_reference_universe`
-//! returns noodles' header MAP and that map collapses duplicate `@SQ` names.
-//! Writing `@SQ SN:tx0, SN:tx1, SN:tx1` and running the real binary prints
-//! `@SQ transcripts: 2`, and the run completes successfully. The negative
-//! control that would have driven the `ensure!` is therefore not constructible
-//! from outside the process, and `main.rs`'s `ensure!` has no test that can
-//! make it fail.
-//!
-//! What this file therefore pins is the guard's PRECONDITION, which is the part
-//! that can actually change: if a `noodles` upgrade stops collapsing
-//! duplicates, the guard becomes reachable and `a_duplicated_universe_entry_is_collapsed_by_the_header_reader`
-//! goes red. The reachable half of the failure mode is pinned in
-//! `emission_model.rs`.
+//! MEASURED OUTCOME: the guard CANNOT fire from the CLI, because the header
+//! reader returns a MAP that collapses duplicate `@SQ` names. This file pins
+//! that precondition: if the reader stops collapsing duplicates the guard
+//! becomes reachable and this file goes red; the reachable half of that
+//! failure mode is pinned in `emission_model.rs`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -63,8 +22,8 @@ use telescope_core::evidence::test_support::{synth_record, write_synthetic_bam_n
 /// Anchor-pool BAM: tx0 and tx1, both with reads that clear the anchor
 /// criteria (MAPQ 60, full-length, `pt:i = 100`).
 ///
-/// `AS:i = 100` is load-bearing since R141: the gap is `AS_1 - (AS_2 or 0)`, so
-/// a record with no `AS` tag measures a delta of 0 against the shipped floor of
+/// The `AS:i = 100` is load-bearing: the gap is `AS_1 - (AS_2 or 0)`, so a
+/// record with no `AS` tag measures a delta of 0 against the shipped floor of
 /// 12 and is rejected into `rejected_gap`. An empty pool would make this
 /// file's conservation tests vacuous — the subject here is a universe, and a
 /// universe over zero anchored transcripts is a different scenario.
@@ -136,33 +95,16 @@ fn cleanup(paths: &[&Path]) {
     }
 }
 
-/// THE PRECONDITION OF THE CONSERVATION GUARD, pinned.
+/// THE PRECONDITION OF THE CONSERVATION GUARD, pinned: the header reader
+/// collapses duplicate `@SQ` names, so the guard is currently unreachable.
 ///
-/// The guard in `main.rs` is
-/// ```text
-///   n_after == n_reference + n_anchored_not_in_reference
-/// ```
-/// and both sides are the cardinality of `anchored UNION universe`, so for any
-/// two SETS the law is an identity. The single input that breaks it is a
-/// universe naming a transcript twice — the key enters the emitted set twice
-/// while `n_imputed`, a `HashSet`, counts it once — and `universe` has exactly
-/// one source: `read_reference_universe`, which returns noodles' header MAP.
+/// The reachable half of the failure mode is pinned in `emission_model.rs`,
+/// which drives the library with a duplicated universe directly and shows it
+/// is refused there, before any row is written.
 ///
-/// **This test documents that the map collapses duplicate `@SQ` names, and so
-/// the guard is currently unreachable.** That is not a footnote. It means the
-/// `ensure!` protecting the P0-2 fix has no test that can make it fire, and its
-/// soundness rests on a third-party crate's header semantics rather than on
-/// anything this repository asserts.
-///
-/// The reachable half of the failure mode is pinned in `emission_model.rs`:
-/// `a_duplicated_universe_key_is_rejected_at_the_entry_point` drives the library
-/// with a duplicated universe directly and shows it is refused there, before any
-/// row is written.
-///
-/// IF THIS TEST GOES RED, a `noodles` upgrade has changed the header map's
-/// duplicate handling. The consequence is not cosmetic: the CLI conservation
-/// guard has become REACHABLE, and now needs its own negative control before
-/// anyone relies on it.
+/// IF THIS TEST GOES RED, a header-reader upgrade has changed the duplicate
+/// handling. The CLI conservation guard has become REACHABLE and now needs its
+/// own negative control before anyone relies on it.
 #[test]
 fn a_duplicated_universe_entry_is_collapsed_by_the_header_reader() {
     let dup_bam = duplicated_universe_bam("consv");
@@ -181,13 +123,11 @@ fn a_duplicated_universe_entry_is_collapsed_by_the_header_reader() {
     );
 }
 
-/// THE CLI RUNS, PRINTS THE W2 SPLIT, AND EXITS ZERO.
+/// THE CLI RUNS, PRINTS THE COMPLETENESS SPLIT, AND EXITS ZERO.
 ///
-/// This is the positive half of W1 and it is not optional. Without it, "the
+/// This is the positive half and it is not optional. Without it, "the
 /// conservation guard did not fire" would also be satisfied by a run that fails
-/// for any other reason. Here the same fixture with a WELL-FORMED universe is
-/// required to succeed, which is what makes the unreachable-ness above an
-/// attribute of the duplication rather than of the harness.
+/// for any other reason.
 #[test]
 fn a_well_formed_universe_succeeds_and_prints_the_w2_split() {
     let pool_bam = anchor_bam("consv_ok");
@@ -218,8 +158,8 @@ fn a_well_formed_universe_succeeds_and_prints_the_w2_split() {
         !stderr.contains("emission conservation violated"),
         "a well-formed universe must not trip the guard. stderr:\n{stderr}"
     );
-    // W2's print shape, asserted here because this is the only test that runs
-    // the real CLI far enough to see it.
+    // The completeness block's print shape, asserted here because this is the
+    // only test that runs the real CLI far enough to see it.
     assert!(
         stderr.contains("n_imputed_rows:"),
         "the completeness block must still print. stderr:\n{stderr}"
@@ -233,11 +173,11 @@ fn a_well_formed_universe_succeeds_and_prints_the_w2_split() {
     );
 }
 
-/// POSITIVE CONTROL, and it is not optional. Without this, the test above
-/// would also pass if `build-emission` failed for ANY reason on any input —
-/// a missing flag, an unparseable header, a bad parquet. It asserts that a
-/// well-formed universe runs to completion, so the failure in the other test
-/// is attributable to the duplication and to nothing else.
+/// POSITIVE CONTROL, and it is not optional.
+///
+/// Without this the test above would also pass if `build-emission` failed for
+/// ANY reason on any input — a missing flag, an unparseable header, a bad
+/// parquet — so the failure would not be attributable to the duplication.
 #[test]
 fn a_well_formed_universe_still_succeeds() {
     let pool_bam = anchor_bam("consv_ok");
@@ -268,8 +208,8 @@ fn a_well_formed_universe_still_succeeds() {
         !stderr.contains("emission conservation violated"),
         "a well-formed universe must not trip the guard. stderr:\n{stderr}"
     );
-    // W2's print shape, asserted here because this is the only test that runs
-    // the real CLI far enough to see it.
+    // The completeness block's print shape, asserted here because this is the
+    // only test that runs the real CLI far enough to see it.
     assert!(
         stderr.contains("n_imputed_rows:"),
         "the completeness block must still print. stderr:\n{stderr}"

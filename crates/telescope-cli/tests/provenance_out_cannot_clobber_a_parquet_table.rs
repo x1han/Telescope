@@ -1,25 +1,18 @@
 //! `build-emission --provenance-out` must REFUSE to overwrite a parquet table.
 //!
-//! WHY THIS EXISTS. `--provenance-out` names the JSON run header, written with
-//! `std::fs::write`. Nothing constrained it. On the frozen Dataset B calibration
-//! run, `--provenance-out .../tiers.parquet` replaced that file with 654 bytes
-//! of JSON — and that file is the per-transcript tier table, the ONLY record of
-//! which fallback level (L1 / L2 / L3) produced each row. The calibration became
-//! unidentifiable from its own artefacts, and nothing anywhere reported an error,
-//! because writing JSON to a `.parquet` path is a perfectly valid file write.
+//! `--provenance-out` names the JSON run header, written with `std::fs::write`.
+//! Nothing constrained it: naming a `.parquet` path would replace that file
+//! with JSON — and that file is the per-transcript tier table, the ONLY record
+//! of which fallback level (L1 / L2 / L3) produced each row.
 //!
 //! WHY A PROCESS-LEVEL TEST. The guard is two `anyhow::ensure!` calls inside
-//! `fn main()`. They do not panic; they return `Err`, so the process exits
-//! non-zero with the message on **stderr**. A `#[should_panic]` unit test cannot
-//! see that, and a library test cannot either — the assert lives in the binary
-//! and nothing in `telescope-core` owns it. So this spawns the real binary via
-//! `CARGO_BIN_EXE_telescope`.
+//! `fn main()`. They return `Err` rather than panicking, so the process exits
+//! non-zero with the message on **stderr** — which a `#[should_panic]` unit
+//! test and a library test both cannot see.
 //!
-//! WHAT WOULD HAPPEN WITHOUT THE GUARD. Every negative case below would exit 0
-//! and leave a `.parquet` file containing JSON. The positive control at the end
-//! is not optional: without it, "the run failed" would also be satisfied by a
-//! fixture that fails for an unrelated reason, and the negative cases would
-//! prove nothing about the guard rather than about the harness.
+//! The positive control at the end is not optional: without it, "the run
+//! failed" would also be satisfied by a fixture that fails for an unrelated
+//! reason.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -29,9 +22,9 @@ use telescope_core::evidence::test_support::{synth_record, write_synthetic_bam_n
 /// Anchor-pool BAM: tx0 and tx1, both with reads that clear the anchor
 /// criteria (MAPQ 60, full length, `pt:i = 100`, `AS:i = 100`).
 ///
-/// `AS:i = 100` is load-bearing since R141: the gap is `AS_1 - (AS_2 or 0)`
-/// against a shipped floor of 12, so a tag-less record measures 0 and is
-/// rejected — an empty pool makes every test below measure nothing.
+/// The `AS:i = 100` is load-bearing: the gap is `AS_1 - (AS_2 or 0)` against a
+/// shipped floor of 12, so a tag-less record measures 0 and is rejected — an
+/// empty pool makes every test below measure nothing.
 fn anchor_bam(tag: &str) -> PathBuf {
     write_synthetic_bam_named(
         &format!("{tag}_pool"),
@@ -133,9 +126,8 @@ fn prepared(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
 /// The first four bytes of a parquet file, or `None` if the file is missing.
 ///
 /// THE DECISIVE CHECK, and byte length is not: a JSON run header and a small
-/// parquet table can easily be the same size, so "is it still the right length"
-/// would pass on a file that had already been replaced. `PAR1` is the parquet
-/// magic; `{` is JSON's.
+/// parquet table can easily be the same size. `PAR1` is the parquet magic; `{`
+/// is JSON's.
 fn magic(path: &Path) -> Option<[u8; 4]> {
     let b = std::fs::read(path).ok()?;
     Some([b[0], b[1], b[2], b[3]])
@@ -144,12 +136,11 @@ fn magic(path: &Path) -> Option<[u8; 4]> {
 /// A `--provenance-out` ENDING IN `.parquet` IS REFUSED, AND THE TARGET IS LEFT
 /// ALONE.
 ///
-/// This is the exact failure that cost the calibration: the run wrote JSON over
-/// a parquet file. Two things are asserted, and only together do they close the
-/// hole — the run fails, AND the pre-existing parquet is still readable as
-/// parquet afterwards. A guard that merely refused to write would leave the
-/// wrong verdict (this is a legal path shape) and a guard that merely wrote
-/// would leave the file destroyed.
+/// Two things are asserted, and only together do they close the hole — the run
+/// fails, AND the pre-existing parquet is still readable as parquet afterwards.
+/// A guard that merely refused to write would leave the wrong verdict (this is
+/// a legal path shape) and a guard that merely wrote would leave the file
+/// destroyed.
 #[test]
 fn a_provenance_out_ending_in_parquet_is_refused_and_writes_nothing() {
     let (bam, pool, emission) = prepared("provparquet");
@@ -213,25 +204,13 @@ fn a_provenance_out_equal_to_output_is_refused() {
 /// A `--provenance-out` NAMED AT THE PER-TRANSCRIPT TIER SIDECAR IS REFUSED,
 /// AND THE SIDECAR SURVIVES AS PARQUET.
 ///
-/// This is the shape that reached the frozen calibration run: the user named
-/// the tier table, and 654 bytes of JSON replaced it.
+/// The run fails here at the FIRST guard — the `.parquet`-extension check —
+/// because every `.parquet` path is refused before the build starts. So this
+/// test cannot say which of the two guards the SECOND call would have fired,
+/// and asserts the PROPERTY (refused, sidecar intact) rather than the message.
 ///
-/// ## WHICH OF THE TWO GUARDS FIRES
-///
-/// The run fails here at the FIRST call — the `.parquet`-extension check —
-/// because the tier sidecar is always named `<stem>.provenance.parquet` and
-/// every `.parquet` path is refused before the build starts. So this test
-/// cannot say which of the two guards the SECOND call would have fired, and
-/// asserts the PROPERTY (refused, sidecar intact) rather than the message.
-///
-/// ⚠ THIS PARAGRAPH USED TO GO ON: "the collision check between
-/// `build_emission_from_anchors` and the write is defence in depth that this
-/// input cannot reach". That was FALSE, and the symlink case below is what
-/// makes it false in writing: `same_file_or_path` canonicalises, canonicalise
-/// RESOLVES SYMLINKS, and `refuse_a_provenance_path_that_clobbers_a_table`
-/// checks collision BEFORE extension — so a symlink at the sidecar path
-/// pointing at the `--provenance-out` path makes the second call fire on the
-/// collision branch.
+/// A symlink at the sidecar path pointing at the `--provenance-out` path is
+/// what makes the second, collision guard reachable.
 #[test]
 fn a_provenance_out_named_at_the_tier_sidecar_is_refused_and_the_sidecar_survives() {
     let (bam, pool, emission) = prepared("provtiers");
@@ -264,13 +243,11 @@ fn a_provenance_out_named_at_the_tier_sidecar_is_refused_and_the_sidecar_survive
 /// A SYMLINK AT THE TIER SIDECAR PATH PUTS THE SECOND GUARD ON THE LIVE PATH,
 /// AND IT FIRES ON THE COLLISION BRANCH — not on the extension check.
 ///
-/// This is the fixture that pins, rather than argues, the reachability claim
-/// the module doc used to get wrong ("the collision check is defence in depth
-/// that this input cannot reach"). It is reachable, and the mechanism is
-/// `same_file_or_path`: it `canonicalize`s both sides, `canonicalize` is
-/// `realpath(3)` and RESOLVES SYMLINKS, and `refuse_a_provenance_path_that_
-/// clobbers_a_table` checks the collision BEFORE the extension. So when the
-/// sidecar path is a symlink pointing at the `--provenance-out` path:
+/// The mechanism is `same_file_or_path`: it `canonicalize`s both sides,
+/// `canonicalize` is `realpath(3)` and RESOLVES SYMLINKS, and
+/// `refuse_a_provenance_path_that_clobbers_a_table` checks the collision
+/// BEFORE the extension. So when the sidecar path is a symlink pointing at the
+/// `--provenance-out` path:
 ///
 ///   * the extension check cannot fire — `prov` is `header.json`, not `.parquet`;
 ///   * the collision check fires, because both paths canonicalise to the same

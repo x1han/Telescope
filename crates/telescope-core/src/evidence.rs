@@ -1,14 +1,12 @@
-//! Module 2: Transcriptome Evidence Extractor
+//! Module: Transcriptome Evidence Extractor
 //!
-//! Streams a minimap2 transcriptome BAM (AIDRS-aligned), extracts Dorado `pt:i`
-//! poly(A) tail length per record plus per-candidate alignment evidence (`AS:i`,
-//! `NM:i`, MAPQ), filters by 3' TES proximity, and constructs a flat indexed
-//! candidate graph for TEL-EM (Module 3).
+//! Streams a transcriptome BAM, extracts Dorado `pt:i` poly(A) tail length per
+//! record plus per-candidate alignment evidence (`AS:i`, `NM:i`, MAPQ), filters
+//! by 3' TES proximity, and constructs a flat indexed candidate graph for the
+//! downstream EM solver.
 //!
-//! Input contract (spec v0.1.6 F1): one BAM file, AIDRS-aligned transcriptome
-//! BAM carrying `pt:i` tag per record. No Dorado BAM dependency.
-//!
-//! Source spec: `workspace/specs/telescope-v0.1.6.md` §Module 2.
+//! Input contract: one BAM file, transcriptome-aligned, carrying a `pt:i` tag
+//! per record.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -21,8 +19,7 @@ use noodles_sam::alignment::record::data::field::Tag;
 use noodles_sam::alignment::Record as _;
 
 /// Dorado poly(A) tail length SAM tag: `pt:i`. The default for
-/// `PolyASource::BamTag`, and the tag every BAM in the 10-sample cohort
-/// carries on ~97% of records.
+/// `PolyASource::BamTag`.
 const TAG_PT: Tag = Tag::new(b'p', b't');
 
 /// minimap2 alignment score SAM tag: `AS:i` (primary; drives Module 3's A_rk).
@@ -42,36 +39,9 @@ pub struct MoleculeEvidence {
     pub candidate_count: u16,
 }
 
-/// Compact memory graph containing all reads and a flattened pool of
-/// transcript candidate IDs (one slice per molecule), plus the per-candidate
-/// alignment evidence in lockstep parallel pools. Designed for zero-copy
-/// downstream consumption by Module 3.
-///
-/// Layout invariant (all five pools): `candidate_pool`, `candidate_as`,
-/// `candidate_nm`, `candidate_mapq` and `candidate_5p_gap` are molecule-major /
-/// candidate-minor concatenations of identical length. A molecule owns the
-/// range `[candidate_offset, candidate_offset + candidate_count)` in *each* of
-/// them; index `candidate_pool[o + c]` and `candidate_as[o + c]` describe the
-/// same (read, transcript) pair. A MISSING `extend` in the cohort path
-/// (`resolver::pool_evidence_graphs`) desynchronises a pool from
-/// `candidate_pool` and reads it from the wrong BAM's coordinate frame. Both
-/// sites are now guarded by an UNCONDITIONAL `assert_eq!` (promoted from
-/// `debug_assert_eq!` on 2026-10-08), so a desynchronised pool aborts instead
-/// of producing a wrong 5' gap in a release build.
 /// Record-level accounting for the filters in `extract_evidence_with`.
 ///
-/// WHY A LEDGER AND NOT A COUNTER
-/// ------------------------------
-/// The expert ruling (2026-10-06, Q5) asked for a counter of records lost
-/// during evidence extraction, to be exposed as statistics. The first draft of
-/// that work put the counter at the `entry.candidates.is_empty()` guard, which
-/// turns out to be **structurally unreachable**: an entry is only ever created
-/// by `or_insert_with` immediately before a `push`, with no `continue` or
-/// `return` in between, so every entry has `candidates.len() >= 1` forever. A
-/// counter there would have read 0 for every input, which is worse than no
-/// counter -- it would have been reported as a measurement.
-///
-/// A single counter is also not enough. This function drops records at SIX
+/// WHY A LEDGER AND NOT A COUNTER. This function drops records at SIX
 /// distinct sites, and a count of only the largest one leaves a residual that
 /// no reader can attribute: it is indistinguishable from a bug. So this is a
 /// closed ledger, not a tally -- `ledger_deficit()` is asserted to be 0 inside
@@ -79,16 +49,14 @@ pub struct MoleculeEvidence {
 /// site FAIL LOUDLY at the point it is added instead of quietly skewing one
 /// number forever.
 ///
-/// SCOPE, stated precisely because it is easy to over-claim
-/// -------------------------------------------------------
-/// These are RECORD counts, not read counts and not candidate counts. One read
-/// contributes 1 record per alignment it has, so `records_entered` exceeds the
-/// molecule count and `dropped_tes_window` is a property of alignments, not of
-/// molecules. The record-level `records_with_candidates` is NOT the molecule
-/// count either: the push below is a MERGE, so a second record for the same
-/// (read, transcript) contributes 1 here and 0 new molecules. The candidate
-/// conservation law lives in `em::CandidateLedger`, which is a different and
-/// finer-grained accounting at a different stage.
+/// SCOPE, stated precisely because it is easy to over-claim. These are RECORD
+/// counts, not read counts and not candidate counts. One read contributes 1
+/// record per alignment it has, so `records_entered` exceeds the molecule
+/// count. The record-level `records_with_candidates` is NOT the molecule count
+/// either: the push is a MERGE, so a second record for the same (read,
+/// transcript) contributes 1 here and 0 new molecules. The candidate
+/// conservation law lives in the EM solver's own candidate ledger, which is a
+/// different and finer-grained accounting at a different stage.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FilterCounts {
     /// Every record read from the BAM, before any filter. The LHS of the
@@ -145,6 +113,20 @@ impl FilterCounts {
     }
 }
 
+/// Compact memory graph containing all reads and a flattened pool of
+/// transcript candidate IDs (one slice per molecule), plus the per-candidate
+/// alignment evidence in lockstep parallel pools.
+///
+/// Layout invariant (all five pools): `candidate_pool`, `candidate_as`,
+/// `candidate_nm`, `candidate_mapq` and `candidate_5p_gap` are molecule-major /
+/// candidate-minor concatenations of identical length. A molecule owns the
+/// range `[candidate_offset, candidate_offset + candidate_count)` in *each* of
+/// them; index `candidate_pool[o + c]` and `candidate_as[o + c]` describe the
+/// same (read, transcript) pair. A MISSING `extend` in the cohort path
+/// (`resolver::pool_evidence_graphs`) desynchronises a pool from
+/// `candidate_pool` and reads it from the wrong BAM's coordinate frame. Both
+/// sites are guarded by an UNCONDITIONAL `assert_eq!`, so a desynchronised pool
+/// aborts instead of producing a wrong 5' gap in a release build.
 #[derive(Debug)]
 pub struct FlatEvidenceGraph {
     pub molecules: Vec<MoleculeEvidence>,
@@ -154,27 +136,24 @@ pub struct FlatEvidenceGraph {
     /// contributes 0, which only leaves A_rk uniform when EVERY candidate of
     /// that read is tag-less (see the fallback semantics in `extract_evidence`).
     pub candidate_as: Vec<i32>,
-    /// Edit distance `NM:i` per candidate (audit only; not used by TEL-EM).
+    /// Edit distance `NM:i` per candidate (audit only; not used by the EM
+    /// solver).
     pub candidate_nm: Vec<i32>,
-    /// Mapping quality per candidate (audit only; not used by TEL-EM).
+    /// Mapping quality per candidate (audit only; not used by the EM solver).
     pub candidate_mapq: Vec<u8>,
     /// Observed 5' gap `g_k` per candidate, in the candidate transcript's own
     /// cDNA coordinates: the number of transcript bases 5' of the read's 5' end
     /// in its best alignment to that candidate.
     ///
     /// NO strand correction is performed, and none is needed: transcriptome
-    /// alignments are forward by construction, and `extract_evidence` now
-    /// REFUSES any reverse-strand record rather than reading it as forward. An
-    /// earlier version of this comment claimed the gap was "strand-corrected at
-    /// extraction"; no such code has ever existed in this crate -- `FLAG & 0x10`
-    /// was not read anywhere. Consumers still never see a strand flag, but the
-    /// reason is the guard, not a correction.
+    /// alignments are forward by construction, and `extract_evidence` REFUSES
+    /// any reverse-strand record rather than reading it as forward.
     ///
-    /// Consumed by Module 3's 5'-anchoring term `ln_5p_k = β if g_k ≤ window`.
-    /// It is FIXED per (read, candidate) — exactly like `AS` — so it is computed
-    /// once here rather than per EM iteration; in the E-step it reduces to one
-    /// `u32` compare and an add of a constant. It is a prior, not an EM
-    /// parameter, and must never be folded into an accumulator.
+    /// Consumed by the EM solver's 5'-anchoring term `ln_5p_k = β if g_k ≤
+    /// window`. It is FIXED per (read, candidate) — exactly like `AS` — so it
+    /// is computed once here rather than per EM iteration; in the E-step it
+    /// reduces to one `u32` compare and an add of a constant. It is a prior,
+    /// not an EM parameter, and must never be folded into an accumulator.
     pub candidate_5p_gap: Vec<u32>,
     pub transcript_names: Vec<String>,
     /// PROVENANCE, not measurement: true iff this graph was built with
@@ -182,12 +161,9 @@ pub struct FlatEvidenceGraph {
     /// rather than an observed tail length.
     ///
     /// This is a property of the GRAPH, not of a molecule, which is why it is
-    /// one bool here and not `Option<f32>` on `MoleculeEvidence`. The
-    /// distinction is the whole point: `Option<f32>` would double the
-    /// per-molecule field and have to be threaded through the flat pools,
-    /// while this is O(1) on the struct (a handful of Vec handles, not
-    /// per-read data) and touches no Parquet schema, because
-    /// `FlatEvidenceGraph` is never serialised.
+    /// one bool here and not `Option<f32>` on `MoleculeEvidence`: it is O(1) on
+    /// the struct and touches no Parquet schema, because `FlatEvidenceGraph`
+    /// is never serialised.
     ///
     /// It exists so `em::solve_and_write_profile` can refuse the combination
     /// that is silently wrong: a placeholder graph at `poly_a_weight > 0`
@@ -205,18 +181,16 @@ pub struct FlatEvidenceGraph {
 /// Where per-read poly(A) length comes from.
 ///
 /// `pt:i` is Dorado's native tail-length tag, so it is the default and it is
-/// what every BAM in the 10-sample cohort carries (~97% of records). It is a
-/// basecaller-specific tag, and a BAM re-aligned from a producer that does not
-/// emit it has no `pt:i` at all; before this type existed that case produced an
-/// EMPTY GRAPH and exit code 0: every record dropped at the tag read, with
-/// nothing to distinguish "this BAM has no poly(A)" from "this sample has no
-/// reads". That is the fail-quiet path the 2026-10-02 ruling ordered destroyed,
-/// and `PolyASource::None` is the only sanctioned answer to it now.
+/// what every BAM in the 10-sample cohort carries. It is a basecaller-specific
+/// tag, and a BAM re-aligned from a producer that does not emit it has no
+/// `pt:i` at all; before this type existed that case produced an EMPTY GRAPH
+/// and exit code 0: every record dropped at the tag read, with nothing to
+/// distinguish "this BAM has no poly(A)" from "this sample has no reads". That
+/// is the fail-quiet path `PolyASource::None` exists to answer.
 ///
-/// A third variant, `Tsv` (`read_id<TAB>poly_a_len`, the tailfindr / nanopolish
-/// side-file shape), existed until the 2026-10-03 deletion. It was removed as a
-/// physical deletion, not deprecated: `--polyA-source tsv:<path>` is now a parse
-/// error, not a warning.
+/// A third variant, `Tsv` (`read_id<TAB>poly_a_len`), existed once and was
+/// removed as a physical deletion, not deprecated: `--polyA-source tsv:<path>`
+/// is now a parse error, not a warning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolyASource {
     /// Read a two-character SAM tag from each record. `None` on a record is a
@@ -236,25 +210,22 @@ pub enum PolyASource {
     ///
     /// It must be FINITE, and the obvious alternative is not. `log2(0)` is
     /// `-inf`, and `poly_a_weight = 0` does not protect the M-step from that:
-    /// `em.rs` multiplies the Gaussian in the E-step only (`em.rs:508`), while
-    /// `y` reaches the S1/S2 accumulators (`accum_w_y`, `accum_w_y2`)
-    /// unconditionally. A single read at `y = -inf` sends `mu` to `-inf` and
-    /// `sigma2` to NaN for its transcript. `0.0` is finite and survives that
-    /// path; it still biases `mu` toward the origin, which is a known and
-    /// accepted cost of an alignment-only run, not a corruption.
+    /// the Gaussian is multiplied in the E-step only, while `y` reaches the
+    /// S1/S2 accumulators unconditionally. A single read at `y = -inf` sends
+    /// `mu` to `-inf` and `sigma2` to NaN for its transcript. `0.0` is finite
+    /// and survives that path; it still biases `mu` toward the origin, which is
+    /// a known and accepted cost of an alignment-only run, not a corruption.
     None,
 }
 
 /// Parse the `--polyA-source` CLI value into a [`PolyASource`].
 ///
-/// Two forms, exactly as the expert ruling specifies them:
-///   `bam_tag:<TAG>` Dorado's native tail-length tag (the historical default)
+/// Two forms:
+///   `bam_tag:<TAG>` Dorado's native tail-length tag (the default)
 ///   `none`          declared-absent; alignment-only, `poly_a_weight` forced 0
 ///
 /// The tag is a parameter rather than the literal `pt` so a re-basecaller that
-/// emits a different tag can be used without a code change — but the ruling
-/// names `pt`, and that is the default, because it is the tag the 10-sample
-/// cohort actually carries.
+/// emits a different tag can be used without a code change.
 pub fn parse_poly_a_source(spec: &str) -> Result<PolyASource> {
     let spec = spec.trim();
     if spec == "none" {
@@ -273,17 +244,15 @@ pub fn parse_poly_a_source(spec: &str) -> Result<PolyASource> {
 }
 
 /// Number of records scanned before deciding a poly(A) source is globally
-/// absent. The ruling specifies 10,000; it is a sampling depth, not a
-/// threshold on the data.
+/// absent. This is a sampling depth, not a threshold on the data.
 const POLY_A_PROBE_RECORDS: usize = 10_000;
 
 /// Parse the transcriptome BAM and emit the candidate graph, reading poly(A)
 /// from Dorado's native `pt:i` tag.
 ///
-/// Equivalent to `extract_evidence_with(.., &PolyASource::BamTag(TAG_PT))`,
-/// and **fails** rather than returning an empty graph when no record in the
-/// first [`POLY_A_PROBE_RECORDS`] carries the tag. Callers that want a
-/// different source, or none, use `extract_evidence_with`.
+/// Equivalent to `extract_evidence_with(.., &PolyASource::BamTag(TAG_PT))`, and
+/// **fails** rather than returning an empty graph when no record in the first
+/// [`POLY_A_PROBE_RECORDS`] carries the tag.
 pub fn extract_evidence<P: AsRef<Path>>(
     bam_path: P,
     tes_slack: usize,
@@ -302,9 +271,8 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
     let mut reader = bam::io::Reader::new(BufReader::new(file));
     let header = reader.read_header().context("Failed to read BAM header")?;
 
-    // Build transcript name index + target length table.
-    // `reference_sequences()` returns an ordered map keyed by ReferenceSequenceId;
-    // iteration order matches `@SQ` lines in the header (deterministic).
+    // Build transcript name index + target length table. `reference_sequences()`
+    // iterates in header order, so the order is deterministic.
     let mut transcript_names: Vec<String> = Vec::new();
     let mut transcript_lengths: Vec<usize> = Vec::new();
 
@@ -332,10 +300,7 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
     }
     // Records seen and records carrying poly(A), for the global-absence guard.
     // Both guards below are keyed on `hits == 0`, and the `None` arm reports a
-    // hit on every record, so neither can fire on an alignment-only run. That
-    // is a property of the `None` arm's value, not a separate exemption --
-    // which is why there is no `expect_measurement` flag here. An earlier
-    // version had one, and it was dead: a mutation removing it stayed green.
+    // hit on every record, so neither can fire on an alignment-only run.
     let mut poly_a_records_seen: u64 = 0;
     let mut poly_a_hits: u64 = 0;
 
@@ -346,30 +311,14 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
 
     // Temporary per-read accumulator.
     //
-    // MEMORY (COPD29, 16.4 GB BAM): adding A_rk moved peak RSS 2.99 GB → ~4.1 GB.
-    // That growth is transient co-existence, not a leak — the peak is inside
-    // `extract_evidence`, while this `read_map` is live and growing the flat
-    // pools below it are growing too. `CandidateAlign` is `{u32, i32, i32, u8,
-    // u32}` = 20 B with padding, versus the bare `u32` (4 B) this vector held
-    // before F-EM-4; at ~4.9 candidates/read and a doubling capacity of 8 that
-    // is ~3.9 M entries, plus malloc headers and alignment on ~3.9 M entries,
-    // plus doubling slack on the four evidence pools below, plus arena
-    // fragmentation across 11.7 M allocations — ~0.7–1.1 GB, consistent with
-    // the observed increase.
+    // MEMORY: adding the per-candidate alignment evidence moved peak RSS on a
+    // 16.4 GB BAM from 2.99 GB to ~4.1 GB. That growth is transient
+    // co-existence, not a leak -- the peak is inside `extract_evidence`, while
+    // this map is live and the flat pools below it are growing too.
     //
-    // The RSS figures quoted in this block were MEASURED on the four-field
-    // (16 B) `CandidateAlign` / four-pool layout. The 5th pool and the 5th
-    // struct field post-date them: they add 4 B per candidate in `read_map`
-    // (~16 MB at ~3.9 M entries) and 4 B per candidate in each pool (~74 MB at
-    // 18,601,634 candidates). Those are ARITHMETIC PROJECTIONS, not
-    // measurements — re-derive the totals from a fresh `/usr/bin/time -v` run
-    // before quoting them as measured. The trailing `u32` is placed last so it
-    // does not disturb the field order the measured figures assumed; under
-    // `repr(Rust)` reordering to save padding is not guaranteed anyway.
-    //
-    // `candidate_nm` / `candidate_mapq` are retained deliberately: the expert
-    // reviewers required MAPQ/NM for audit. A struct-of-slots refactor would
-    // remove most of the per-entry padding and is out of scope here.
+    // `candidate_nm` / `candidate_mapq` are retained deliberately: MAPQ and NM
+    // are required for audit. A struct-of-slots refactor would remove most of
+    // the per-entry padding and is out of scope here.
     struct TempReadEntry {
         poly_a_len: i32,
         candidates: Vec<CandidateAlign>,
@@ -381,11 +330,10 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
     // `gap5p` rides along with the AS winner for free: the merge below is a
     // whole-struct `*existing = align`, so a repeat alignment to the same
     // transcript replaces this slot wholesale. That is what makes it the
-    // *best* alignment's 5' gap rather than the first-seen record's — "the
-    // read's best alignment TO CANDIDATE k" is the max-AS record, not the
-    // 5'-closest one. On an exact AS tie the merge uses strict `>`, so the
-    // first-seen record in BAM order wins; that is deterministic but arbitrary,
-    // and it is the same tie-break that already decides `as_score`/`nm`/`mapq`.
+    // *best* alignment's 5' gap rather than the first-seen record's. On an
+    // exact AS tie the merge uses strict `>`, so the first-seen record in BAM
+    // order wins; that is deterministic but arbitrary, and it is the same
+    // tie-break that already decides `as_score`/`nm`/`mapq`.
     struct CandidateAlign {
         tx_id: u32,
         as_score: i32,
@@ -405,29 +353,20 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
             fc.dropped_unmapped += 1;
             continue;
         }
-        // REVERSE-STRAND GUARD (P1, 2026-10-10).
+        // REVERSE-STRAND GUARD.
         //
-        // Nothing downstream of this loop reads a strand flag, and nothing in
-        // `crates/` ever reads `FLAG & 0x10` -- that was checked by grep, and
-        // the only hit was a test fixture SETTING the bit. Two doc comments
-        // (here and in `em.rs`) claimed the 5' gap was "strand-corrected at
-        // extraction"; no such code exists.
+        // Nothing downstream of this loop reads a strand flag, and no code in
+        // this crate reads `FLAG & 0x10`. Transcriptome alignments are forward
+        // by construction, but that is a property of the DATA, not of the
+        // CODE, and it is exactly the kind of property that stops holding the
+        // moment the tool is pointed at a genome BAM.
         //
-        // That has been harmless so far only because transcriptome alignments
-        // are forward by construction. Measured on HC2's full scan: mapped
-        // 37,714,800, **reverse 0**, supplementary 25,077, secondary
-        // 32,517,774. So the missing correction has never had anything to
-        // correct. That is a property of the DATA, not of the CODE, and it is
-        // exactly the kind of property that stops holding the moment someone
-        // points the tool at a genome BAM.
-        //
-        // Hence a hard failure rather than a silent pass. If a reverse record
-        // ever appears, `gap5p = start_pos - 1` on cDNA coordinates is computed
-        // from an orientation the rest of the pipeline does not model, and the
-        // resulting `g_k` would feed Module 3's 5'-anchoring term as if it were
-        // meaningful. Refusing the input is the only outcome that is correct
-        // without a strand model, and it converts a silent wrong answer into a
-        // loud stop. `is_reverse()` is `FLAG & 0x10`.
+        // Hence a hard failure rather than a silent pass. `gap5p = start_pos
+        // - 1` on cDNA coordinates would be computed from an orientation the
+        // rest of the pipeline does not model, and the resulting `g_k` would
+        // feed the 5'-anchoring term as if it were meaningful. Refusing the
+        // input is the only outcome that is correct without a strand model.
+        // `is_reverse()` is `FLAG & 0x10`.
         if flags.is_reverse_complemented() {
             let qname = match record.name() {
                 Some(name) => String::from_utf8_lossy(name).to_string(),
@@ -445,14 +384,13 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
         }
         // SUPPLEMENTARY (`FLAG & 2048`) records are DROPPED, not merged.
         //
-        // SAM semantics, stated correctly (an earlier version of this file's
-        // test had them backwards): the CIGAR is always written in the
-        // molecule's own 5'->3' order, so a LEADING hard clip means "this
-        // record starts `H` bases into the read" -- i.e. the read's 5' portion
-        // is NOT aligned here and this record is the molecule's **3'** segment.
-        // A TRAILING hard clip means the opposite: the molecule's **5'** segment,
-        // whose 3' remainder lives in another record. A leading `H` is
-        // therefore evidence AGAINST a record being the 5' source, never for.
+        // SAM semantics: the CIGAR is always written in the molecule's own
+        // 5'->3' order, so a LEADING hard clip means "this record starts `H`
+        // bases into the read" -- i.e. the read's 5' portion is NOT aligned
+        // here and this record is the molecule's **3'** segment. A TRAILING
+        // hard clip means the opposite: the molecule's **5'** segment, whose 3'
+        // remainder lives in another record. A leading `H` is therefore
+        // evidence AGAINST a record being the 5' source, never for.
         //
         // Dropping is the right call and it is what NanoCount, Salmon and
         // IsoQuant do. Merging segments is unsound here for three reasons:
@@ -463,33 +401,8 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
         // `reference_start` carries no query offset, so "which segment is 5'"
         // cannot be recovered reliably from a transcriptome BAM alone.
         //
-        // MEASURED, not assumed, and the measurement is not uniform across the
-        // three input modes. Every row below is the `trans_align/` BAM that
-        // Telescope actually consumes, re-measured 2026-10-04:
-        //
-        //   AIDRS    trans_align/HC2.sorted.bam    27,189,952 records 24,678 supp (0.091%)
-        //   AIDRS    trans_align/COPD29.sorted.bam 21,565,325 records 29,220 supp (0.135%)
-        //   Bambu    COPD52.sorted.bam            29,658,736 records 82,080 supp (0.28%)
-        //   IsoQuant HC30.sorted.bam              25,344,489 records 53,116 supp (0.21%)
-        //
-        // Reproduce:
-        //   samtools view -c <bam>          # total
-        //   samtools view -c -f 2048 <bam>  # supplementary
-        //
-        // RETRACTED (2026-10-04). This table previously cited
-        // `aidrs_pipeline/nanocount/{HC2,COPD29}.bam` -- "8,016,260 records,
-        // 0 supp" -- and concluded the filter was a NO-OP for the AIDRS path.
-        // That was wrong twice over. The figures came from a DIFFERENT BAM: the
-        // `nanocount/` alignments, not the `trans_align/` ones Telescope reads
-        // (the same two-BAM conflation that made the shipped NanoCount TSVs
-        // unusable as a comparison arm). Measured on the real input, the AIDRS
-        // path DOES carry supplementary records, at ~0.1%.
-        //
-        // So this filter is a small live correction on all three paths, not
-        // defence in depth for AIDRS. It is larger on the Bambu (F1) and
-        // which do carry supplementary records at ~0.2-0.3% of alignments. The
-        // expert ruling that required this filter was right, and its priority
-        // is F1/F2 rather than the path being developed today.
+        // The filter is a small live correction on every input path, not
+        // defence in depth: supplementary records are ~0.1-0.3% of alignments.
         if flags.is_supplementary() {
             fc.dropped_supplementary += 1;
             continue;
@@ -497,26 +410,20 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
 
         // Counted for EVERY record that survives the flag filters, BEFORE the
         // poly(A) lookup. Counting only the records where a value was found
-        // would make the global-absence guard unsatisfiable: `hits` and
-        // `seen` would rise together and the "seen but no hits" state could
-        // never be observed. That mistake was made once already in this
-        // function's history, in the shape of an empty graph and exit 0.
+        // would make the global-absence guard unsatisfiable: `hits` and `seen`
+        // would rise together and the "seen but no hits" state could never be
+        // observed.
         poly_a_records_seen += 1;
 
         // GLOBAL-ABSENCE GUARD, in-loop form. Sampled over the first
         // POLY_A_PROBE_RECORDS records so a BAM with no poly(A) fails at record
         // 10,000 instead of at end-of-stream on a 27 M-record file.
         //
-        // IT MUST SIT HERE, ABOVE THE LOOKUP. It used to sit below it, and was
-        // therefore dead code: every arm of the `match` below `continue`s on a
-        // record with no poly(A), and `poly_a_hits` is incremented by the same
-        // statement that survives those `continue`s. So reaching the old check
-        // implied `hits >= 1`, making `hits == 0` unsatisfiable -- a guard that
-        // could not fire, wrapped in a comment claiming it did. Mutation
-        // confirmed it: neutering it left the suite fully green.
-        //
-        // Checked BEFORE the lookup, `hits` reflects records 1..POLY_A_PROBE_RECORDS-1
-        // only, so a BAM whose poly(A) starts late is caught here.
+        // IT MUST SIT HERE, ABOVE THE LOOKUP. Below the lookup it is dead
+        // code: every arm of the `match` below `continue`s on a record with no
+        // poly(A), and `poly_a_hits` is incremented by the same statement that
+        // survives those `continue`s -- so reaching the check implies
+        // `hits >= 1`, making `hits == 0` unsatisfiable.
         if poly_a_records_seen as usize == POLY_A_PROBE_RECORDS && poly_a_hits == 0 {
             let spec = match poly_a {
                 PolyASource::BamTag(t) => {
@@ -601,38 +508,19 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
         // immediately above `let entry = read_map.entry(read_id)`, i.e. after
         // the LAST exit in the record loop. That placement is the whole point.
         //
-        // HISTORY, because the wrong version of this comment is instructive.
-        // The increment used to sit HERE -- right after the last counted filter
-        // -- on the claim that "from this point to the push there is no
-        // `continue`, `return`, or `?` (checked by reading the whole span)".
-        // THAT CLAIM WAS FALSE. There was one: `record.name() -> None =>
-        // continue`, downstream of this line. A nameless record was therefore
-        // counted as one that had reached the candidate push, the ledger
-        // identity still balanced, `ledger_deficit()` returned 0, and the
-        // record was lost with no counter anywhere recording the loss -- a
-        // silent drop behind a guard that looked total. Found 2026-10-14 by
-        // building the BAM it takes; see R93.
-        //
-        // The three malformed-record exits in this loop are :570 (`refID`),
-        // :577 (`pos`) and :642 (`name`). All three are now upstream of the
-        // RHS term, so any of them lands on the LHS alone and trips the
-        // assertion at the end of the stream. Three `#[should_panic]` tests
-        // pin that: `..._with_no_reference_sequence_id`,
-        // `..._with_no_alignment_start`, `..._with_no_read_name`.
+        // INVARIANT, and it is the one a future edit can break: there must be
+        // no `continue`, `return`, `?`, `bail!` or early `panic!` between the
+        // increment and the `candidates.push` below. If you add one, move the
+        // increment past it in the same commit -- otherwise a record is
+        // counted as delivered and then lost, with the ledger still balancing
+        // and no counter recording the loss.
         //
         // WHY THIS IS NOT A SCHEMA CHANGE. `FilterCounts`' field list is
         // untouched -- no bucket was added, nothing downstream of Schema v1
         // sees a new field. What moved is the MEANING of one existing counter,
         // from "passed every filter" to "actually produced a candidate". The
         // second is the field's literal name, and it is the only placement
-        // from which all three exits are upstream.
-        //
-        // INVARIANT, and it is the one a future edit can break: there must be
-        // no `continue`, `return`, `?`, `bail!` or early `panic!` between the
-        // increment and the `candidates.push` below. If you add one, move the
-        // increment past it in the same commit -- otherwise you have reopened
-        // exactly this bug, and the three tests below will still be green
-        // because none of them can reach a site you added.
+        // from which every exit is upstream.
 
         // 3. Observed 5' gap `g_k`, in this candidate's own cDNA coordinates.
         //
@@ -642,28 +530,15 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
         //    genomic conversion is involved, and none is wanted.
         //
         //    STRAND — KNOWN GAP, NOT HANDLED. The frozen spec was validated on
-        //    a FORWARD-ONLY population: the prototype that produced the 58.34%
-        //    directionality figure skips reverse records outright
-        //    (`if a.is_reverse: continue` in `proto_five_prime.py`). Measured
-        //    over 200,000 mapped records in each of the three BAMs this project
-        //    actually runs (AIDRS, Bambu, IsoQuant), the reverse fraction is
-        //    0.0000, so on today's data this is dead code either way.
-        //
-        //    An earlier version branched here to `T_k − ref_end` for reverse
-        //    records. That was removed: the TES filter above runs first and is
-        //    strand-blind, so every surviving reverse read satisfies
-        //    `ref_end + tes_slack >= ref_len`, forcing `T_k − ref_end <=
-        //    tes_slack` (= 35). With `five_prime_window = 20` the term would
-        //    degenerate into "did `ref_end` land in the top 20 bp of a band the
-        //    filter already chose", and it would be unvalidated in any case.
-        //    If the Bambu/IsoQuant general path (Phase F1/F2) ever carries
-        //    antisense alignments, this needs a separately validated
-        //    definition — it must not be reintroduced as an inline guess.
+        //    a FORWARD-ONLY population, and reverse records are REFUSED above
+        //    rather than handled here. If a general path ever carries antisense
+        //    alignments, this needs a separately validated definition -- it
+        //    must not be reintroduced as an inline guess.
         //
         //    noodles' `alignment_start()` is 1-BASED, so this is already
         //    exactly the spec's `s_k − 1`; do NOT subtract a second 1 (the
         //    spec's "1-based reference_start" is bait for rust-htslib, whose
-        //    `reference_start()` is 0-based — this crate does not use it).
+        //    `reference_start()` is 0-based -- this crate does not use it).
         let gap5p: u32 = u32::try_from(start_pos.saturating_sub(1)).unwrap_or(u32::MAX);
 
         // 4. Read name (QNAME).
@@ -672,8 +547,8 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
             None => continue,
         };
 
-        // 5. Alignment evidence. `AS:i` is the primary signal consumed by
-        //    Module 3's A_rk term; `NM:i` and MAPQ are retained for audit.
+        // 5. Alignment evidence. `AS:i` is the primary signal consumed by the
+        //    EM solver's A_rk term; `NM:i` and MAPQ are retained for audit.
         //    A missing / non-integer tag falls back to 0. That is neutral ONLY
         //    when EVERY candidate of the read is tag-less: `max_j AS_rj` is then
         //    also 0, `ln A_rk ≡ 0`, and A_rk is uniform and independent of λ.
@@ -681,33 +556,12 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
         //    `ln A_rk = (0 − max_j AS_rj)/λ`, and the size of that penalty is
         //    what decides whether the candidate survives at all.
         //
-        //    Measured per-read max AS on the COPD29 BAM
-        //    (minimap2 2.28-r1209, `-ax map-ont`), 600k records:
-        //        genome-wide   p10 462   p50 1654   p90 4338   max 27978
-        //        PGAM1 pair                       p50 3206   p90 3338
-        //    At the SHIPPED default λ = 20 (was 1000 — see the provenance note
-        //    on `ALN_WEIGHT_LAMBDA_DEFAULT` in the CLI), the whole alignment
-        //    term spans only `[−ΔAS_prune/λ, 0] = [−2.5, 0]` nats, because
-        //    Module 3 prunes every candidate with `ΔAS > 50` before the term
-        //    can matter. Two consequences, and they replace the λ=1000
-        //    threshold analysis this block used to carry:
-        //
-        //      (a) A_rk alone can NEVER delete a candidate. The output stage
-        //          truncates `w < 0.01`, i.e. ≈ ln 99 = 4.595 nats of log-odds
-        //          against a single competitor, and reaching that costs
-        //          `ΔAS > 4.595·20 = 91.9` — already past the ΔAS > 50 prune,
-        //          so such a candidate never reaches the output stage at all.
-        //          A_rk's job at λ = 20 is therefore to ORDER candidates, not
-        //          to delete them. Under the old λ = 1000 the same threshold
-        //          was `max AS > 4595`, i.e. the top 10–12% of reads DID have
-        //          tag-less candidates deleted outright by A_rk alone.
-        //      (b) A tag-less candidate (AS → 0) now takes the maximum possible
-        //          penalty, −2.5 nats, on essentially every read (max AS ≫ 92
-        //          at the p10 of 462). It survives the cutoff unless a
-        //          competitor is also weak, but it can never be deleted by the
-        //          alignment term. Measured rate of records lacking `AS:i`:
-        //          0 of 600,000, so this remains a documentation caveat rather
-        //          than a live defect.
+        //    A_rk alone can never delete a candidate at the shipped λ = 20: the
+        //    output stage truncates `w < 0.01`, i.e. ≈ ln 99 = 4.595 nats of
+        //    log-odds against a single competitor, and reaching that costs
+        //    `ΔAS > 4.595·20 = 91.9` -- already past the ΔAS > 50 prune, so
+        //    such a candidate never reaches the output stage at all. A_rk's job
+        //    at λ = 20 is therefore to ORDER candidates, not to delete them.
         let as_score = match data
             .get(&TAG_AS)
             .and_then(|r| r.ok())
@@ -732,11 +586,10 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
         // Accumulate candidate transcripts per read. O(n) dedup per insert
         // is acceptable for typical ONT multimappers (≤10 candidates).
         //
-        // A repeated (read, transcript) pair — primary + supplementary, or two
-        // secondaries landing on the same transcript — must MERGE rather than
-        // be dropped: the record with the highest AS wins and its NM / MAPQ
-        // ride along. Losing the AS here would silently mis-assign A_rk to
-        // the wrong transcript.
+        // A repeated (read, transcript) pair must MERGE rather than be
+        // dropped: the record with the highest AS wins and its NM / MAPQ ride
+        // along. Losing the AS here would silently mis-assign A_rk to the
+        // wrong transcript.
         let tx_id = ref_id as u32;
         let align = CandidateAlign {
             tx_id,
@@ -749,9 +602,8 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
         // THE RHS TERM OF THE LEDGER IDENTITY. Everything above is computed;
         // everything below is bookkeeping. This is the LAST point in the loop
         // at which a record can still leave, so it is the only placement from
-        // which every exit (:570 refID, :577 pos, :642 read name) sits upstream
-        // and therefore lands on the LHS alone. See the long note above the
-        // filters for the history of the two earlier placements.
+        // which every exit (refID, pos, read name) sits upstream and therefore
+        // lands on the LHS alone.
         //
         // Counted here, the record has definitely produced a candidate: the
         // `match` immediately below either pushes a new entry or merges into an
@@ -797,57 +649,29 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
     // Flatten into `FlatEvidenceGraph`.
     //
     // MEMORY: reserve the five pools at their exact final length instead of
-    // growing them by `push`. The final length is not a guess — it is the total
-    // number of distinct (read, transcript) pairs accumulated above, and that
-    // total is knowable before a single element is pushed. Growing instead
-    // leaves 2^25 = 33,554,432 slots for the 18,601,634 candidates measured on
-    // the COPD29 BAM (3,906,840 reads, 4.76 candidates/read): 14.9 M unused
-    // slots × 17 B/pool element = 254 MB of slack, carried live for the whole
-    // of Module 3 on top of the 316 MB actually used. (The element size was
-    // 13 B across four pools — `u32 + i32 + i32 + u8` — before
-    // `candidate_5p_gap` added a fifth `u32`.)
+    // growing them by `push`. The final length is not a guess -- it is the
+    // total number of distinct (read, transcript) pairs accumulated above, and
+    // that total is knowable before a single element is pushed. Growing
+    // instead leaves doubling slack carried live for the whole downstream run,
+    // on top of the space actually used; measured end-to-end, reserving cut
+    // peak RSS by about 4% against push growth.
     //
-    // Measured end-to-end (`telescope quant` on that BAM, `/usr/bin/time -v`,
-    // 2 runs each, non-overlapping): peak RSS 3,844,148 and 3,876,884 KB with
-    // `push` growth → 3,712,644 and 3,675,896 KB reserved, i.e. −170 MB (−4.3%).
-    // `extract_evidence` on its own moves much less (2,273,924 → 2,254,228 KB)
-    // because `read_map` alone already reaches ~2,050 MB before the first pool
-    // element exists, and this loop drains `read_map` as it goes — so the pools
-    // never coexist with a full `read_map`. The win is the slack, which Module 3
-    // pays for the whole run. Shortening `read_map` itself is the remaining
-    // term and needs the map's per-read `Vec<CandidateAlign>` removed, which
-    // would also change the molecule emission order (HashMap iteration order →
-    // BAM order). Deliberately not done here.
-    //
-    // The RSS figures above were measured on the FOUR-pool layout. The fifth
-    // pool adds ~74 MB at that candidate count; that is arithmetic, not a
-    // measurement. Re-measure before quoting it as one.
+    // The win is the slack, which the downstream module pays for the whole
+    // run. Shortening `read_map` itself is the remaining term and needs the
+    // map's per-read `Vec<CandidateAlign>` removed, which would also change
+    // the molecule emission order (HashMap iteration order -> BAM order).
+    // Deliberately not done here.
     //
     // Guard on the estimate: the `is_empty` filter mirrors the `continue`
     // below, so the reserved capacity is an UPPER bound on what the loop
-    // pushes, never an over-allocation; a molecule whose candidates were all
-    // merged away contributes 0 to both sides. It is exact on this input (an
-    // entry is only ever created immediately before a `push`), and a
-    // hypothetical under-count would degrade to today's `push` growth rather
-    // than to a wrong graph.
+    // pushes, never an over-allocation.
     //
-    // CORRECTION (2026-10-06, Q5). The `continue` this filter "mirrors" is
-    // UNREACHABLE. An entry is only ever created by `or_insert_with` at the
-    // push site below, on a fresh `Vec::new()`, and the `match` that follows
-    // is straight-line: its `None` arm must run on the first record for that
-    // read, so every entry has `candidates.len() >= 1` permanently and
-    // `is_empty()` is always false. The reservation is still an upper bound
-    // (that holds a fortiori), so nothing above is invalidated -- but the
-    // filter is a no-op, and an earlier plan to put the Q5 record-loss counter
-    // on that guard would have produced a counter reading 0 for every input.
-    // See `FilterCounts`.
-    //
-    // NOTE: Module 3's `ΔAS > 50` prune deliberately does NOT run here. It
-    // needs the read's completed candidate list, so it cannot be applied in
-    // the per-record loop above; putting it here instead would leave every
-    // pool's `capacity()` an over-estimate of its `len()`, reversing the exact
-    // reservation measured above. It runs in the E-step as a `-inf` push,
-    // which is also where it stays switchable per run.
+    // NOTE: the downstream `ΔAS > 50` prune deliberately does NOT run here. It
+    // needs the read's completed candidate list, so it cannot be applied in the
+    // per-record loop above; putting it here instead would leave every pool's
+    // `capacity()` an over-estimate of its `len()`, reversing the exact
+    // reservation. It runs in the E-step as a `-inf` push, which is also where
+    // it stays switchable per run.
     let total_candidates: usize = read_map
         .values()
         .filter(|e| !e.candidates.is_empty())
@@ -865,19 +689,15 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
     // decides the order of `molecules`, which decides the order of the
     // `init_counts[tx_id] += share` accumulation in the E-step's alpha
     // initialisation, which is a FLOAT sum. Different addition order is a
-    // different rounding, so `alpha` came out ~6 ULP apart between two runs of
-    // the same command on the same input, which propagated into every posterior
-    // (538,127 of 1,347,285 weights differed, max 1.39e-15) and flipped the
-    // top-1 assignment of 10 reads in 689,052.
+    // different rounding, and it propagated into every posterior.
     //
     // Sorting by `read_id` removes the randomness. This changes the MODEL not
-    // at all — it fixes the order of an existing sum, so every value is one of
+    // at all -- it fixes the order of an existing sum, so every value is one of
     // the values the unordered version could already produce.
     //
-    // Do not "optimise" this away. Nothing downstream is order-sensitive by
-    // design, and this is the only thing making the emitted parquet
-    // bit-reproducible, which is what makes a regression gate able to compare
-    // md5s at all.
+    // Do not "optimise" this away. This is the only thing making the emitted
+    // parquet bit-reproducible, which is what makes a regression gate able to
+    // compare md5s at all.
     let mut entries: Vec<(String, TempReadEntry)> = read_map.into_iter().collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -897,29 +717,23 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
 
         molecules.push(MoleculeEvidence {
             read_id,
-            // `poly_a_len` is >= 1 on every path that reaches here (BamTag drops
-            // non-positive, Tsv rejects non-positive at load, and `None` is filled
-            // with 1 below), so this is finite. The guard is a cheap assertion that
-            // the three sources cannot be changed into a `-inf` source unnoticed: an
-            // infinite `y` propagates into the S1/S2 accumulators, which are outside
-            // the `poly_a_weight` gate.
+            // `poly_a_len` is >= 1 on every path that reaches here, so this is
+            // finite. The guard is a cheap assertion that the three sources
+            // cannot be changed into a `-inf` source unnoticed: an infinite `y`
+            // propagates into the S1/S2 accumulators, which are outside the
+            // `poly_a_weight` gate.
             log_pal: (entry.poly_a_len.max(1) as f32).log2(),
             candidate_offset,
             candidate_count,
         });
     }
 
-    // Lockstep invariant: the four alignment-evidence pools are index-aligned
-    // with `candidate_pool` (see `FlatEvidenceGraph`).
+    // Lockstep invariant: the alignment-evidence pools are index-aligned with
+    // `candidate_pool` (see `FlatEvidenceGraph`).
     //
-    // PROMOTED from `debug_assert_eq!` to `assert_eq!` by ruling 2026-10-08.
-    // The four pools and `candidate_pool` are each pushed once inside the same
-    // `for c in &entry.candidates` loop body above, so they are equal by
-    // construction on every path that reaches this point. An unconditional
-    // `assert_eq!` is already the established pattern in this function -- the
-    // ledger identity a few lines below is one -- so this adds a guard, not a
-    // new convention. As in `resolver.rs`, the failure mode is now a crash
-    // rather than silently misaligned evidence, which is the intended trade.
+    // UNCONDITIONAL `assert_eq!`, not `debug_assert_eq!`: the release profile
+    // compiles debug assertions out, and the failure mode should be a crash
+    // rather than silently misaligned evidence.
     assert_eq!(candidate_pool.len(), candidate_as.len());
     assert_eq!(candidate_pool.len(), candidate_nm.len());
     assert_eq!(candidate_pool.len(), candidate_mapq.len());
@@ -953,7 +767,7 @@ pub fn extract_evidence_with<P: AsRef<Path>>(
 impl FlatEvidenceGraph {
     /// Distribution of `candidate_count` across molecules: returns a sorted
     /// vec of `(candidate_count, n_molecules_with_that_count)` pairs.
-    /// Useful for diagnosing multi-mapping load (Phase A telemetry).
+    /// Useful for diagnosing multi-mapping load.
     pub fn candidate_count_histogram(&self) -> Vec<(u16, u64)> {
         let mut hist: HashMap<u16, u64> = HashMap::new();
         for mol in &self.molecules {
@@ -970,9 +784,7 @@ impl FlatEvidenceGraph {
 /// end-to-end integration tests in `tests/`, which are a SEPARATE crate and so
 /// cannot see `#[cfg(test)]` items. That is what the `test-support` feature is
 /// for; `#[doc(hidden)]` keeps it out of the published docs. The alternative —
-/// a second BAM writer inside `tests/` — would let the copies drift, which is
-/// precisely the class of bug the pooling path is prone to and the reason this
-/// module exists at all.
+/// a second BAM writer inside `tests/` — would let the copies drift.
 #[doc(hidden)]
 pub mod test_support {
     use super::*;
@@ -982,9 +794,8 @@ pub mod test_support {
     use noodles_core::Position;
 
     /// RE-EXPORTED so a caller in another crate can build a flagged record
-    /// without depending on `noodles_sam` itself. `telescope-cli`'s
-    /// integration tests do not declare that dependency, and re-implementing
-    /// the fixture there is exactly the copy that drifts.
+    /// without depending on `noodles_sam` itself; re-implementing the fixture
+    /// there is exactly the copy that drifts.
     pub use noodles_sam::alignment::record::Flags as SamFlags;
 
     use noodles_sam::{
@@ -1004,9 +815,7 @@ pub mod test_support {
     /// Length of every reference in `write_synthetic_bam`'s header. Was 100 bp
     /// while every fixture aligned from `Position::MIN` with a 100M CIGAR, which
     /// pinned `g_k ≡ 0` for every synthetic candidate and made a 5'-term test
-    /// unable to distinguish a real gap from a constant. Lengthening it is what
-    /// allows a partial-length read, and the read length is then DERIVED from
-    /// the gap so the fixture stays inside the 3' TES filter.
+    /// unable to distinguish a real gap from a constant.
     pub const REF_LEN: usize = 2000;
 
     /// Build a synthetic BAM record: a full-length forward match against
@@ -1031,18 +840,15 @@ pub mod test_support {
     ///             read's 5' end is the alignment's HIGH end.
     ///
     /// Both cases have span `REF_LEN − g_k`, so the read's 3' end lands at
-    /// `REF_LEN` (forward) or `REF_LEN − g_k` (reverse) and always satisfies
-    /// the 3' TES filter used by the tests. Deriving the coordinates from the
-    /// gap rather than fixing the start is what keeps this coherent: the TES
-    /// filter REJECTS any read whose 3' end is more than `tes_slack` from the
-    /// transcript's 3' end, so a fixture that pins the start and the CIGAR
-    /// length independently silently empties the graph the moment the
-    /// reference is lengthened.
+    /// `REF_LEN` (forward) or `REF_LEN − g_k` (reverse). Deriving the
+    /// coordinates from the gap rather than fixing the start is what keeps this
+    /// coherent: the TES filter REJECTS any read whose 3' end is more than
+    /// `tes_slack` from the transcript's 3' end, so a fixture that pinned the
+    /// start and the CIGAR length independently would silently empty the graph
+    /// the moment the reference is lengthened.
     ///
     /// Note the consequence for a reverse record: it can only ever have
-    /// `g_k <= tes_slack`. A reverse read with a large 5' gap is unreachable
-    /// under this filter, and that is a property of the data, not of the
-    /// fixture.
+    /// `g_k <= tes_slack`, because the TES filter runs first.
     ///
     /// `reverse` sets SAM `REVERSE_COMPLEMENTED` (0x10) — in noodles the
     /// accessor is `is_reverse_complemented()`, not `is_reverse()`.
@@ -1084,32 +890,9 @@ pub mod test_support {
     /// builder's `set_reference_sequence_id` is simply never called, so the
     /// encoded record carries tid = -1.
     ///
-    /// Added 2026-10-13 (Ticket 2B-Fix). Until then this shape was recorded as
-    /// unreachable, on the strength of `bam::io::Writer` raising
-    /// `InvalidReferenceSequenceId`. That error is the `Some(id)`-out-of-range
-    /// branch. Having NO tid is a distinct, supported encoding, and it is what
-    /// `RNAME=*` produces in a SAM file -- measured through samtools 1.24 on
-    /// 2026-10-13:
-    ///
-    /// ```text
-    ///   norid  flag=4  rname=*  pos=0  mapq=60  cigar=2000M
-    /// ```
-    ///
     /// Note samtools forces FLAG 4 here and KEEPS MAPQ, which is what lets the
-    /// record clear the `MAPQ < 20` gate and die at `reference_sequence_id()`
-    /// instead, one line further down. The MAPQ gate's position in the chain is
-    /// load-bearing for this fixture: a record that died earlier would land in
-    /// `filtered_unique` and prove nothing.
-    ///
-    /// Reproduce that receipt (samtools 1.24):
-    ///
-    /// ```bash
-    /// printf '@SQ\tSN:tx0\tLN:2000\nnorid\t0\t*\t0\t60\t2000M\t*\t0\t0\t%s\t%s\tpt:i:100\n' \
-    ///   "$(printf 'A%.0s' {1..2000})" "$(printf 'I%.0s' {1..2000})" > /tmp/n.sam
-    /// samtools view -b -o /tmp/n.bam /tmp/n.sam
-    /// samtools view /tmp/n.bam | cut -f1-6
-    /// # norid  4  *  0  60  2000M
-    /// ```
+    /// record clear a MAPQ gate and die at `reference_sequence_id()` instead,
+    /// one line further down.
     pub fn synth_record_no_refid(
         name: &str,
         as_score: Option<i32>,
@@ -1133,31 +916,8 @@ pub mod test_support {
 
     /// As [`synth_record`], but with NO read name: `set_name` is never called.
     ///
-    /// The mirror image of [`synth_record_no_refid`], and reachable for the same
-    /// reason -- `QNAME=*` is legal SAM and survives the round trip through
-    /// samtools verbatim (measured 2026-10-13, samtools 1.24):
-    ///
-    /// ```text
-    ///   *       flag=0  rname=tx0  pos=1  mapq=60  cigar=2000M
-    /// ```
-    ///
-    /// Reproduce (samtools 1.24): same SAM as above with the QNAME column set
-    /// to `*` instead of the RNAME:
-    ///
-    /// ```bash
-    /// printf '@SQ\tSN:tx0\tLN:2000\n*\t0\ttx0\t1\t60\t2000M\t*\t0\t0\t%s\t%s\tpt:i:100\n' \
-    ///   "$(printf 'A%.0s' {1..2000})" "$(printf 'I%.0s' {1..2000})" > /tmp/n.sam
-    /// samtools view -b -o /tmp/n.bam /tmp/n.sam
-    /// samtools view /tmp/n.bam | cut -f1-6
-    /// # *  0  tx0  1  60  2000M
-    /// ```
-    ///
-    /// ⭐ THIS ONE MATTERS DOWNSTREAM: samtools text output PRESERVES `*` as
-    /// QNAME. So `recompute_anchor_filters` in
-    /// `workspace/validation/benchmark/dseta_step0_5/run_dseta_step0_5.py` CAN
-    /// check `filtered_no_read_id` on the text side (`f[0] == "*"`) — it is not
-    /// a structural blind spot of the text projection. An earlier claim in the
-    /// Round 71 erratum said it was; that claim was wrong.
+    /// The mirror image of [`synth_record_no_refid`] — `QNAME=*` is legal SAM
+    /// and survives the round trip through samtools verbatim.
     ///
     /// Note this record keeps FLAG 0 and a valid tid, so it clears every filter
     /// up to `record.name()` -- which is the point. It dies at the LAST branch,
@@ -1188,28 +948,15 @@ pub mod test_support {
     /// is never called, so the encoder writes POS = 0 and the decoder's
     /// `Position::new(0)` fails.
     ///
-    /// Added 2026-10-13 (Ticket 2B-Fix). This is the third of the three
-    /// "omitted setter" fixtures, and the least obvious of them:
+    /// The constraint is on the RUST CONSTRUCTOR -- `Position::new(0)` is
+    /// invalid because positions are 1-based -- not on the encoding: an unset
+    /// field is written as 0, and the decoder cannot turn 0 into a `Position`.
+    /// The two facts face each other and the path is open.
     ///
-    /// > `Position::new(0)` is an INVALID RUST VALUE — positions are 1-based —
-    /// > so `set_alignment_start` cannot be given one. It looks like POS = 0 is
-    /// > unrepresentable.
-    ///
-    /// It is not. The constraint is on the *Rust* constructor, not on the
-    /// encoding: an unset field is written as 0, and the decoder cannot turn 0
-    /// into a `Position`. The two facts face each other and the path is open.
-    ///
-    /// WHAT IS ON THE WIRE, measured 2026-10-13 (samtools 1.24). It is `0`,
-    /// NOT a `-1` sentinel — which is how the tid case encodes absence, and the
-    /// two are NOT the same mechanism:
-    ///
-    /// ```text
-    /// QNAME='nopos' FLAG=0 RNAME='tx0' POS='0' MAPQ=60 CIGAR='2000M'
-    /// ```
-    ///
-    /// Compare `synth_record_no_refid`, which samtools renders `rname=*`
-    /// because tid = -1 is a real sentinel in the format. Anyone generalising
-    /// from that case to this one will predict `pos=*` and be wrong.
+    /// What is on the wire is `0`, NOT a `-1` sentinel -- which is how the tid
+    /// case encodes absence, and the two are NOT the same mechanism. Anyone
+    /// generalising from that case to this one will predict `pos=*` and be
+    /// wrong.
     ///
     /// Requires a valid `ref_id`: `reference_sequence_id()` is checked BEFORE
     /// `alignment_start()`, so a record with no tid would land in
@@ -1245,12 +992,6 @@ pub mod test_support {
     /// pinned the CIGAR length independently would silently fall out of the
     /// graph the moment the leading ops changed the reference span, and a
     /// missing molecule is indistinguishable from a rejected one.
-    ///
-    /// This is the only helper in the file that produces a CIGAR other than a
-    /// bare `Match`. Before 2026-10-02 that was the only kind that had ever
-    /// been built, so nothing in the suite had ever exercised what
-    /// `alignment_start()` does when the CIGAR begins with a soft-clip, an
-    /// insertion, a deletion or a hard-clip.
     pub fn synth_record_with_leading_cigar(
         name: &str,
         ref_id: usize,
@@ -1285,13 +1026,7 @@ pub mod test_support {
             .build()
     }
 
-    /// **Module 2 `gap5p` under real CIGARs — the Phase B blocking gate.**
-    ///
-    /// Every other fixture in this file builds a bare `Match` CIGAR, so until
-    /// this test the suite had never asked what `alignment_start()` does when
-    /// the alignment begins with something other than a match. The 5' channel
-    /// is the whole subject of the frozen `ln_5p = β·1[g ≤ W]` term, and
-    /// `gap5p` is the only thing feeding it from Module 2.
+    /// Module 2 `gap5p` under real CIGARs.
     ///
     /// The physics being pinned: `gap5p = s_k − 1` counts the reference bases
     /// between the transcript's 5' end and where the alignment begins. A
@@ -1303,7 +1038,7 @@ pub mod test_support {
     ///
     /// If any of these ever moved the answer, the 5' term would be reading a
     /// quantity that depends on the aligner's CIGAR rendering rather than on
-    /// where the molecule physically starts — i.e. two aligners, or one aligner
+    /// where the molecule physically starts -- i.e. two aligners, or one aligner
     /// across two versions, would silently produce different posteriors from
     /// the same molecules.
     #[test]
@@ -1367,8 +1102,7 @@ pub mod test_support {
     /// `gap5p` agrees with an independent cDNA-coordinate computation, for every
     /// CIGAR family, through the real `extract_evidence` path.
     ///
-    /// This is the "100% agreement with reference exon coordinates" gate. The
-    /// reference computation is deliberately a different route to the same
+    /// The reference computation is deliberately a different route to the same
     /// number: it walks the alignment's own reference span from the 3' end
     /// backwards, whereas production reads the start position forwards. If
     /// noodles' `alignment_start()` and `alignment_span()` disagreed about
@@ -1440,8 +1174,6 @@ pub mod test_support {
     /// Supplementary alignments are DROPPED, and the CIGAR direction is stated
     /// the way the SAM spec states it.
     ///
-    /// # The spec, and the correction
-    ///
     /// The CIGAR is always written in the **molecule's own 5' -> 3' order**,
     /// regardless of the strand the molecule aligned to. So:
     ///
@@ -1451,13 +1183,6 @@ pub mod test_support {
     /// | `900H1000M` | 900 read bases 5' of this alignment are clipped | the molecule's **3'** segment |
     ///
     /// A **leading** hard clip is evidence AGAINST a record being the 5' source.
-    /// (An earlier version of this test asserted the opposite and built its
-    /// fixture to match the error: it labelled `120H900M` at reference 1..900
-    /// as the "5' segment". Per the spec that record is the 3' segment, and a
-    /// 3' segment cannot sit at the lower reference start on a forward
-    /// alignment. The test passed -- the code does not know the difference --
-    /// which is exactly why a wrong mental model can sit in a file for months
-    /// without anything going red.)
     ///
     /// # What is pinned
     ///
@@ -1466,40 +1191,23 @@ pub mod test_support {
     ///   -- the molecule's actual 5' segment -- and not from an interior
     ///   junction coordinate.
     /// * A read whose ONLY record is supplementary contributes nothing.
-    ///
-    /// # Why this is defence in depth, not a live fix
-    ///
-    /// RETRACTED (2026-10-04). This section used to claim the filter was a
-    /// no-op on the AIDRS path, citing `HC2.bam` at 8,016,260 records with **0**
-    /// supplementary. Those figures were read off
-    /// `aidrs_pipeline/nanocount/HC2.bam`, a different BAM from the
-    /// `trans_align/HC2.sorted.bam` this crate actually consumes.
-    ///
-    /// Measured on the real input (2026-10-04):
-    /// `trans_align/HC2.sorted.bam` 27,189,952 records, **24,678** supplementary
-    /// (0.091%); `trans_align/COPD29.sorted.bam` 21,565,325 records, **29,220**
-    /// (0.135%). So the supplementary path IS reachable on the AIDRS path, and
-    /// this filter is a small live correction there -- not defence in depth.
-    /// It is a larger one on the Bambu (0.28%) and IsoQuant (0.21%) paths.
     #[test]
     fn test_supplementary_alignments_are_dropped_rather_than_merged() {
         use Kind::*;
         // tx0 is 2000 nt and the junction sits at 1980, close to the TES.
         //
-        // That placement is load-bearing, not cosmetic. The 3' TES filter
-        // keeps only reads whose alignment end is within `tes_slack` of the
+        // That placement is load-bearing, not cosmetic. The 3' TES filter keeps
+        // only reads whose alignment end is within `tes_slack` of the
         // transcript end, so a 5' segment ending at an INTERIOR junction is
         // discarded by that filter whatever the supplementary flag says. On a
-        // transcriptome reference the TES filter is therefore already a
-        // de-facto supplementary filter, and the explicit check in
-        // `extract_evidence` is the second, cheap line of defence. The
-        // assertion at the end of this test pins that structural fact so it
-        // cannot be forgotten.
+        // transcriptome reference the TES filter is therefore already a de-facto
+        // supplementary filter, and the explicit check in `extract_evidence` is
+        // the second, cheap line of defence.
         //
         // Molecule 5' segment: reference 1..=1980, no leading clip (1980M).
         // Its 3' remainder: reference 1981..=2000, LEADING hard clip -- what a
         // 3' segment looks like. The 3' segment deliberately scores HIGHER, so
-        // the old max-AS merge would have won and reported the junction
+        // the max-AS merge would otherwise win and report the junction
         // coordinate 1980 as the molecule's 5' end.
         let five_prime = RecordBuf::builder()
             .set_name("split")
@@ -1636,33 +1344,17 @@ pub mod test_support {
 
     /// A forward alignment that STOPS SHORT of the transcript's 3' end.
     ///
-    /// WHY THIS HELPER WAS ADDED (2026-10-06, Q5) -- and what it does NOT fix.
+    /// What this helper adds over the general `gap` helpers, which derive the
+    /// span from `REF_LEN` so the read always ends on the last base:
     ///
-    /// The obvious claim to make here is "the 3' TES filter is untested". That
-    /// claim is FALSE, and it is worth recording why, because the first draft
-    /// of this comment asserted it. The filter does fire on an existing
-    /// fixture: `test_supplementary_alignments_are_dropped_rather_than_merged`
-    /// writes a `900M` record from position 1, whose alignment ends 1100 bases
-    /// short of the 3' end and is therefore dropped at `tes_slack = 35`. The
-    /// test asserts `molecules.is_empty()` on it.
-    ///
-    /// What was genuinely missing is narrower, and this helper addresses exactly
-    /// that:
-    ///
-    /// 1. NO ACCOUNTING. A read dropped here was indistinguishable from a read
-    ///    that never existed. `dropped_tes_window` did not exist, so the
-    ///    fixture's disappearance proved the filter fired without saying how
-    ///    many records it fired on.
+    /// 1. NO ACCOUNTING. A read dropped by the TES filter was
+    ///    indistinguishable from a read that never existed.
     /// 2. NO BOUNDARY. `molecules.is_empty()` stays true whether the filter
     ///    rejects at `end_offset > tes_slack` or `>= tes_slack`, and whether it
     ///    compares `ref_end` or `ref_end + 1`. An off-by-one in the condition
     ///    is invisible to it. `synth_record_short_of_tes` puts a read exactly
     ///    at `tes_slack` and one at `tes_slack + 1` in the same run, which
     ///    pins both sides.
-    ///
-    /// The general `gap` helpers still cannot express either case — they derive
-    /// the span from `REF_LEN` so the read always ends on the last base — so
-    /// the boundary genuinely was unreachable without a new helper.
     ///
     /// `end_offset` is how many bases short of `REF_LEN` the alignment's last
     /// base sits, so `end_offset = 0` is the full-length case every other helper
@@ -1745,8 +1437,8 @@ pub mod test_support {
     /// id. Returns its path; the caller removes it. `tag` must differ per
     /// caller — the file name is the only thing keeping concurrent tests apart.
     ///
-    /// Molecule ordering out of `extract_evidence` follows HashMap iteration
-    /// order, so callers must look molecules up by `read_id`.
+    /// Molecule ordering out of `extract_evidence` follows `read_id` order, so
+    /// callers must look molecules up by `read_id`.
     pub fn write_synthetic_bam(tag: &str, records: Vec<RecordBuf>) -> std::path::PathBuf {
         write_synthetic_bam_named(tag, &["tx0", "tx1", "tx2"], records)
     }
@@ -1754,15 +1446,12 @@ pub mod test_support {
     /// `write_synthetic_bam` with the `@SQ` names chosen by the caller, so a
     /// caller can build a reference universe it cannot otherwise produce.
     ///
-    /// Added 2026-10-15 for the CLI conservation negative control. The
-    /// production `read_reference_universe` deliberately does NOT de-duplicate
-    /// `@SQ` names ("silently collapsing one would turn a corrupt reference
-    /// into a plausible-looking universe"), so a header naming the same
-    /// transcript twice reaches the universe-padding loop twice. Under the
+    /// The production `read_reference_universe` deliberately does NOT
+    /// de-duplicate `@SQ` names ("silently collapsing one would turn a corrupt
+    /// reference into a plausible-looking universe"), so a header naming the
+    /// same transcript twice reaches the universe-padding loop twice. Under the
     /// fixed tx0/tx1/tx2 header that state is unreachable, which would have
-    /// left the conservation `ensure!` in `main.rs` with no way to be shown to
-    /// fire at all -- the guard would have been unfalsifiable by construction
-    /// and therefore unverified by the project's own admission rule.
+    /// left the conservation `ensure!` with no way to be shown to fire at all.
     ///
     /// `names` is passed through verbatim, duplicates included. An empty name
     /// is rejected by the header builder, so a caller cannot accidentally
@@ -1803,12 +1492,10 @@ mod tests {
 
     /// The in-loop probe, which the end-of-stream guard cannot stand in for.
     ///
-    /// The fixture is the case the ruling was written for and that only this
-    /// guard can catch: 10,000 records with NO poly(A), then records that DO
-    /// have it. The end-of-stream check passes on this file -- poly(A) exists,
-    /// so the run is not a global absence -- and the 10,000-record probe is
-    /// what must stop it. Before the guard was hoisted above the lookup it
-    /// could not fire, and this fixture returned `Ok` with the read included.
+    /// The fixture is the case only this guard can catch: 10,000 records with
+    /// NO poly(A), then records that DO have it. The end-of-stream check passes
+    /// on this file -- poly(A) exists, so the run is not a global absence --
+    /// and the 10,000-record probe is what must stop it.
     #[test]
     fn test_the_in_loop_probe_catches_poly_a_that_only_starts_after_10000_records() {
         use noodles_sam::alignment::record_buf::data::field::Value;
@@ -1876,24 +1563,16 @@ mod tests {
     ///
     /// `read_map` is a `HashMap`, so an unsorted drain yields a per-process
     /// random order. That order propagates: molecules -> the `init_counts`
-    /// float accumulation -> `alpha` -> every posterior. Measured before the
-    /// sort was added, two runs of one command on one input gave two different
-    /// profile md5s, 538,127 of 1,347,285 posterior weights differing, and 10
-    /// of 689,052 top-1 assignments flipped.
+    /// float accumulation -> `alpha` -> every posterior.
     ///
     /// This asserts the INVARIANT rather than re-measuring the symptom, because
     /// the symptom is cross-process.
     ///
-    /// WHY THIS EXTRACTS EIGHT TIMES, NOT ONCE. The first version of this test
-    /// used 3 read_ids and called the extractor once, and the mutation battery
-    /// then reported M8 GREEN — deleting the sort did not reliably fail it. A
-    /// 3-key `HashMap` iterates in sorted order by chance 1 time in 3! = 6, so
-    /// the "red" I had demonstrated by hand was luck, and a battery run that
-    /// drew the other 5 faces would have certified an unpinned fix. Each
-    /// `extract_evidence` call builds a FRESH `HashMap` with a fresh random
-    /// seed, so repeating the extraction samples the real distribution: with 8
-    /// keys and 8 draws, an unsorted drain passes by chance (1/8!)^8, i.e.
-    /// never in practice.
+    /// WHY THIS EXTRACTS EIGHT TIMES, NOT ONCE. A 3-key `HashMap` iterates in
+    /// sorted order by chance 1 time in 3! = 6, so a single extraction could
+    /// pass by luck and certify an unpinned fix. Each `extract_evidence` call
+    /// builds a FRESH `HashMap` with a fresh random seed, so repeating the
+    /// extraction samples the real distribution.
     ///
     /// The read_ids are also given out of order, so a graph that merely
     /// preserved BAM order fails too — the property is sortedness, not
@@ -1940,9 +1619,10 @@ mod tests {
     /// the user, so a parser that only accepted some spelling would produce an
     /// error naming a flag that cannot be typed.
     ///
-    /// `tsv:` is in the REJECTION list, not the acceptance list. The TSV poly(A)
-    /// source was deleted outright (not deprecated), so both a well-formed TSV
-    /// spec and a bare `tsv:` prefix must now be errors naming the flag.
+    /// `tsv:` is in the REJECTION list, not the acceptance list: the TSV
+    /// poly(A) source was deleted outright (not deprecated), so both a
+    /// well-formed TSV spec and a bare `tsv:` prefix must now be errors naming
+    /// the flag.
     #[test]
     fn test_parse_poly_a_source_accepts_the_two_forms_and_rejects_the_rest() {
         assert_eq!(
@@ -1980,16 +1660,13 @@ mod tests {
         }
     }
 
-    /// Restored after commit 8ee1077 deleted it without saying so, and inverted
-    /// per the expert ruling: the absence of poly(A) is a named error, not an
-    /// empty graph.
+    /// The absence of poly(A) is a named error, not an empty graph.
     #[test]
     fn test_poly_a_enters_as_the_bam_tag_pt_and_bad_tags_drop_the_read() {
         use noodles_sam::alignment::record_buf::data::field::Value;
 
         // Well-formed: the helper writes `pt:i = 100`, and log2(100) = 6.643856.
-        // The value is not arbitrary -- log2 is the base the whole Gaussian
-        // lives in, and `INSTRUMENTAL_PAL_NOISE_FLOOR` is quoted in it.
+        // log2 is the base the whole Gaussian lives in.
         let good = synth_record_with_gap("pt64", 0, 0, false, Some(1000), 1, 60);
 
         // pt:i present but zero -> dropped (a molecule cannot have no tail)
@@ -2023,17 +1700,11 @@ mod tests {
 
     /// A BAM with no `pt:i` on any record is a HARD ERROR, not an empty graph.
     ///
-    /// This assertion is INVERTED from what it was. It used to pin the
-    /// fail-quiet behaviour -- empty graph, exit 0 -- as a "KNOWN GAP" so the
-    /// interface work would have a case to fix. The expert ruling closed that
-    /// gap: the failure is now `bail!`ed, and this test pins the fix.
-    ///
     /// The failure it removes is real. Every record is dropped at the tag read,
     /// so the caller cannot tell "this BAM has no poly(A)" from "this sample has
     /// no reads"; the error surfaces much later, as an empty profile or a
     /// divide-by-zero, with nothing pointing back at the tag. `pt:i` is Dorado's
-    /// native tail-length tag, and the Bambu (F1) and IsoQuant (F2) paths are
-    /// not obliged to emit it.
+    /// native tail-length tag, and not every producer is obliged to emit it.
     ///
     /// The 2-record fixture cannot reach the 10,000-record in-loop probe, so
     /// this also pins the END-OF-STREAM guard -- without it the fail-quiet path
@@ -2067,10 +1738,9 @@ mod tests {
     ///
     /// Note what actually makes that true: the `None` arm reports a HIT on
     /// every record, so `hits == 0` is unreachable and both guards pass by
-    /// construction. An earlier version used a placeholder of 0, which made
-    /// `hits == 0` reachable and would have killed a healthy alignment-only run
-    /// at record 10,000. The flag `expect_measurement` that briefly existed to
-    /// prevent exactly that was dead -- removing it left the suite green.
+    /// construction. The placeholder must be 1, not 0: `0i32.log2()` is `-inf`,
+    /// which would make `hits == 0` reachable and kill a healthy
+    /// alignment-only run at record 10,000.
     #[test]
     fn test_the_none_source_keeps_every_read_and_never_trips_the_guard() {
         use noodles_sam::alignment::record_buf::data::field::Value;
@@ -2151,7 +1821,7 @@ mod tests {
             .sum();
         assert_eq!(total as usize, graph.candidate_pool.len());
 
-        // Molecule order follows HashMap iteration → index by read_id.
+        // Molecule order is by read_id, so index by read_id.
         // Every pool is returned by name; a `..` in a destructure below would
         // silently stop asserting the new one. Named as a struct rather than a
         // 5-tuple so the field order cannot be transposed without a compile
@@ -2245,9 +1915,8 @@ mod tests {
     /// `f20` sits exactly on the `g_k <= 20` window edge, so an inclusive /
     /// exclusive slip at the boundary also fails here.
     ///
-    /// Strand is deliberately NOT exercised here — see
-    /// `test_reverse_alignment_uses_the_forward_formula_as_a_documented_gap`
-    /// for why that is a known gap rather than a handled case.
+    /// Strand is deliberately NOT exercised here — reverse records are refused
+    /// outright, so there is no `g_k` to validate for them.
     #[test]
     fn test_5p_gap_is_forward_formula_and_one_based() {
         let path = write_synthetic_bam(
@@ -2284,28 +1953,15 @@ mod tests {
 
     /// Strand is a REFUSED input, not a handled case.
     ///
-    /// HISTORY, because this test used to assert the opposite contract. It
-    /// asserted `g_k = 0` for a reverse record -- reverse alignments were
-    /// ACCEPTED and given the forward formula -- and said so explicitly as a
-    /// tripwire ("if this ever becomes strand-aware, this assertion is the
-    /// tripwire"). That was a deliberate "keep the gap visible" design: the
-    /// frozen spec `g_k = s_k − 1` was validated on a forward-only population,
-    /// and an earlier version had branched to `T_k − ref_end` and been removed
-    /// because the strand-blind TES filter collapses that to a 20-of-35 bp band.
-    ///
-    /// The expert ruling of 2026-10-10 supersedes it: refuse the input. The
-    /// swap preserves what the old test was FOR -- a guard that fails if someone
-    /// changes strand handling -- by transposing it. The old tripwire watched
-    /// the formula; the new one watches the refusal. What is lost is only the
-    /// ability to observe a reverse record's `g_k` at all, which is the point:
-    /// no such value is now reachable, so there is nothing to validate until a
-    /// separately validated strand definition exists.
+    /// The frozen spec `g_k = s_k − 1` was validated on a forward-only
+    /// population, and this crate reads no strand flag at all, so a reverse
+    /// record's `g_k` would be computed from an orientation nothing downstream
+    /// models. The input is therefore refused.
     ///
     /// The forward population is unaffected: the control at the end runs the
     /// same fixture without the reverse record and requires it to succeed.
     /// Without that, `expect_err` would also be satisfied by any unrelated
-    /// failure to read the file -- this test would pass against a `extract_evidence`
-    /// broken in any way whatsoever.
+    /// failure to read the file.
     #[test]
     fn test_reverse_alignment_is_refused_rather_than_given_the_forward_formula() {
         let path = write_synthetic_bam(
@@ -2378,8 +2034,7 @@ mod tests {
         );
     }
 
-    /// Phase A verifier-required test: candidate_count_histogram must be
-    /// exercised from inside this file (>=2 occurrences of the symbol).
+    /// `candidate_count_histogram` must be exercised from inside this file.
     /// Builds a synthetic FlatEvidenceGraph with a known candidate-count
     /// distribution and asserts the histogram returns the right counts in
     /// sorted order.
@@ -2443,14 +2098,14 @@ mod tests {
     /// reserved at the summed candidate count, so no pool carries a single
     /// spare slot. Reverting them to `Vec::new()` + `push` (doubling growth)
     /// over-allocates any non-power-of-two total and turns this red — which is
-    /// the point, because that doubling is what the COPD29 peak-RSS
-    /// regression came from. The total here is deliberately 6, so a
-    /// doubling-grown pool lands on capacity 8.
+    /// the point, because that doubling is what the peak-RSS regression came
+    /// from. The total here is deliberately 6, so a doubling-grown pool lands
+    /// on capacity 8.
     ///
-    /// The fixture's AS gaps (100/100, 100/100, 100/100) are irrelevant here
-    /// precisely because the `ΔAS > 50` prune runs in the E-step, not in
-    /// `extract_evidence` — this test is about allocation, and `graph` is
-    /// observed before any pruning could occur.
+    /// The fixture's AS gaps are irrelevant here precisely because the
+    /// `ΔAS > 50` prune runs in the E-step, not in `extract_evidence` — this
+    /// test is about allocation, and `graph` is observed before any pruning
+    /// could occur.
     #[test]
     fn test_candidate_pools_are_exactly_sized() {
         let path = write_synthetic_bam(
@@ -2508,10 +2163,8 @@ mod tests {
     /// direction (strict vs non-strict, `ref_end` vs `ref_end + 1`) is
     /// invisible to a test that only checks "some read was dropped".
     ///
-    /// The pre-existing coverage does not pin that boundary.
-    /// `test_supplementary_alignments_are_dropped_rather_than_merged` does
-    /// trip the filter -- on a `900M` record ending 1100 bases short -- but it
-    /// asserts `molecules.is_empty()`, which is true at every offset from
+    /// The pre-existing coverage does not pin that boundary: it asserts
+    /// `molecules.is_empty()`, which is true at every offset from
     /// `tes_slack + 1` to `REF_LEN`. This test is the one that pins WHERE the
     /// edge is, and it is the first to assert the drop COUNT rather than only
     /// the drop's effect on the graph.
@@ -2519,8 +2172,7 @@ mod tests {
     /// The four buckets this fixture cannot trip are asserted zero HERE, and
     /// that assertion is only meaningful because
     /// `test_flag_drop_buckets_are_observable` pins two of them non-zero on
-    /// real records. Without that sibling test these four lines would pass
-    /// against counters that were never wired to anything.
+    /// real records.
     #[test]
     fn test_tes_filter_boundary_is_exact_and_the_ledger_closes() {
         const TES_SLACK: usize = 35;
@@ -2544,12 +2196,8 @@ mod tests {
         );
         assert_eq!(s.records_with_candidates, 2, "{s:?}");
         // This assertion is only worth writing because a SIBLING test shows the
-        // same expression going non-zero. Measured 2026-10-14: hard-zeroing
-        // `ledger_deficit()` (`return 0;`) leaves THIS TEST GREEN, because a
-        // function that can only return 0 satisfies `== 0` trivially. The three
-        // `test_ledger_guard_panics_on_a_record_with_*` tests are what make it
-        // non-vacuous -- all three go red under that same mutation. Delete them
-        // and this line is decoration.
+        // same expression going non-zero; a function that can only return 0
+        // satisfies `== 0` trivially.
         assert_eq!(s.ledger_deficit(), 0, "ledger must close: {s:?}");
         assert_eq!(s.dropped_total(), 1, "{s:?}");
 
@@ -2574,10 +2222,7 @@ mod tests {
     /// This is the sibling that makes the zero-assertions in
     /// `test_tes_filter_boundary_is_exact_and_the_ledger_closes` non-trivial,
     /// and it is also the mutation target for the corresponding increments:
-    /// delete either `fc.dropped_* += 1` and this test goes red. Deleting the
-    /// TES increment is caught by the test above AND by the library's
-    /// `ledger_deficit() == 0` assertion, which panics rather than merely
-    /// reporting.
+    /// delete either `fc.dropped_* += 1` and this test goes red.
     #[test]
     fn test_flag_drop_buckets_are_observable() {
         use noodles_sam::alignment::record::Flags;
@@ -2597,12 +2242,8 @@ mod tests {
         assert_eq!(s.dropped_supplementary, 1, "{s:?}");
         assert_eq!(s.records_with_candidates, 1, "{s:?}");
         // This assertion is only worth writing because a SIBLING test shows the
-        // same expression going non-zero. Measured 2026-10-14: hard-zeroing
-        // `ledger_deficit()` (`return 0;`) leaves THIS TEST GREEN, because a
-        // function that can only return 0 satisfies `== 0` trivially. The three
-        // `test_ledger_guard_panics_on_a_record_with_*` tests are what make it
-        // non-vacuous -- all three go red under that same mutation. Delete them
-        // and this line is decoration.
+        // same expression going non-zero; a function that can only return 0
+        // satisfies `== 0` trivially.
         assert_eq!(s.ledger_deficit(), 0, "ledger must close: {s:?}");
         assert_eq!(
             graph.molecules.len(),
@@ -2615,9 +2256,8 @@ mod tests {
     // RED PROOF for the production `ledger_deficit() == 0` assertion.
     //
     // Every other test in this module exercises that assertion's GREEN side.
-    // Until now nothing had ever made it go red, which under this project's own
-    // rule ("a comment stating an invariant is a wish until a test goes red")
-    // left it indistinguishable from an assertion that could never fire.
+    // Nothing had ever made it go red, which left it indistinguishable from
+    // an assertion that could never fire.
     //
     // These fixtures are raw BAM BYTES rather than `write_synthetic_bam`
     // records, and they have to be: the values under test are "no reference"
@@ -2632,19 +2272,12 @@ mod tests {
     // `pt:i:70`, `tx1` the only reference. It clears every COUNTED filter --
     // unmapped, supplementary, poly(A) tag, poly(A) value, no CIGAR span,
     // empty span, 3' TES window -- so the drop site under test is the only one
-    // that can be reached. Build them with:
-    //
-    //     cd crates/telescope-core/tests
-    //     python3 make_ledger_fixtures.py --out-dir /tmp/ledger_fx \
-    //         --check ../src/evidence.rs
-    //
-    // which rebuilds all three files and fails if any array below differs from
-    // its output. Run from `crates/telescope-core/tests`.
+    // that can be reached.
     // ---------------------------------------------------------------------
 
     /// `refID = -1` on a record whose FLAG says mapped. `reference_sequence_id()`
-    /// yields nothing, so the `_ => continue` at :570 is taken. That is UPSTREAM
-    /// of `fc.records_with_candidates += 1`, so the ledger identity does not
+    /// yields nothing, so the `_ => continue` is taken. That is UPSTREAM of
+    /// `fc.records_with_candidates += 1`, so the ledger identity does not
     /// balance and the assertion must panic.
     #[test]
     #[should_panic(expected = "evidence filter ledger does not close")]
@@ -2656,8 +2289,8 @@ mod tests {
     }
 
     /// `pos = -1`, so `alignment_start().get()` yields nothing and the
-    /// `_ => continue` at :577 is taken. Also upstream of the RHS term; same
-    /// ledger arithmetic as above.
+    /// `_ => continue` is taken. Also upstream of the RHS term; same ledger
+    /// arithmetic as above.
     #[test]
     #[should_panic(expected = "evidence filter ledger does not close")]
     fn test_ledger_guard_panics_on_a_record_with_no_alignment_start() {
@@ -2670,20 +2303,14 @@ mod tests {
     ///
     /// QNAME is the two bytes `*\0`. noodles' `fields::name()` returns `None`
     /// for exactly two byte patterns -- `*\0` and `\0\0` -- and for nothing
-    /// else, so this is the only read-name that reaches the `None => continue`
-    /// at :642. (An EMPTY read name, `l_read_name = 0`, returns `Some("")` and
-    /// does not; nor does QNAME `*` written through a SAM/BAM writer, which
+    /// else, so this is the only read-name that reaches the `None => continue`.
+    /// (An EMPTY read name, `l_read_name = 0`, returns `Some("")` and does
+    /// not; nor does QNAME `*` written through a SAM/BAM writer, which
     /// normalises it.)
     ///
-    /// CHANGED 2026-10-14. This test used to assert the opposite and was named
-    /// `test_a_nameless_record_is_lost_without_tripping_the_ledger_guard`: it
-    /// pinned a run that returned `Ok` with `ledger_deficit() == 0`,
-    /// `records_with_candidates == 1`, and zero molecules -- a record counted
-    /// as delivered and then gone, behind a guard that could not see it.
-    /// `fc.records_with_candidates += 1` now sits after :642 rather than
-    /// before it, so this exit is upstream of the RHS term like the other two,
-    /// and the assertion fires. `FilterCounts` gained no field; only the
-    /// placement moved. See the note above the filters for the full history.
+    /// `fc.records_with_candidates += 1` sits after the name check, so this
+    /// exit is upstream of the RHS term like the other two, and the assertion
+    /// fires. `FilterCounts` gained no field; only the placement moved.
     ///
     /// All three exits -- refID, pos, read name -- now trip the same assertion,
     /// so the three `#[should_panic]` tests above and here are the complete
@@ -2696,18 +2323,16 @@ mod tests {
         let _ = extract_evidence(&path, 35);
     }
 
-    /// The pre-change behaviour, kept as a fixture-level assertion so the
-    /// 2026-10-14 receipt in R93 stays checkable against the code as it is
-    /// now rather than against a claim in a commit message.
+    /// The pre-change behaviour, kept as a fixture-level assertion.
     ///
     /// It does NOT run `extract_evidence` -- that panics now, by design. It
     /// reproduces the arithmetic the old placement produced, from the same
     /// counters the guard reads, and shows why that arithmetic balanced: the
-    /// RHS term was incremented before :642, so a record dropped there was
-    /// counted on BOTH sides. 1 entered, 0 dropped, 1 "with candidates",
-    /// deficit 0 -- and no molecule. Conservation held; the loss did not get
-    /// recorded. That is the whole lesson, so it is asserted rather than
-    /// described.
+    /// RHS term was incremented before the name check, so a record dropped
+    /// there was counted on BOTH sides. 1 entered, 0 dropped, 1 "with
+    /// candidates", deficit 0 -- and no molecule. Conservation held; the loss
+    /// did not get recorded. That is the whole lesson, so it is asserted rather
+    /// than described.
     #[test]
     fn test_the_old_rhs_placement_balanced_the_ledger_while_losing_the_record() {
         // The bug, arithmetic only: the increment ran BEFORE the name check, so
@@ -2745,7 +2370,7 @@ mod tests {
         );
     }
 
-    // ---- fixture bytes, emitted verbatim by make_ledger_fixtures.py ----
+    // ---- fixture bytes ----
     const BAM_NO_REFID: &[u8] = &[
         0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x06, 0x00, 0x42, 0x43, 0x02,
         0x00, 0x83, 0x00, 0x73, 0x72, 0xf4, 0x65, 0xd4, 0x61, 0x60, 0x60, 0x70, 0xf0, 0x70, 0xe1,

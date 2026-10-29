@@ -1,94 +1,18 @@
-//! Module 1: Emission Model Builder
+//! Per-transcript poly(A) emission model $P(L \mid T_k)$ for TEL-EM: a
+//! Gaussian in $\log_2(\text{PAL})$ space.
 //!
-//! Two ways to construct the per-transcript emission model
-//! $P(L \mid T_k)$ — a Gaussian in $\log_2(\text{PAL})$
-//! space — for TEL-EM:
+//! - `build_emission_from_anchors` — Universal mode, the only CLI-reachable
+//!   path; fits from the anchor pool with a 3-level fallback cascade
+//!   (Tx → Gene → Cohort).
+//! - `build_emission_parquet` — external poly(A) initializer, deferred and
+//!   not reachable from any CLI subcommand: its read→transcript assignment
+//!   has never been compared with Universal's, so it is kept working and
+//!   tested but not re-exposed.
 //!
-//! - **Universal mode (the only one reachable from a CLI
-//!   subcommand)**: parses the per-read
-//!   `telescope.anchor_pool.parquet` (produced by
-//!   `anchor_builder::build_anchor_pool`), optionally joins
-//!   with `telescope.transcript_evidence.parquet` to apply
-//!   `em_eligible` filtering, then fits the emission model
-//!   with a 3-level fallback cascade (Tx → Gene → Cohort).
-//!   Entry point: `build_emission_from_anchors`, dispatched
-//!   from `telescope build-emission --anchor-pool`.
-//!
-//! - **External poly(A) initializer (DEFERRED, not wired to
-//!   any CLI subcommand)**: parses an AIDRS-shaped pair
-//!   (`aidrs.transcript_polyA_len.parquet` +
-//!   `aidrs.transcript.assessment.tsv`) and builds the same
-//!   emission model. The three functions
-//!   [`AssessmentQuality`], [`load_assessment_quality`] and
-//!   [`build_emission_parquet`] are RETAINED, working and
-//!   tested, but no CLI entry point currently reaches them:
-//!   the `--polya-parquet` / `--assessment-tsv`
-//!   arguments of `telescope build-emission` were deleted on
-//!   2026-10-03, and `--anchor-pool` is now that subcommand's
-//!   sole input.
-//!
-//!   WHY IT IS DEFERRED, NOT DELETED. This was once "AIDRS
-//!   Mode", a peer of Universal mode with its own CLI surface,
-//!   and it was removed in that role because the two paths
-//!   were never actually compared. Whether AIDRS's upstream
-//!   read→transcript assignment is BETTER OR WORSE than
-//!   Universal's own is a measurement that HAS NEVER BEEN
-//!   MADE. Until it is made, the initializer design is frozen
-//!   in the 解冻区 (thaw region): keeping the code costs
-//!   nothing, but re-exposing the CLI would be a decision
-//!   dressed as a convenience. The one thing the frozen code
-//!   does establish is agreement, not superiority — see
-//!   `test_aidrs_universal_equivalence` below.
-//!
-//! Output: `telescope.emission.parquet` with the schema
-//! declared in `output_schema()`. Each row is one transcript
-//! $T_k$ with computed emission parameters
-//! $(\mu_{k,\text{cohort}}, \sigma^2_{k,\text{cohort}})$.
-//!
-//! ## The fitted object is a DISTRIBUTION, not a scalar
-//!
-//! A row of the anchor pool is one (sample, transcript, read)
-//! triple carrying one observed `poly_a_length`. A
-//! transcript's emission is therefore fitted to a
-//! **per-read observation set**, and $\mu_k$ / $\sigma^2_k$
-//! are DERIVED PARAMETERS of that fit — summary statistics,
-//! not measurements. A transcript with 1, 3 or 400 anchor
-//! reads has the same kind of row here; only the width of the
-//! observation set behind it differs. The shipped anchor
-//! pool is 90,703 rows over 15,427 transcripts, of which
-//! 49.32% (7,609) carry more than one distinct observed
-//! length, so the scalar reading of a "transcript's
-//! poly(A) length" is wrong for roughly half the
-//! transcriptome and the distribution reading is the one
-//! to use. Both figures, and the command that produces
-//! them, are in `workspace/notes/EXPERIMENT.md` under
-//! "2026-10-03 (measurement provenance)"; the row and
-//! transcript counts also appear in the 2026-10-02
-//! anchor-pool fan-out entry.
-//!
-//! ## `polyA_frac` + `is_polyA_competent` semantics
-//!
-//! - **External poly(A) initializer (deferred)**: state is
-//!   lifted from `aidrs.transcript.assessment.tsv` (State
-//!   1/2/3 → 3-way classification, see
-//!   `load_assessment_quality`).
-//! - **Universal mode**: there is no equivalent
-//!   `assessment.tsv`. We define:
-//!   - `polyA_frac` = fraction of anchor reads for the
-//!     transcript with `poly_a_length >= 10`. Since the
-//!     anchor filter already requires `pt:i >= 10`, this
-//!     fraction is **1.0 by construction**.
-//!   - `is_polyA_competent` = `polyA_frac > 0 AND n_reads > 0`.
-//!     Always true for non-empty transcripts.
-//!
-//! This semantic gap is the reason the equivalence test
-//! (`test_aidrs_universal_equivalence`) compares only
-//! `mu_logPAL`, `sigma2_logPAL`, and `n_cohort_flnc`, and
-//! documents `polyA_frac` / `is_polyA_competent` as
-//! "by-construction-equal" rather than asserted.
-//!
-//! Source spec: `workspace/specs/telescope-v0.2.1.md`
-//! 常温区 Module 1 (Mode B = Universal) + F2/F3 + Step 3.
+//! Output: `telescope.emission.parquet` (schema in `output_schema()`). The
+//! fitted object is a DISTRIBUTION, not a scalar: $\mu$ and $\sigma^2$ are
+//! derived parameters of a fit over that transcript's per-read anchor
+//! observations.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -109,90 +33,38 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
-/// Physical instrumentation floor on cohort variance.
+/// Physical instrumentation floor on cohort variance, in `log2(PAL)` space.
 ///
-/// Why this constant exists (per `specs/telescope-v0.1.3.md` F3 and
-/// `notes/spec-self-audit-v0.1.3.md`):
-///
-/// Even with the Weak-MAP weak prior in TEL-EM (denominator
-/// `+2*nu_0+3 = 5`), the variance update hits a degenerate corner
-/// if a single-molecule cluster assigns a read to a transcript
-/// whose cohort emission model has `var(y) == 0` *and* the new read
-/// has `y_r == mu_k` exactly. In that case
-/// `sigma^2(m+1) = 0 / (w_rk + 5) = 0`, locking sigma at 0 and
-/// starving subsequent E-steps of the Gaussian likelihood.
-///
-/// The floor is a **physical** quantity, not a numerical convenience, and the
-/// name says so. Renamed from `MIN_COHORT_VARIANCE` on 2026-10-02 by expert
-/// ruling, which required the constant to carry its justification rather than
-/// a bare number.
-///
-/// # Why 0.04
-///
-/// The floor lives in `log2(PAL)` space — `evidence.rs` computes
-/// `log_pal = (poly_a_len as f32).log2()`, so `y` is base 2 throughout. With
-/// `sigma^2 = 0.04` we have `sigma = 0.20` in log2 units, and a lognormal with
-/// log2-scale sd `sigma` has a physical CV of
-///
-/// ```text
-///     CV = 2^sigma - 1 = 2^0.20 - 1 = 0.1487
-/// ```
-///
-/// i.e. **~15%**. That matches the instrument: a poly(A) tail measured by
-/// nanopore current (Dorado, tailfindr, Nanopolish) carries a signal-noise
-/// floor of roughly +/- 5-10 nt, and on a 60-80 nt tail that is a 10-15% CV.
-/// The floor is that floor, expressed in the units the model works in.
-///
-/// # Why it must not be removed
-///
-/// The inverse-gamma prior already prevents the *posterior mean* from
-/// collapsing, so the floor is partly redundant with it — a MAP estimate under
-/// `nu_0`/`beta_0` cannot reach zero no matter how few reads land on a
-/// transcript. What the prior does not do is stop the LIKELIHOOD from becoming
-/// degenerate: with `sigma^2 -> 0` and `y_r == mu_k` exactly, the Gaussian
-/// density is unbounded, and a single coincidental read can dominate the
-/// E-step for that transcript.
-///
-/// This is the same philosophy as `alevin-fry`'s `MIN_OUTPUT_ALPHA = 0.01`:
-/// always keep the posterior non-degenerate, whatever the data does.
-///
-/// Renamed, NOT removed. The removal argument is a testable claim and is
-/// recorded as one rather than settled by assertion — see
-/// `workspace/notes/EXPERIMENT.md`, 2026-10-02.
+/// `sigma^2 = 0.04` is `sigma = 0.20` log2 units, i.e. a physical CV of
+/// `2^0.20 - 1 ≈ 0.149` (~15%): the signal-noise floor of a nanopore poly(A)
+/// tail. It must not be removed — with `sigma^2 -> 0` and `y_r == mu_k`
+/// exactly, the Gaussian density is unbounded and one coincidental read can
+/// dominate the E-step for that transcript.
 pub const INSTRUMENTAL_PAL_NOISE_FLOOR: f64 = 0.04;
 
 /// MAD-to-sigma scale factor for normal-consistency.
 ///
-/// For a standard normal, `median(|X - median(X)|) * 1.4826 ≈ σ`.
-/// We use this to derive a robust cohort-level variance from
-/// the median absolute deviation without parametric assumptions.
+/// For a standard normal, `median(|X - median(X)|) * 1.4826 ≈ σ`. Used to
+/// derive a robust cohort-level variance from the median absolute deviation
+/// without parametric assumptions.
 const MAD_TO_SIGMA: f64 = 1.4826;
 
-/// Fallback thresholds for the 3-level Tx → Gene → Cohort
-/// cascade in Universal Mode.
+/// Fallback thresholds for the 3-level Tx → Gene → Cohort cascade.
 ///
-/// Per expert ruling (v0.2.1 常温区 Step 3 Part 2), **every
-/// threshold MUST be CLI-configurable** ("严禁硬编码常数").
-/// The defaults below are the v0.2.1 spec defaults but can be
-/// overridden per-invocation via CLI flags
-/// (`--tx-min-reads`, `--gene-min-reads`,
-/// `--cohort-min-reads`).
+/// Every threshold is CLI-configurable and must stay so; the values below are
+/// the defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FallbackConfig {
-    /// L1 Tx-level: minimum reads to fit log-normal at the
-    /// transcript level. Below this, fall to L2 (gene) or L3
-    /// (cohort).
+    /// L1 Tx-level: minimum reads to fit at the transcript level.
+    /// Below this, fall to L2 (gene) or L3 (cohort).
     pub tx_min_reads: usize,
-    /// L2 Gene-level: minimum pooled reads in the same
-    /// `gene_id` to fit at the gene level. Below this, fall
-    /// to L3 (cohort).
+    /// L2 Gene-level: minimum pooled reads in the same `gene_id`.
+    /// Below this, fall to L3 (cohort).
     pub gene_min_reads: usize,
-    /// L3 Cohort-level: informational minimum for the *total*
-    /// cohort read count. **Does not gate** the L3 fit —
-    /// cohort fallback is always available as long as ≥1 read
-    /// exists — but is logged when the cohort is below the
-    /// threshold so that downstream consumers can flag
-    /// low-cohort cases.
+    /// L3 Cohort-level: informational minimum for the *total* cohort read
+    /// count. **Does not gate** the L3 fit — cohort fallback is always
+    /// available as long as ≥1 read exists — but a below-threshold cohort is
+    /// logged so downstream consumers can flag it.
     pub cohort_min_reads: usize,
 }
 
@@ -206,32 +78,24 @@ impl Default for FallbackConfig {
     }
 }
 
-/// Per-transcript poly(A) state from `aidrs.transcript.assessment.tsv`.
-///
-/// Part of the DEFERRED external poly(A) initializer; see the module
-/// docs. Retained, not deprecated: no CLI subcommand reaches it, and it
-/// is expected to be re-wired only after the read→transcript assignment
-/// comparison the module docs name has been made.
+/// Per-transcript poly(A) state from the external initializer's assessment
+/// table.
 #[derive(Debug, Clone, Copy)]
 pub struct AssessmentQuality {
     pub poly_a_frac: f64,
-    /// True iff `polyA_frac > 0` AND AIDRS state was reachable.
+    /// True iff `polyA_frac > 0` AND the assessment state was reachable.
     /// False for State 2 (`polyA_frac` effectively 0) and State 3
     /// (NaN — Dorado `pt:i` tag entirely missing).
     pub is_poly_a_competent: bool,
 }
 
-/// Reads `aidrs.transcript.assessment.tsv` and parses the
-/// `(TrID, polyA_frac)` columns into a HashMap keyed by TrID.
+/// Reads `aidrs.transcript.assessment.tsv` and parses the `(TrID, polyA_frac)`
+/// columns into a HashMap keyed by TrID.
 ///
-/// State 3 (NaN / missing `polyA_frac`) and State 2
-/// (`polyA_frac == 0` or non-numeric) both become
-/// `(0.0, is_poly_a_competent=false)`. Numeric non-zero values
-/// keep their original `polyA_frac` and flag the transcript as
+/// State 3 (NaN / missing `polyA_frac`) and State 2 (`polyA_frac == 0` or
+/// non-numeric) both become `(0.0, is_poly_a_competent = false)`. A numeric
+/// non-zero value keeps its `polyA_frac` and flags the transcript as
 /// polyA-competent.
-///
-/// Part of the DEFERRED external poly(A) initializer; see the module
-/// docs. Not reachable from any CLI subcommand.
 pub fn load_assessment_quality<P: AsRef<Path>>(
     tsv_path: P,
 ) -> Result<HashMap<String, AssessmentQuality>> {
@@ -289,8 +153,6 @@ pub fn load_assessment_quality<P: AsRef<Path>>(
 }
 
 /// Schema for the output `telescope.emission.parquet`.
-/// Exposed for downstream callers (Module 3) that need to read
-/// what Module 1 produced.
 pub fn output_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("transcript_id", DataType::Utf8, false),
@@ -307,35 +169,22 @@ pub fn output_schema() -> Arc<Schema> {
         // The L1/L2/L3 level is therefore NOT stored in the file. It is
         // INFERRED downstream by comparing this value against the
         // `tx_min_reads` / `gene_min_reads` thresholds that
-        // `build_emission_from_anchors` was run with: `>= tx_min_reads` is
-        // L1, and anything smaller is L2 or L3 depending on its gene's pooled
-        // count. Those thresholds are not recorded in the parquet, so this
-        // reconstruction is only exact when the reader knows them.
-        //
-        // The column is NOT renamed and the schema is NOT changed: it is part
-        // of the published contract that Module 3 and downstream consumers
-        // read. `test_n_cohort_flnc_counts_observations_not_distinct_lengths`
-        // pins the observation-counting semantics.
+        // `build_emission_from_anchors` was run with. Those thresholds are
+        // not recorded in the parquet, so this reconstruction is only exact
+        // when the reader knows them.
         Field::new("n_cohort_flnc", DataType::UInt32, false),
         Field::new("mu_logPAL", DataType::Float64, false),
         Field::new("sigma2_logPAL", DataType::Float64, false),
     ]))
 }
 
-/// Build `telescope.emission.parquet` from AIDRS outputs.
+/// Build `telescope.emission.parquet` from the external initializer's inputs.
 ///
-/// Reads `aidrs.transcript_polyA_len.parquet` row-by-row (chunked),
-/// joins each row's `TrID` against the assessment TSV to get
-/// `polyA_frac` and `is_polyA_competent`, computes the log2(pal)
-/// mean/variance per transcript, applies `INSTRUMENTAL_PAL_NOISE_FLOOR`
-/// floor, and writes the 7-column output schema above.
-///
-/// Part of the DEFERRED external poly(A) initializer; see the module
-/// docs. No CLI subcommand reaches it as of 2026-10-03 — the
-/// `build-emission` command that used to dispatch here takes
-/// `--anchor-pool` only. Retained so the initializer stays a
-/// re-wirable option once the comparison the module docs name has been
-/// made; it is covered live by `test_aidrs_universal_equivalence`.
+/// Reads `aidrs.transcript_polyA_len.parquet` row-by-row (chunked), joins
+/// each row's `TrID` against the assessment TSV to get `polyA_frac` and
+/// `is_polyA_competent`, computes the log2(pal) mean/variance per
+/// transcript, applies the `INSTRUMENTAL_PAL_NOISE_FLOOR` floor, and writes
+/// the 7-column output schema above.
 pub fn build_emission_parquet<P: AsRef<Path>>(
     poly_a_parquet_path: P,
     assessment_tsv_path: P,
@@ -471,14 +320,13 @@ pub fn build_emission_parquet<P: AsRef<Path>>(
 // Universal Mode (Mode B) — anchor_pool → emission model
 // =============================================================================
 
-/// Per-transcript accumulator of `log2(PAL)` values from the
-/// anchor pool.
+/// Per-transcript accumulator of `log2(PAL)` values from the anchor pool.
 #[derive(Debug, Clone)]
 struct TxAccumulator {
     gene_id: String,
-    /// `log2(poly_a_length)` for every anchor read assigned to
-    /// this transcript. (Anchor filter already requires
-    /// `poly_a_length >= 10`, so values are finite positives.)
+    /// `log2(poly_a_length)` for every anchor read assigned to this
+    /// transcript. (The anchor filter already requires `poly_a_length >= 10`,
+    /// so values are finite positives.)
     log2_pals: Vec<f64>,
 }
 
@@ -496,30 +344,23 @@ impl TxAccumulator {
 
 /// Result of fitting a Gaussian in `log2(PAL)` space.
 ///
-/// Both AIDRS and Universal modes produce identical shape:
-/// `mu` is the arithmetic mean (L1) or median (L3) of
-/// `log2(PAL)`; `sigma2` is the sample variance (L1/L2) or
-/// `(MAD * 1.4826)^2` (L3), floored at `INSTRUMENTAL_PAL_NOISE_FLOOR`.
+/// Both the external initializer and Universal mode produce the same shape:
+/// `mu` is the arithmetic mean (L1) or median (L3) of `log2(PAL)`; `sigma2`
+/// is the sample variance (L1/L2) or `(MAD * 1.4826)^2` (L3), floored at
+/// `INSTRUMENTAL_PAL_NOISE_FLOOR`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct LogNormalFit {
     mu: f64,
     sigma2: f64,
 }
 
-/// Fit `(mean, sample variance floored at INSTRUMENTAL_PAL_NOISE_FLOOR)`
-/// from a slice of `log2(PAL)` values. Returns `None` iff
-/// `values` is empty.
+/// Fit `(mean, sample variance floored at INSTRUMENTAL_PAL_NOISE_FLOOR)` from
+/// a slice of `log2(PAL)` values. Returns `None` iff `values` is empty.
 ///
-/// The result is a function of the VALUES, not of the order they arrive in.
-/// `f64` addition is not associative, so the sum of a multiset depends on the
-/// order it is accumulated in, and the L2 gene pool is assembled by iterating
-/// `tx_accums` -- a `HashMap`, whose iteration order is a function of the
-/// insertion history and the per-process random seed. Summing in that order
-/// made the same anchor pool emit L2 rows differing in the last 1-2 mantissa
-/// bits between runs (~1e-16 relative, measured over 12 runs; L1 and L3 were
-/// already bit-reproducible). Sorting first costs microseconds on a few
-/// thousand values and removes the seed from the result. Pinned by
-/// `test_l2_gene_fit_is_bit_identical_across_accumulator_insertion_orders`.
+/// The values are SORTED before summing: `f64` addition is not associative,
+/// so the order a multiset is summed in changes the result, and the L2 gene
+/// pool is assembled by iterating a `HashMap`. Sorting removes the
+/// per-process seed from the result.
 fn fit_log_normal(values: &[f64]) -> Option<LogNormalFit> {
     let n = values.len();
     if n == 0 {
@@ -540,15 +381,11 @@ fn fit_log_normal(values: &[f64]) -> Option<LogNormalFit> {
     })
 }
 
-/// Cohort-level robust fit: `mu` = median(log2(PAL)),
-/// `sigma2` = `(MAD * 1.4826)^2`, floored at
-/// `INSTRUMENTAL_PAL_NOISE_FLOOR`. Returns `None` iff `values` is empty.
+/// Cohort-level robust fit: `mu` = median(log2(PAL)), `sigma2` =
+/// `(MAD * 1.4826)^2`, floored at `INSTRUMENTAL_PAL_NOISE_FLOOR`. Returns
+/// `None` iff `values` is empty.
 ///
-/// Order-independent by construction, and for a different reason than
-/// `fit_log_normal` needs its sort: both statistics are ORDER STATISTICS read
-/// off a sorted copy, and nothing here is summed, so no accumulation order
-/// reaches the result. The sort is load-bearing -- do not remove it as a
-/// micro-optimisation.
+/// The sort is load-bearing — do not remove it as a micro-optimisation.
 fn cohort_log_normal_fit(values: &[f64]) -> Option<LogNormalFit> {
     let n = values.len();
     if n == 0 {
@@ -575,12 +412,11 @@ fn cohort_log_normal_fit(values: &[f64]) -> Option<LogNormalFit> {
     Some(LogNormalFit { mu: median, sigma2 })
 }
 
-/// Load the set of `transcript_id`s with `em_eligible == true`
-/// from `telescope.transcript_evidence.parquet` (Module 0
-/// output, F5.3 schema).
+/// Load the set of `transcript_id`s with `em_eligible == true` from
+/// `telescope.transcript_evidence.parquet`.
 ///
-/// This is the entry point for Universal Mode's optional
-/// `em_eligible` filtering (resolver F6.3 + cohort pre-filter).
+/// This is the entry point for Universal mode's optional `em_eligible`
+/// filtering.
 pub fn load_em_eligible_set<P: AsRef<Path>>(path: P) -> Result<HashSet<String>> {
     let file = File::open(&path).with_context(|| format!("Failed to open {:?}", path.as_ref()))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -605,7 +441,7 @@ pub fn load_em_eligible_set<P: AsRef<Path>>(path: P) -> Result<HashSet<String>> 
         for i in 0..batch.num_rows() {
             // O(1) per row: `value(i)` on a non-null BooleanArray is a
             // direct bit read. Avoided `iter().nth(i)` which was O(i)
-            // per row → O(n²) total. `em_eligible` is non-null per F5.3
+            // per row → O(n²) total. `em_eligible` is non-null in the
             // schema; `value()` panics on null which is the intended
             // contract for schema-conformant inputs.
             if em_col.value(i) {
@@ -616,9 +452,8 @@ pub fn load_em_eligible_set<P: AsRef<Path>>(path: P) -> Result<HashSet<String>> 
     Ok(set)
 }
 
-/// Stream `telescope.anchor_pool.parquet` (anchor_builder
-/// output schema) into per-transcript accumulators + a flat
-/// cohort-level `log2(PAL)` vector.
+/// Stream `telescope.anchor_pool.parquet` into per-transcript accumulators
+/// plus a flat cohort-level `log2(PAL)` vector.
 fn read_anchor_pool_parquet<P: AsRef<Path>>(
     path: P,
     tx_accums: &mut HashMap<String, TxAccumulator>,
@@ -669,14 +504,10 @@ fn read_anchor_pool_parquet<P: AsRef<Path>>(
 }
 
 /// How many transcripts each level of the Tx → Gene → Cohort fallback
-/// supplied a fit for.
+/// supplied a fit for, plus the reference-universe bookkeeping.
 ///
-/// This exists because the split is a RESULT, not a log line. It was computed
-/// correctly all along and printed to stderr, but nothing outside
-/// `build_emission_from_anchors` could read it, so `n_l1 += 1` -> `n_l1 += 0`
-/// left the whole test suite green while changing the number a reader of the
-/// run compares across arms. The counters are returned so that both the CLI and
-/// a test read the same value from the same place.
+/// The counters are RETURNED, not only printed: a number that reaches nothing
+/// but stderr cannot be read by a caller or a test.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FallbackTierCounts {
     /// L1: `n_reads_tx >= fallback.tx_min_reads` — per-transcript fit.
@@ -685,79 +516,56 @@ pub struct FallbackTierCounts {
     pub l2: usize,
     /// L3: cohort-level fit (always available when ≥1 read).
     pub l3: usize,
-    /// Rows IMPUTED to reach the reference universe: a transcript named by
-    /// `@SQ` that the anchor pool never observed. Zero unless a
+    /// Rows IMPUTED to reach the reference universe: a transcript named by the
+    /// reference that the anchor pool never observed. Zero unless a
     /// `reference_universe` was supplied.
     ///
-    /// This is deliberately NOT folded into `l3`. Folding it there would keep
-    /// `l1 + l2 + l3 == rows.len()` true, but it would also silently rebase
-    /// the published tier percentages onto a 70,511-row denominator, turning
-    /// a previously printed `L3=17327 (51.8%)` into `(71.5%)` with no flag and
-    /// no doc change. Keeping it separate means the L1/L2/L3 percentages keep
-    /// describing the ANCHORED population — comparable with every earlier run —
-    /// and a reader who wants the whole table subtracts `n_imputed`.
-    ///
+    /// Deliberately NOT folded into `l3`: folding it there would silently
+    /// rebase the published tier percentages onto the padded denominator.
     /// The partition invariant is therefore four terms, not three:
-    /// `l1 + l2 + l3 + n_imputed == rows.len()`. Pinned by
-    /// `test_l1_l2_l3_tier_attribution_and_split` and by
-    /// `test_padded_rows_are_cohort_fits_not_a_fourth_tier`.
+    /// `l1 + l2 + l3 + n_imputed == rows.len()`.
     ///
     /// `n_imputed` is the SUM of the two fields below and of nothing else.
-    /// That identity is what lets this field stay the backwards-compatible
-    /// total while the split becomes readable; it is asserted, not merely
-    /// documented (see `test_suppressed_transcripts_emitted_as_incompetent`).
     pub n_imputed: usize,
     /// Imputed rows that were never anchored: named by the reference universe
     /// and absent from the anchor pool, so nothing was observed about them.
     ///
     /// `is_polyA_competent = true` on these rows. They are padded for
-    /// COMPLETENESS — the F3 axiom isolates transcripts with NO poly(A), and a
-    /// transcript the anchor pool never observed has not been shown to be one.
+    /// COMPLETENESS — a transcript the anchor pool never observed has not
+    /// been shown to have no poly(A).
     pub n_imputed_padded: usize,
     /// Imputed rows that HAD anchors and were removed by the `em_eligible`
     /// filter before row assembly.
     ///
-    /// `is_polyA_competent = false` on these rows. They are padded because the
-    /// suppression was DELIBERATE, which is a different fact from "never
-    /// observed", and the two used to be indistinguishable in this counter.
-    ///
-    /// Round 101 created this population by emitting suppressed transcripts
-    /// instead of dropping them. Before that they did not exist here at all, so
-    /// the conflation they introduced was invisible to every earlier reader of
-    /// `n_imputed`.
+    /// `is_polyA_competent = false` on these rows. The suppression was
+    /// DELIBERATE, which is a different fact from "never observed".
     pub n_imputed_suppressed: usize,
     /// Transcripts named by `reference_universe`. Zero when none was supplied.
     pub n_reference: usize,
     /// Anchored transcripts that the reference universe does NOT name.
     ///
     /// Non-zero means the model and the alignment reference disagree about
-    /// which transcripts exist, which makes the universe the wrong authority
-    /// and the emitted row count NOT equal to `n_reference`. The CLI warns
-    /// rather than silently reporting a `total` that is not the universe size.
+    /// which transcripts exist, so the emitted row count is NOT equal to
+    /// `n_reference`.
     pub n_anchored_not_in_reference: usize,
     /// Absolute path of the per-transcript provenance sidecar just written.
     ///
-    /// Returned rather than only logged: the sidecar is a product of this
-    /// function, and a product whose path only exists on stderr cannot be
-    /// opened by the test that is supposed to check it.
+    /// Returned rather than only logged, so a caller can open it.
     pub provenance_path: std::path::PathBuf,
 }
 
-/// The authoritative reference universe: every `@SQ SN` in an alignment
-/// BAM's header, in header order.
+/// The authoritative reference universe: every `@SQ SN` in an alignment BAM's
+/// header, in header order.
 ///
-/// WHY A BAM, AND WHY IT IS THE RIGHT AUTHORITY
-/// ------------------------------------------
-/// The emission model is keyed by the transcripts an alignment can name, so
-/// the set of transcripts the alignment CAN name is the only universe that
-/// makes a candidate evaluable. `tx2gene` is not a universe (it maps
-/// transcripts that exist; it does not say which exist), and a hand-kept list
-/// drifts from the reference it claims to describe. HC2 measured
-/// `n(model) - n(@SQ)` drift at exactly 0, which is what makes this
-/// checkable rather than merely defensible.
+/// A BAM is the authority because the emission model is keyed by the
+/// transcripts an alignment can name; `tx_to_gene` maps transcripts that
+/// exist but does not say which exist. The BAM is read HEADER-ONLY — no
+/// record is touched.
 ///
-/// The BAM is read HEADER-ONLY. No record is touched, so this costs a few
-/// kilobytes of I/O on a multi-gigabyte file.
+/// TRAP: the header reader is a name-keyed MAP, so a header naming the same
+/// transcript twice arrives here already collapsed, and the duplicate is not
+/// visible to this function. `build_emission_from_anchors` therefore
+/// re-checks the universe for duplicates itself and fails closed.
 pub fn read_reference_universe<P: AsRef<Path>>(bam_path: P) -> Result<Vec<String>> {
     use std::fs::File;
     use std::io::BufReader;
@@ -772,46 +580,6 @@ pub fn read_reference_universe<P: AsRef<Path>>(bam_path: P) -> Result<Vec<String
     // `reference_sequences()` is keyed by ReferenceSequenceId and its iteration
     // order matches the `@SQ` lines, which is what makes the result
     // deterministic.
-    //
-    // CORRECTION 2026-10-15. This comment used to read: "Names are NOT
-    // de-duplicated: SAM requires `@SQ SN` to be unique, so a duplicate means a
-    // malformed file, and silently collapsing one would turn a corrupt
-    // reference into a plausible-looking universe." That is FALSE, and it was
-    // false about this function's own behaviour by the time it was written.
-    // `reference_sequences()` is a MAP keyed by reference name, so a header
-    // naming the same transcript twice arrives here already collapsed. Measured:
-    // a header written with `@SQ SN:tx0, SN:tx1, SN:tx1` returns
-    // `["tx0", "tx1"]` -- two entries, not three. The corrupt reference IS
-    // turned into a plausible-looking universe; it is just noodles doing it, one
-    // layer below, not this code.
-    //
-    // WHY IT MATTERS, and it is not pedantry. `main.rs` asserts the emission
-    // conservation law
-    //     n_after == n_reference + n_anchored_not_in_reference
-    // where BOTH sides are the cardinality of `anchored UNION universe`, so the
-    // law is an identity that a well-formed universe can never violate. The one
-    // input that broke it -- a universe vector naming a transcript twice, which
-    // pushes the key into the emitted set twice while `n_imputed` (a HashSet)
-    // counts it once -- is only reachable if THIS function can return a
-    // duplicate. It cannot, today, because of noodles' map. So the CLI guard is
-    // sound only by an undocumented invariant of a third-party crate, and a
-    // noodles upgrade that changed that map would make the guard reachable
-    // without anyone noticing the guard had changed status.
-    //
-    // `test_a_duplicated_universe_entry_is_collapsed_by_the_header_reader` in
-    // `crates/telescope-cli/tests/` pins the collapse, so that upgrade turns a
-    // test red instead of silently changing what the guard means.
-    //
-    // UPDATED 2026-10-15. The paragraph above, read alone, says the CLI
-    // conservation guard is sound "only by an undocumented invariant of a
-    // third-party crate". That was the state of the world when it was written
-    // and it is no longer: `build_emission_from_anchors` now checks
-    // `reference_universe` for duplicates ITSELF and `bail!`s. So a noodles
-    // upgrade that un-collapses the map now turns the CLI test red AND, if the
-    // collapse were removed without anyone reading the test, a loud `Err` at
-    // the library entry point instead of a silently corrupted emission table.
-    // The dependence on noodles is real but it is no longer load-bearing on
-    // its own.
     Ok((0..header.reference_sequences().len())
         .map(|i| match header.reference_sequences().get_index(i) {
             Some((name, _)) => name.to_string(),
@@ -824,23 +592,9 @@ pub fn read_reference_universe<P: AsRef<Path>>(bam_path: P) -> Result<Vec<String
 /// The five provenance tiers, exactly as written into
 /// `<stem>.provenance.parquet`'s `tier` column.
 ///
-/// WHY THESE FIVE AND NOT THREE. The L1/L2/L3 cascade has three levels, and
-/// an IMPUTED row is not one of them: it has no anchors at all, so it never
-/// entered the cascade. Folding it into `L3` would make "L3" mean both "this
-/// transcript's own gene pool was too small" and "this transcript was never
-/// observed", which are different facts with different consequences downstream.
-/// `L3_imputed` and `L3_anchored` are therefore separate enum values even
-/// though both carry the cohort fit.
-///
-/// `L3_unexpressed` (R141) splits the imputed population a second time, on the
-/// only line the data supports: whether the transcript's OWN GENE has an entry
-/// in `gene_fit`. When it does, the cohort fit this row carries is standing in
-/// for a gene that WAS measured from pooled anchors of sibling transcripts —
-/// a legal imputation derived from real measurements of the same locus. When
-/// it does not, nothing in this dataset informs the transcript beyond the
-/// cohort-wide prior, and calling that an imputation overstates it. It is a
-/// LABEL split only: no fitted value, no `is_polyA_competent`, and no row
-/// changes.
+/// An IMPUTED row is not a level of the L1/L2/L3 cascade: it has no anchors
+/// at all. `L3_imputed` (the gene was measured) and `L3_unexpressed` (it was
+/// not) are therefore separate values even though both carry the cohort fit.
 pub const TIER_L1: &str = "L1";
 pub const TIER_L2: &str = "L2";
 pub const TIER_L3_ANCHORED: &str = "L3_anchored";
@@ -849,12 +603,10 @@ pub const TIER_L3_UNEXPRESSED: &str = "L3_unexpressed";
 
 /// Schema of the per-transcript provenance sidecar: exactly four columns.
 ///
-/// Deliberately NOT a column of `telescope.emission.parquet`. That schema is
-/// frozen at seven columns, and the question this table answers — which
-/// fallback level produced this row's `(mu, sigma2)` — is not answerable from
+/// Deliberately NOT a column of `telescope.emission.parquet`: the fallback
+/// level that produced a row's `(mu, sigma2)` is not answerable from
 /// `n_cohort_flnc` alone, because L2 is decided by the GENE's pooled count
-/// while the parquet only carries the TRANSCRIPT's own count. The
-/// discriminators have to live outside the frozen file.
+/// while the parquet carries only the TRANSCRIPT's own count.
 pub fn provenance_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("transcript_id", DataType::Utf8, false),
@@ -872,11 +624,8 @@ pub fn provenance_schema() -> Arc<Schema> {
 /// [`build_emission_from_anchors`], where the row loop iterates one sorted
 /// `tx_keys` vector and appends to both builders in lockstep.
 ///
-/// The file name is derived from `emission_path` by replacing `.parquet`
-/// with `.provenance.parquet`, so `<stem>.emission.parquet` produces
-/// `<stem>.emission.provenance.parquet`. The path is RETURNED as well as
-/// written, because a path that only reaches stderr is a path no test can
-/// open.
+/// The file name is derived from `emission_path` by replacing `.parquet` with
+/// `.provenance.parquet`. The path is RETURNED as well as written.
 pub fn write_provenance_parquet<P: AsRef<Path>>(
     emission_path: P,
     rows: &[(String, String, &'static str, u32)],
@@ -920,28 +669,11 @@ pub fn write_provenance_parquet<P: AsRef<Path>>(
     Ok(out_path)
 }
 
-/// Build `telescope.emission.parquet` from a Universal Mode
-/// `anchor_pool.parquet` (per-read rows).
+/// Build `telescope.emission.parquet` from a Universal-mode
+/// `anchor_pool.parquet` (per-read rows), fitting each transcript at the Tx,
+/// Gene or Cohort level and returning the L1/L2/L3 split.
 ///
-/// Returns the L1/L2/L3 split — see [`FallbackTierCounts`].
-///
-/// Algorithm (per spec 常温区 Step 3 Part 2):
-/// 1. Read `anchor_pool.parquet` (per-read `poly_a_length`,
-///    `gene_id`, `transcript_id`).
-/// 2. If `transcript_evidence_path` is provided, drop reads
-///    whose `transcript_id` has `em_eligible == false`.
-/// 3. Compute cohort-level robust fit (median + MAD) across
-///    all surviving reads.
-/// 4. For each transcript, pick the best fit:
-///    - L1 Tx-level if `n_reads_tx >= fallback.tx_min_reads`.
-///    - L2 Gene-level if pooled gene reads
-///      `>= fallback.gene_min_reads`. The same `(mu, sigma2)`
-///      is shared across all underpowered transcripts in the
-///      same gene.
-///    - L3 Cohort-level fit (always available when ≥1 read).
-/// 5. `polyA_frac = 1.0` by construction (anchor filter
-///    requires `pt:i >= 10`); `is_polyA_competent = true` for
-///    every non-empty transcript. See module docstring.
+/// See [`FallbackTierCounts`] for the returned counts.
 pub fn build_emission_from_anchors<P, Q>(
     anchor_pool_path: P,
     transcript_evidence_path: Option<Q>,
@@ -954,24 +686,10 @@ where
     P: AsRef<Path>,
     Q: AsRef<Path>,
 {
-    // W2'. Fail closed on a reference universe that names a transcript twice.
-    //
-    // WHY THIS IS HERE AND NOT ONLY IN `main.rs`. The CLI's conservation
-    // `ensure!` (n_after == n_reference + n_anchored_not_in_reference) compares
-    // two cardinalities of `anchored UNION universe`, so it is an identity on any
-    // two well-formed SETS and can only fire when the universe carries a
-    // duplicate key. Today `read_reference_universe` returns noodles'
-    // `reference_sequences()`, which is a name-keyed MAP and has already
-    // collapsed duplicates by the time it reaches us -- measured: `@SQ SN:tx0,
-    // SN:tx1, SN:tx1` yields two entries. So the CLI guard currently rests on an
-    // undocumented invariant of a third-party crate rather than on anything this
-    // repository enforces, and a noodles upgrade that changed that map would make
-    // the guard reachable with nobody noticing its status had changed.
-    //
-    // Checking here makes the precondition explicit at the layer that actually
-    // consumes it, so the law's soundness stops depending on someone else's data
-    // structure. Cost is O(n) over a header-sized vector, paid once, and it runs
-    // before a single parquet row is read.
+    // Fail closed on a reference universe that names a transcript twice: a
+    // duplicate key would be pushed into the emitted row set twice while
+    // `n_imputed` (a HashSet) counts it once, so the CLI's conservation law —
+    // an identity on two SETS — would be violated by construction.
     if let Some(universe) = reference_universe {
         let mut seen = std::collections::HashSet::with_capacity(universe.len());
         for tx in universe {
@@ -997,16 +715,12 @@ where
 
     // 2. Optional em_eligible filter.
     //
-    // `em_suppressed` records what the filter removed, BY MOVE -- the loop
+    // `em_suppressed` records what the filter removed BY MOVE — the loop
     // consumes `tx_accums`, so cloning the dropped keys would cost a clone per
-    // ineligible transcript. It is consumed later, when the reference universe
-    // pads the row set: a suppressed transcript that the universe names is
-    // still emitted, but as an INCOMPETENT row rather than a competent one.
-    // Dropping the row instead would leave `rows.len() < n_reference` with no
-    // counter able to see it, and would report the transcript as `n_missing`
-    // in the candidate ledger -- whose documented question is "would padding
-    // have saved this read?" (em.rs `CandidateAvailability`) -- when the truth
-    // is that the suppression was deliberate. See the match arm below.
+    // ineligible transcript. A suppressed transcript that the reference
+    // universe names is still emitted, but as an INCOMPETENT row; dropping the
+    // row instead would leave `rows.len() < n_reference` with no counter able
+    // to see it.
     let mut em_suppressed: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Some(te_path) = transcript_evidence_path {
         let em_set = load_em_eligible_set(&te_path)?;
@@ -1037,8 +751,8 @@ where
     let cohort_fit = cohort_log_normal_fit(&cohort_log2_pals)
         .context("cohort_log_normal_fit failed despite non-empty input")?;
 
-    // Informational only: spec says L3 is always available, but
-    // log a warning when the cohort is suspiciously small.
+    // Informational only: L3 is always available, but log a warning when the
+    // cohort is suspiciously small.
     if cohort_log2_pals.len() < fallback.cohort_min_reads {
         eprintln!(
             "[telescope][INFO] cohort reads ({}) < cohort_min_reads ({}); \
@@ -1065,7 +779,14 @@ where
         }
     }
 
-    // 5+6. Per-transcript fit + output row assembly.
+    // 5+6. Per-transcript fit + output row assembly. Each transcript takes
+    // the best of: L1 Tx-level if `n_reads_tx >= fallback.tx_min_reads`;
+    // L2 Gene-level if pooled gene reads `>= fallback.gene_min_reads` (the
+    // same `(mu, sigma2)` is shared across all underpowered transcripts in
+    // that gene); L3 Cohort-level fit (always available when ≥1 read).
+    // `polyA_frac` is 1.0 by construction (the anchor filter requires
+    // `pt:i >= 10`) and `is_polyA_competent` is true for every non-empty
+    // transcript.
     let mut tx_id_builder = StringBuilder::new();
     let mut gene_id_builder = StringBuilder::new();
     let mut frac_builder = Float64Builder::new();
@@ -1073,23 +794,17 @@ where
     let mut count_builder = UInt32Builder::new();
     let mut mu_builder = Float64Builder::new();
     let mut sigma2_builder = Float64Builder::new();
-    // Provenance sidecar, built in lockstep with the emission row below. It is
-    // a SEPARATE FILE, not an eighth column: the 7-column emission schema is
-    // frozen, and `n_cohort_flnc == 0` is the only in-schema marker of an
-    // imputed row, so the fallback LEVEL that produced an ANCHORED row's
+    // Provenance sidecar, built in lockstep with the emission row below: a
+    // SEPARATE FILE, not an eighth column, because the 7-column emission
+    // schema is frozen and the fallback LEVEL that produced an ANCHORED row's
     // `(mu, sigma2)` is not recoverable from the parquet itself.
     let mut tier_builder = StringBuilder::new();
 
-    // THE EMITTED KEY SET. Normally this is the anchor pool's transcripts and
-    // nothing else, which is precisely the defect that padding exists to fix:
-    // a read whose candidate is absent from the table cannot be evaluated, so
-    // it is dropped with no profile row. With a reference universe the set
-    // becomes the UNION, and a universe key with no anchors becomes an imputed
-    // row.
-    //
-    // A universe key that DOES have anchors is reached through `tx_accums`
-    // and therefore takes the anchored path — the union makes a double emit
-    // structurally impossible rather than something a test has to catch.
+    // THE EMITTED KEY SET: normally the anchor pool's transcripts, and with a
+    // reference universe the UNION of pool and universe. A universe key with
+    // no anchors becomes an imputed row; a universe key that HAS anchors is
+    // reached through `tx_accums`, so the union makes a double emit
+    // structurally impossible.
     let mut tx_keys: Vec<&String> = tx_accums.keys().collect();
     let mut imputed_keys: std::collections::HashSet<&String> = std::collections::HashSet::new();
     let mut n_reference = 0usize;
@@ -1124,44 +839,28 @@ where
     // The same rows, in the same order, as a plain Vec. This is the ONLY place
     // the two tables are kept in step, which is why the sidecar is written
     // from here rather than re-derived by re-reading the parquet back: a
-    // re-read would be a second code path that could disagree with the first
-    // and there would be nothing to catch it.
+    // re-read would be a second code path that could disagree with the first.
     let mut provenance_rows: Vec<(String, String, &'static str, u32)> =
         Vec::with_capacity(n_rows_emitted);
 
     for tx_id in tx_keys {
         // IMPUTED ROW. Reached only for a universe key with no entry in
-        // `tx_accums`, which the union above guarantees. Two distinct reasons
-        // land here, and they are NOT the same row:
+        // `tx_accums`. Two distinct reasons land here, and they are NOT the
+        // same row:
         //
-        //   (a) never had anchors -- `is_polyA_competent = true`. That is the
-        //       load-bearing choice, and it is NOT a claim this transcript was
-        //       measured to have a poly(A) tail; it says the row is evaluable.
-        //       The F3 axiom isolates transcripts with NO poly(A), and a
-        //       transcript absent from the anchor pool has not been shown to be
-        //       one. HC2 measured `pt >= 10` on 98.23% of the reads landing on
-        //       exactly this set, so the isolated case is not what is padded.
-        //
+        //   (a) never had anchors -- `is_polyA_competent = true`. That says
+        //       the row is EVALUABLE, not that the transcript was measured to
+        //       have a poly(A) tail.
         //   (b) HAD anchors and was removed by the `em_eligible` filter --
-        //       `is_polyA_competent = false`. Marking this row true would let a
-        //       transcript the resolver deliberately suppressed win posterior
-        //       mass, which is the bug this arm exists to close: the reads of a
-        //       TierC transcript (zero poly(A)-compatible reads BY CONSTRUCTION,
-        //       `resolver::classify_tier`) or of a TierB transcript superseded by
-        //       its TierA isoform would stay attributed to it instead of to the
-        //       transcript that supersedes it.
+        //       `is_polyA_competent = false`. Marking this row true would let
+        //       a transcript the resolver deliberately suppressed win
+        //       posterior mass.
         //
         // `false` is not a demotion, it is the E-step's own switch: an
-        // incompetent candidate is pushed as `-inf` and cannot win any mass, so
-        // the row is inert while still present. Keeping the row is what keeps
-        // `rows.len() == n_reference` and routes the candidate to the ledger's
-        // `n_incompetent` bucket -- whose question is "where did this candidate
-        // go?" -- rather than to `n_missing`, whose question is "would padding
-        // have saved this read?" (em.rs `CandidateAvailability`).
+        // incompetent candidate is pushed as `-inf` and cannot win any mass.
         //
         // In both cases the fit is the cohort fit and `n_cohort_flnc = 0` is the
-        // in-schema marker that says "imputed, not observed" — the 7-column
-        // schema is frozen and gets no eighth column for this.
+        // in-schema marker that says "imputed, not observed".
         let (gene_id, poly_a_frac, is_poly_a_competent, n_obs, fit, tier) =
             match tx_accums.get(tx_id.as_str()) {
                 None if em_suppressed.contains(tx_id.as_str()) => {
@@ -1184,21 +883,13 @@ where
                     let gene = tx_to_gene
                         .and_then(|m| m.get(tx_id).cloned())
                         .unwrap_or_else(|| (*tx_id).clone());
-                    // THE THIRD STATUS (R141). `gene_fit` holds a fit for every
-                    // gene whose POOLED anchors reached `gene_min_reads`, so it
-                    // answers exactly one question about a never-anchored
-                    // transcript: did anything in this dataset measure this
-                    // LOCUS? A gene with an entry here is backed by real
-                    // measurements of sibling transcripts, which makes borrowing
-                    // the cohort fit for one of its isoforms a legal
-                    // imputation. A gene with no entry is not: nothing beyond
-                    // the cohort-wide prior informs this row, and labelling
-                    // that `L3_imputed` presents a fabricated fit as a
-                    // derivation.
-                    //
-                    // LABEL ONLY. The fitted values, `is_polyA_competent` and
+                    // LABEL ONLY: the fitted values, `is_polyA_competent` and
                     // the row count are identical in both arms — this changes
-                    // what the table SAYS, not what it computes.
+                    // what the table SAYS, not what it computes. `gene_fit`
+                    // holds a fit for every gene whose POOLED anchors reached
+                    // `gene_min_reads`, so it answers exactly one question
+                    // about a never-anchored transcript: did anything in this
+                    // dataset measure this LOCUS?
                     let tier = if gene_fit.contains_key(&gene) {
                         TIER_L3_IMPUTED
                     } else {
@@ -1218,9 +909,9 @@ where
                 }
                 Some(acc) => {
                     let n = acc.len();
-                    // Universal-Mode polyA_frac: anchor filter enforces
+                    // Universal-mode polyA_frac: the anchor filter enforces
                     // pt:i >= 10, so by construction this is 1.0 for any
-                    // non-empty transcript. Documented in module docstring.
+                    // non-empty transcript.
                     let (fit, tier) = if n >= fallback.tx_min_reads {
                         n_l1 += 1;
                         // L1: per-tx fit. `n >= tx_min_reads >= 1` implies
@@ -1254,19 +945,13 @@ where
         //
         // WHICH FALLBACK LEVEL produced the row's `(mu, sigma2)` is not
         // recorded here; it is inferred by comparing `n` against
-        // `tx_min_reads` / `gene_min_reads`. Pinned by
-        // `test_n_cohort_flnc_counts_observations_not_distinct_lengths`.
+        // `tx_min_reads` / `gene_min_reads`.
         //
-        // `0` NOW HAS A SECOND MEANING, and that is deliberate: it marks an
-        // IMPUTED row, emitted to reach the reference universe for a
-        // transcript the anchor pool never observed. Before reference-universe
-        // padding, `0` was unreachable in this file -- a transcript with no
-        // anchors had no row at all -- so nothing downstream could have been
-        // relying on it. Inside the parquet an imputed row is
-        // indistinguishable from a transcript observed zero times; that is
-        // the accepted cost of the frozen 7-column schema, and the
-        // discriminators live outside it (`FallbackTierCounts::n_imputed` and
-        // the CLI's provenance sidecar).
+        // `0` marks an IMPUTED row, emitted to reach the reference universe for
+        // a transcript the anchor pool never observed. Inside the frozen
+        // 7-column schema an imputed row is otherwise indistinguishable from a
+        // transcript observed zero times; the discriminators live outside it
+        // (`FallbackTierCounts::n_imputed` and the provenance sidecar).
         count_builder.append_value(n_obs);
         mu_builder.append_value(fit.mu);
         sigma2_builder.append_value(fit.sigma2);
@@ -1274,17 +959,15 @@ where
         provenance_rows.push((tx_id.clone(), gene_id.clone(), tier, n_obs));
     }
 
-    // W1'. The physical builder must have received exactly one row per key the
+    // The physical builder must have received exactly one row per key the
     // solver decided to emit. `tx_keys` was MOVED by the emission loop above, so
     // `tx_keys.len()` is unreachable here; `n_rows_emitted` is its pre-move
     // capture, and the builder is still live because `finish()` has not run.
     //
     // This is the check the CLI conservation `ensure!` cannot make: that law
-    // compares two cardinalities of `anchored UNION universe`, which is an
-    // identity on any two SETS. A builder that silently dropped or duplicated
-    // a row changes the emitted ARRAYS, not the set, so nothing downstream sees
-    // it -- `RecordBatch::try_new` would succeed as long as the lengths agree
-    // with each other, which they would not, so this is where it dies instead.
+    // compares two cardinalities of `anchored UNION universe`, an identity on
+    // two SETS, while a builder that dropped or duplicated a row changes the
+    // emitted ARRAYS.
     anyhow::ensure!(
         tx_id_builder.len() == n_rows_emitted,
         "emission builder row count {} != emitted key count {}",
@@ -1316,20 +999,17 @@ where
     writer.close().context("Failed to close writer")?;
 
     // The L1/L2/L3 COUNTS are what the fallback cascade chose; the FRACTIONS
-    // are what it means for the run, and the two answer different questions.
-    // A run that is 80% L1 and a run that is 80% L3 both print a valid triple,
-    // but the second is a run in which most transcripts carry no
-    // transcript-specific poly(A) distribution at all — the cohort fit is
-    // standing in for them. The denominator is the number of output rows, and
-    // the caller formats it: the split is RETURNED (see `FallbackTierCounts`)
-    // rather than formatted here, because a number that only reaches stderr is
-    // a number no test can read.
+    // are what it means for the run, and the two answer different questions: a
+    // run that is 80% L3 is a run in which most transcripts carry no
+    // transcript-specific poly(A) distribution at all.
     //
-    // The run header stays here because only this function knows how many
-    // cohort reads survived the `em_eligible` filter. The THIRD number is the
-    // emitted row count: it is NOT `tx_accums.len()` once a reference universe
-    // is supplied, and printing the anchored count alone beside a padded table
-    // would state a row count the file does not have.
+    // The split is RETURNED (see `FallbackTierCounts`) rather than formatted
+    // here: a number that only reaches stderr is a number no test can read.
+    //
+    // The third number is the emitted row count: it is NOT `tx_accums.len()`
+    // once a reference universe is supplied, and printing the anchored count
+    // alone beside a padded table would state a row count the file does not
+    // have.
     eprintln!(
         "[telescope]  Universal mode: {} anchored transcripts, {} cohort reads, \
          {} rows emitted",
@@ -1342,14 +1022,10 @@ where
     // provenance file describing a model that was never emitted.
     let provenance_path = write_provenance_parquet(output_path.as_ref(), &provenance_rows)?;
 
-    // W1'' second half. `n_imputed_padded` and `n_imputed_suppressed` are
-    // computed by two independent `filter`s over `imputed_keys`, and
-    // `em_suppressed` is a HashSet, so the two predicates are exact complements
-    // and the sum is `imputed_keys.len()` by construction. The comment below
-    // says so. This turns that comment into a check the code cannot violate
-    // without the check also going red: the risk is not the partition being
-    // wrong now, it being wrong after someone adds a third imputed category and
-    // remembers to update one side only.
+    // `n_imputed_padded` and `n_imputed_suppressed` are computed by two
+    // independent filters over `imputed_keys`, and `em_suppressed` is a
+    // HashSet, so the two predicates are exact complements and the sum is
+    // `imputed_keys.len()` by construction.
     let n_imputed = imputed_keys.len();
     let n_imputed_padded = imputed_keys
         .iter()
@@ -1386,30 +1062,17 @@ mod tests {
 
     /// A private scratch directory that no other process can collide with.
     ///
-    /// Two things are wrong with `temp_dir().join("telescope_test_<x>")`:
-    ///
-    /// 1. `$TMPDIR` here is `/datg/hanxi/tmp`, which is **nfs4**. A file
-    ///    written and immediately re-read under concurrent I/O can come back
-    ///    0 bytes. That already flaked a different test in this crate once
-    ///    (`EOF: Parquet file too small`); the same helper exists in `em.rs`
-    ///    as `local_scratch`.
-    /// 2. A FIXED name is shared by every concurrent `cargo test`, and each
-    ///    test `remove_dir_all`s its directory at the START. Two runs
-    ///    therefore delete each other's fixtures: measured on 2026-10-06 as
-    ///    `open provenance parquet: No such file or directory`, in a test
-    ///    that had passed minutes earlier in the same day. A test that is
-    ///    green once and red once is worse than one that is red always,
-    ///    because it trains the reader to distrust the suite.
-    ///
-    /// Local xfs `/tmp` plus the PID fixes both: distinct per process, and not
-    /// on the network filesystem.
+    /// Local xfs `/tmp`, NOT `$TMPDIR`: on a network filesystem a file written
+    /// and immediately re-read under concurrent I/O can come back 0 bytes.
+    /// Plus the PID: a FIXED name is shared by every concurrent `cargo test`,
+    /// and each test removes its directory at the START, so two runs delete
+    /// each other's fixtures.
     fn local_scratch(name: &str) -> PathBuf {
         PathBuf::from("/tmp").join(format!("telescope_em_{}_{}", name, std::process::id()))
     }
 
     #[test]
     fn min_cohort_variance_value() {
-        // Pinned in spec F3 / spec-self-audit-v0.1.3 R1.
         assert!((INSTRUMENTAL_PAL_NOISE_FLOOR - 0.04).abs() < f64::EPSILON);
     }
 
@@ -1433,10 +1096,10 @@ mod tests {
     }
 
     // ===================================================================
-    // Universal Mode test fixtures + the 3 mandated tests
+    // Universal-mode test fixtures
     // ===================================================================
 
-    /// Logical fixture row shared across all 3 Universal-Mode tests.
+    /// Logical fixture row shared across the Universal-mode tests.
     /// Each `(gene_id, tx_id)` may appear at most once.
     struct TxFixture {
         gene_id: String,
@@ -1447,11 +1110,8 @@ mod tests {
     /// Write an AIDRS-format `aidrs.transcript_polyA_len.parquet`
     /// (3-column subset) from a list of `TxFixture`.
     ///
-    /// This is the fixture writer for the DEFERRED external poly(A)
-    /// initializer, and it is RETAINED rather than deleted: it is what
-    /// `test_aidrs_universal_equivalence` feeds `build_emission_parquet`
-    /// with, and that test is required to keep running. Deleting the
-    /// helper would delete the test with it.
+    /// Retained with the deferred initializer it exercises: deleting it would
+    /// delete `test_aidrs_universal_equivalence` with it.
     fn write_aidrs_parquet(path: &Path, fxs: &[TxFixture]) {
         let mut tx_b = StringBuilder::new();
         let mut gene_b = StringBuilder::new();
@@ -1497,9 +1157,8 @@ mod tests {
     /// Write an AIDRS-format assessment.tsv (`TrID\tpolyA_frac`).
     /// All entries get `polyA_frac = 1.0` (State 1).
     ///
-    /// RETAINED, not deleted: fixture writer for the DEFERRED external
-    /// poly(A) initializer, used only by
-    /// `test_aidrs_universal_equivalence`. See `write_aidrs_parquet`.
+    /// Retained with the deferred initializer it exercises; see
+    /// `write_aidrs_parquet`.
     fn write_assessment_tsv(path: &Path, fxs: &[TxFixture]) {
         use std::fmt::Write as _;
         let mut s = String::from("TrID\tpolyA_frac\n");
@@ -1509,8 +1168,8 @@ mod tests {
         std::fs::write(path, s).expect("write assessment.tsv fixture");
     }
 
-    /// Write a Universal-Mode `anchor_pool.parquet` from the
-    /// same logical fixtures: one row per `(tx_id, pal)`.
+    /// Write a Universal-mode `anchor_pool.parquet` from the same logical
+    /// fixtures: one row per `(tx_id, pal)`.
     fn write_anchor_pool_parquet(path: &Path, fxs: &[TxFixture]) {
         let mut sample_b = StringBuilder::new();
         let mut read_b = StringBuilder::new();
@@ -1559,9 +1218,9 @@ mod tests {
         w.close().expect("close anchor_pool fixture writer");
     }
 
-    /// Write a Module-0 `transcript_evidence.parquet` fixture
-    /// containing only the 2 columns consumed by
-    /// `load_em_eligible_set` (`transcript_id`, `em_eligible`).
+    /// Write a `transcript_evidence.parquet` fixture containing only the 2
+    /// columns consumed by `load_em_eligible_set` (`transcript_id`,
+    /// `em_eligible`).
     fn write_transcript_evidence_minimal(path: &Path, entries: &[(String, bool)]) {
         let mut tx_b = StringBuilder::new();
         let mut em_b = BooleanBuilder::new();
@@ -1587,9 +1246,6 @@ mod tests {
         w.close().expect("close transcript_evidence fixture writer");
     }
 
-    /// Read `telescope.emission.parquet` back into a
-    /// `Vec<(transcript_id, mu, sigma2, n_cohort_flnc, polyA_frac, is_polyA_competent)>`
-    /// for assertions. Sorted by `transcript_id`.
     /// Read the provenance sidecar back as (transcript_id, gene_id, tier,
     /// n_anchor). Deliberately a SEPARATE reader from `read_emission_parquet`
     /// so the test is not comparing one in-memory vector against itself.
@@ -1636,6 +1292,10 @@ mod tests {
         out
     }
 
+    /// Read `telescope.emission.parquet` back into a
+    /// `Vec<(transcript_id, gene_id, polyA_frac, is_polyA_competent,
+    /// n_cohort_flnc, mu_logPAL, sigma2_logPAL)>` for assertions. Sorted by
+    /// `transcript_id`.
     fn read_emission_parquet(path: &Path) -> Vec<(String, String, f64, bool, u32, f64, f64)> {
         let f = File::open(path).expect("open emission parquet");
         let b = ParquetRecordBatchReaderBuilder::try_new(f).expect("init reader");
@@ -1701,45 +1361,30 @@ mod tests {
         out
     }
 
-    /// Per spec 常温区 Step 3 Part 2 + final ruling: the
-    /// statistical equivalence test between the external
-    /// poly(A) initializer and Universal mode is the acceptance
-    /// criterion for Step 3 Part 2.
+    /// The deferred external initializer and Universal mode must AGREE: to
+    /// <1e-9 relative on `mu_logPAL` and `sigma2_logPAL`, and EXACTLY on
+    /// `n_cohort_flnc`.
     ///
-    /// THIS TEST KEEPS RUNNING after the initializer lost its CLI
-    /// surface on 2026-10-03. It is the live proof that
-    /// `build_emission_parquet` (deferred, no CLI entry point
-    /// reaches it) and `build_emission_from_anchors` (the only
-    /// CLI-reachable path) AGREE — to <1e-9 relative on `mu_logPAL`
-    /// and `sigma2_logPAL`, and EXACTLY on `n_cohort_flnc`. Do not
-    /// convert it to prose and do not loosen its tolerances: it is
-    /// the only executable evidence that the retained initializer
-    /// is a real option rather than dead code, and the only thing
-    /// pinning the fit is format-independent.
+    /// Do not convert this to prose and do not loosen its tolerances: it is
+    /// the only executable evidence that the retained initializer is a real
+    /// option rather than dead code, and the only thing pinning the fit as
+    /// format-independent.
     ///
-    /// Note what it does NOT show: that either path assigns reads
-    /// to transcripts better than the other. Both consume the same
-    /// (tx, pal) pairs here, so upstream read→transcript
-    /// assignment — the actual open question — is held fixed and
-    /// unmeasured. See the module docs on why the initializer is
-    /// deferred.
+    /// Note what it does NOT show: that either path assigns reads to
+    /// transcripts better than the other. Both consume the same (tx, pal)
+    /// pairs, so upstream read→transcript assignment is held fixed and
+    /// unmeasured.
     ///
-    /// Test fixture: 3 transcripts, 100 reads each, all reads
-    /// uniquely mapping to 1 transcript. Reads sampled from a
-    /// log-normal in `log2(PAL)` space (synthetic, deterministic
-    /// pal values). The SAME data is laid out in two formats
-    /// (initializer-format list-per-tx vs Universal-format
-    /// per-read rows) and processed by the two paths. Per-transcript
-    /// `mu_logPAL`, `sigma2_logPAL`, and `n_cohort_flnc` MUST
-    /// agree to machine precision. `polyA_frac` and
-    /// `is_polyA_competent` are documented to differ conceptually
-    /// (Universal mode is always State 1 by construction).
+    /// Fixture: 3 transcripts, 100 reads each. The SAME data is laid out in
+    /// two formats (list-per-tx vs per-read rows) and processed by the two
+    /// paths. `polyA_frac` and `is_polyA_competent` are documented to differ
+    /// conceptually (Universal mode is always State 1 by construction).
     #[test]
     fn test_aidrs_universal_equivalence() {
         // Deterministic fixture: 3 transcripts × 100 reads each.
         // Use pal values [a, a+1, ..., a+99] per tx — the actual
         // distribution shape is irrelevant; what matters is that
-        // both AIDRS and Universal see IDENTICAL (tx, pal) pairs.
+        // both paths see IDENTICAL (tx, pal) pairs.
         let fxs = vec![
             TxFixture {
                 gene_id: "gene_1".into(),
@@ -1796,7 +1441,7 @@ mod tests {
         assert_eq!(aidrs_tx, univ_tx, "transcript_id sets must match");
 
         // Per-tx equivalence within machine precision.
-        let tol = 1e-9_f64; // spec-mandated
+        let tol = 1e-9_f64; // relative tolerance for the two paths to agree
         for (a, u) in rows_aidrs.iter().zip(rows_univ.iter()) {
             assert_eq!(a.0, u.0, "transcript_id order mismatch");
             assert_eq!(a.1, u.1, "gene_id must match for {}", a.0);
@@ -1962,11 +1607,9 @@ mod tests {
         );
     }
 
-    /// Verify that `transcript_evidence.parquet` `em_eligible`
-    /// filtering drops reads whose transcript is not eligible.
-    /// Specifically, even though `tx_filtered` has reads in the
-    /// anchor pool, those reads must NOT contribute to the
-    /// output (its emission row is dropped entirely).
+    /// `em_eligible` filtering drops reads whose transcript is not eligible:
+    /// even though `tx_filtered` has reads in the anchor pool, those reads
+    /// must NOT contribute to the output (its emission row is dropped).
     #[test]
     fn test_universal_em_eligible_filtering() {
         let fxs = vec![
@@ -2022,22 +1665,14 @@ mod tests {
 
     /// `n_cohort_flnc` counts OBSERVATIONS, not distinct lengths.
     ///
-    /// The column is named as though it were a cohort-fallback count and is
-    /// easy to read as a count of distinct values; it is neither. It is
+    /// The column is easy to read as a count of distinct values; it is
     /// `acc.len()` — the number of anchor rows for the transcript, one per
     /// (sample, transcript, read). A transcript whose 2 reads carry the SAME
     /// `poly_a_length` therefore reports 2, not 1.
     ///
-    /// This is the ONLY assertion that separates the two readings. The
-    /// distinct-values case is already pinned by
-    /// `test_universal_em_eligible_filtering` above (10 reads, 10 distinct
-    /// lengths, `n_cohort_flnc == 10`); that case is consistent with BOTH
-    /// "counts observations" and "counts distinct values", so it cannot
-    /// discriminate. Repeating it here would add no coverage. Degenerating
-    /// the two reads to one value is what makes the readings differ.
-    ///
-    /// A mutation that made this column count distinct lengths would leave
-    /// the whole suite green without this test.
+    /// The distinct-values case is consistent with BOTH readings, so only the
+    /// degenerate case discriminates: a mutation that made this column count
+    /// distinct lengths would otherwise leave the suite green.
     #[test]
     fn test_n_cohort_flnc_counts_observations_not_distinct_lengths() {
         let tmp = local_scratch("telescope_test_ncohort_obs");
@@ -2080,33 +1715,16 @@ mod tests {
 
     /// L1 / L2 / L3 TIER ATTRIBUTION and SPLIT, with all three tiers non-empty.
     ///
-    /// TWO THINGS ARE ASSERTED, and they fail independently.
+    /// TWO THINGS ARE ASSERTED, and they fail independently: (1) the SPLIT
+    /// `(l1, l2, l3) == (1, 4, 1)` read off the return value, which is what
+    /// pins the counters themselves, and (2) the ATTRIBUTION — which fit each
+    /// transcript was actually given.
     ///
-    /// (1) THE SPLIT, read off `build_emission_from_anchors`'s return value:
-    /// `(l1, l2, l3) == (1, 4, 1)`. This is the assertion that pins the
-    /// counters themselves. `n_l1 += 1` -> `n_l1 += 0` used to leave the whole
-    /// suite green, because the counters were function-local and reached only
-    /// an `eprintln!`; they are now returned as [`FallbackTierCounts`] and read
-    /// from here and from the CLI. The counters sum to the number of emitted
-    /// rows, which is asserted too — a cascade that counted a transcript twice
-    /// or dropped one would break it.
-    ///
-    /// (2) THE ATTRIBUTION: which fit each transcript was actually given.
-    /// `test_3level_fallback_thresholds` above already pins the `(mu, sigma2)`
-    /// each level produces, but it does not pin WHICH transcripts sit in each
-    /// level, nor that all four L2 transcripts share one bit-identical fit.
-    /// Collapsing the L2 branch into L3 turns (2) red.
-    ///
-    /// THE FIXTURE. L2 is the tier that a naive fixture cannot reach, because
-    /// it needs a gene pool strictly larger than any single transcript's pool.
-    /// `write_anchor_pool_parquet` DOES take a `gene_id` per `TxFixture` and
-    /// emits it verbatim on every row, so several DISTINCT transcripts can be
-    /// given one SHARED `gene_id` — which is what `test_3level_fallback_thresholds`
-    /// already relies on, and it is unrelated to the `anchor_builder.rs`
-    /// `gene_id := transcript_id` fallback (that is about the production
-    /// anchor builder, not about this fixture writer). Here `tx_min_reads = 10`
-    /// and `gene_min_reads = 30`: each L2 transcript is capped at 9 reads, so
-    /// four of them are needed to clear 30 in the pool.
+    /// THE FIXTURE. L2 is the tier a naive fixture cannot reach: it needs a
+    /// gene pool strictly larger than any single transcript's pool, so several
+    /// DISTINCT transcripts share one `gene_id`. Here `tx_min_reads = 10` and
+    /// `gene_min_reads = 30`: each L2 transcript is capped at 9 reads, so four
+    /// of them are needed to clear 30 in the pool.
     #[test]
     fn test_l1_l2_l3_tier_attribution_and_split() {
         let fxs = vec![
@@ -2281,18 +1899,16 @@ mod tests {
         );
 
         // The four L2 transcripts must share ONE fit, bit for bit — that
-        // sharing is the mechanism behind `n_polya_zero_power` in Module 3, and
-        // an L2 that recomputed per transcript would break that metric.
+        // sharing is the mechanism behind `n_polya_zero_power` in the solver,
+        // and an L2 that recomputed per transcript would break that metric.
         //
-        // BIT-IDENTICAL TO EACH OTHER, and now also bit-identical to
-        // `l2_fit` as recomputed here. The gene pool is assembled by iterating
-        // `tx_accums`, a `HashMap`, so the order the 36 values arrive in is not
-        // fixed and `fit_log_normal`'s `sum::<f64>()` is not associative --
-        // which is why `fit_log_normal` sorts before summing. The 1e-9
-        // tolerance below is therefore slack the code no longer needs; it is
-        // kept because the re-derivation is a second, independent call and a
-        // ULP-level assertion is a poor failure message. The exact-equality
-        // claim lives in
+        // The gene pool is assembled by iterating `tx_accums`, a `HashMap`, so
+        // the order the 36 values arrive in is not fixed and `fit_log_normal`'s
+        // `sum::<f64>()` is not associative — which is why `fit_log_normal`
+        // sorts before summing. The 1e-9 tolerance below is therefore slack
+        // the code no longer needs; it is kept because the re-derivation is a
+        // second, independent call and a ULP-level assertion is a poor
+        // failure message. The exact-equality claim lives in
         // `test_l2_gene_fit_is_bit_identical_across_accumulator_insertion_orders`.
         let l2_rows: Vec<&(String, String, f64, bool, u32, f64, f64)> =
             rows.iter().filter(|r| r.0.starts_with("tx_l2_")).collect();
@@ -2357,23 +1973,17 @@ mod tests {
     /// `log2(PAL)` values are handed to `fit_log_normal` depends on the
     /// insertion history and the per-process random seed. `f64` addition is not
     /// associative, so before `fit_log_normal` sorted, the same anchor pool
-    /// emitted L2 rows differing in the last 1-2 mantissa bits between runs
-    /// (~1e-16 relative, measured over 12 runs on a fixture; L1 and L3 were
-    /// already bit-reproducible and stayed that way).
+    /// emitted L2 rows differing in the last 1-2 mantissa bits between runs.
     ///
     /// WHY THIS TEST IS NOT "RUN THE BUILD TWICE". `HashMap` iteration order is
     /// STABLE WITHIN A PROCESS, so re-running the same build in the same
     /// process reproduces the non-deterministic value exactly and passes with
     /// the bug present. The only way to reach two different iteration orders
     /// from one process is to build two maps with different insertion
-    /// histories, which is what the three orders below do. (The alternative —
-    /// hard-coding the expected bits — was rejected: it pins the summation
-    /// order, so any later change to how the mean is accumulated, e.g.
-    /// `powi(2)` -> `x * x`, would fail for a reason that has nothing to do
-    /// with determinism.)
+    /// histories, which is what the three orders below do.
     ///
-    /// `to_bits()`, not `==`: `PartialEq for f64` is a numeric comparison, and
-    /// the point of the test is the bit pattern, not the value.
+    /// `to_bits()`, not `==`: the point of the test is the bit pattern, not the
+    /// value.
     #[test]
     fn test_l2_gene_fit_is_bit_identical_across_accumulator_insertion_orders() {
         // A realistic pool, and deliberately large: PAL lengths spread over
@@ -2430,8 +2040,7 @@ mod tests {
         // order STATISTICS off an already-sorted copy and sums nothing, so it
         // was bit-reproducible before the fix and must stay that way. Cheap to
         // assert, and it stops the sort in `cohort_log_normal_fit` from being
-        // removed as a micro-optimisation on the strength of "it sums
-        // nothing, the sort is redundant".
+        // removed as a micro-optimisation.
         let flat: Vec<f64> = per_tx.concat();
         for order in orders.iter().copied().skip(1) {
             let mut reordered: Vec<f64> = Vec::with_capacity(flat.len());
@@ -2452,17 +2061,6 @@ mod tests {
     /// reference universe, and an imputed row is the cohort fit marked by
     /// `n_cohort_flnc == 0`.
     ///
-    /// These are the assertions the whole feature rests on, and each one has a
-    /// mutation that breaks it:
-    ///
-    /// | claim | breaking mutation |
-    /// |---|---|
-    /// | `rows.len() == |universe|` | drop the imputed arm of the row match |
-    /// | sorted by `transcript_id` | remove `tx_keys.sort()` |
-    /// | imputed rows carry the COHORT fit | fit them from something else |
-    /// | `n_cohort_flnc == 0` on imputed rows | write `1` |
-    /// | an anchored+universe key is emitted ONCE | `if anchored.contains(tx)` -> `if false` |
-    /// | `l1+l2+l3+n_imputed == rows.len()` | count imputed rows in `l3` instead |
     /// THE PROVENANCE SIDECAR IS THE ONLY PLACE THE FALLBACK LEVEL IS WRITTEN
     /// DOWN. `n_cohort_flnc` cannot recover it: L2 is decided by the GENE's
     /// pooled count, and the frozen parquet carries only the TRANSCRIPT's own
@@ -2475,8 +2073,8 @@ mod tests {
     ///     unordered or short sidecar turns the downstream join into a
     ///     different, wrong join);
     ///   * `n_anchor == 0` if and only if the tier is `L3_imputed` OR
-    ///     `L3_unexpressed` — since R141 "a row with no anchors of its own" has
-    ///     TWO labels, and the two encodings of "imputed" must not drift apart
+    ///     `L3_unexpressed` — "a row with no anchors of its own" has TWO
+    ///     labels, and the two encodings of "imputed" must not drift apart;
     ///   * the tier histogram reproduces `FallbackTierCounts` (the counters the
     ///     CLI prints must describe the same partition the file records).
     #[test]
@@ -2490,11 +2088,8 @@ mod tests {
         //
         // L2 is the hard one to reach and getting it wrong is silent: it needs
         // the GENE's pooled count over `gene_min_reads` while the TRANSCRIPT's
-        // own count is under `tx_min_reads`. An earlier version of this fixture
-        // had 12 + 3 reads in gene_a against a default `gene_min_reads` of 30,
-        // so no gene fit existed at all and `tx_l2` silently became L3_anchored.
-        // The row-by-row assertions still passed; only the `n_l2 > 0` CONTROL
-        // below caught it, which is the reason that control is here.
+        // own count is under `tx_min_reads`. Only the `n_l2 > 0` CONTROL below
+        // catches that, which is the reason that control is here.
         //
         //   tx_l1  12 reads           >= 10            -> L1
         //   tx_l3  20 reads           >= 10            -> L1
@@ -2568,8 +2163,8 @@ mod tests {
         );
 
         for (tx, gene, tier, n_anchor) in &prov {
-            // `n_anchor == 0` marks a row with NO anchors of its own. Since R141
-            // that population has TWO tiers, not one: `L3_imputed` (the gene was
+            // `n_anchor == 0` marks a row with NO anchors of its own. That
+            // population has TWO tiers, not one: `L3_imputed` (the gene was
             // measured) and `L3_unexpressed` (it was not). The invariant is
             // therefore over the SET, and this fixture has no gene map, so
             // every padded row is `L3_unexpressed` — which is why this test
@@ -2587,9 +2182,9 @@ mod tests {
         let n_l1 = prov.iter().filter(|r| r.2 == TIER_L1).count();
         let n_l2 = prov.iter().filter(|r| r.2 == TIER_L2).count();
         let n_l3a = prov.iter().filter(|r| r.2 == TIER_L3_ANCHORED).count();
-        // `n_imputed` counts ROWS with no anchors of their own, and since R141
-        // that population carries two labels. The histogram is over ROWS, so
-        // the imputed bucket is the SUM — counting only `L3_imputed` would make
+        // `n_imputed` counts ROWS with no anchors of their own, and that
+        // population carries two labels. The histogram is over ROWS, so the
+        // imputed bucket is the SUM — counting only `L3_imputed` would make
         // this test assert 0 against a counter that says 2, and "fixing" it by
         // relaxing the comparison would leave the histogram unchecked.
         let n_l3i = prov
@@ -2744,38 +2339,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// THE THIRD STATUS (R141): a never-anchored transcript is `L3_imputed`
-    /// when its OWN GENE has an entry in `gene_fit`, and `L3_unexpressed` when
-    /// it does not.
-    ///
-    /// ## THE CUT, AND WHY IT IS THE ONLY ONE AVAILABLE
+    /// A never-anchored transcript is `L3_imputed` when its OWN GENE has an
+    /// entry in `gene_fit`, and `L3_unexpressed` when it does not.
     ///
     /// `gene_fit` is built from genes whose POOLED anchors reach
-    /// `gene_min_reads`. Its membership therefore answers exactly one question
-    /// about a transcript with no anchors of its own: **did this dataset
-    /// measure this locus at all?** A gene that made the cut has real
-    /// measurements behind it, so filling in one of its isoforms is a
-    /// derivation. A gene that did not has nothing but the cohort-wide prior,
-    /// and calling that an imputation states more than the arithmetic supports.
-    /// It is the cut the expert named (独立拟合 / 合法插补 / 不可用), and
-    /// `gene_fit` is the only measured quantity on the tier table that
-    /// separates the second from the third.
+    /// `gene_min_reads`, so its membership answers exactly one question about
+    /// a transcript with no anchors of its own: **did this dataset measure this
+    /// locus at all?** A gene that made the cut has real measurements behind
+    /// it, so filling in one of its isoforms is a derivation; a gene that did
+    /// not has nothing but the cohort-wide prior.
     ///
-    /// ## IT IS A LABEL AND NOTHING ELSE
-    ///
-    /// Every fitted value, `is_polyA_competent` and the row COUNT is asserted
-    /// identical across the two arms. That is the load-bearing half of this
-    /// test: a change that quietly started fitting the gene instead of the
+    /// IT IS A LABEL AND NOTHING ELSE. Every fitted value,
+    /// `is_polyA_competent` and the row COUNT is asserted identical across the
+    /// two arms: a change that quietly started fitting the gene instead of the
     /// cohort would keep the tier label and move `(mu, sigma2)`.
     ///
-    /// ## THE FIXTURE
-    ///
-    /// A real `tx_to_gene`, because with no map `gene_id := transcript_id` and
-    /// every padded transcript's gene is its own id, which nobody anchors — so
-    /// the split would collapse to "everything is unexpressed" and the test
-    /// would pass for the wrong reason. `gene_a` pools 16 + 14 = 30 anchors,
-    /// exactly `gene_min_reads`; `gene_b` pools 2. `tx_pad_a` is padded into
-    /// `gene_a` and `tx_pad_b` into `gene_b`.
+    /// THE FIXTURE uses a real `tx_to_gene`, because with no map
+    /// `gene_id := transcript_id` and every padded transcript's gene is its own
+    /// id, which nobody anchors — so the split would collapse to "everything
+    /// is unexpressed" and the test would pass for the wrong reason.
     #[test]
     fn the_tier_label_splits_a_padded_transcript_by_whether_its_gene_was_measured() {
         let tmp = local_scratch("telescope_test_tiersplit");
@@ -2783,8 +2365,8 @@ mod tests {
         std::fs::create_dir_all(&tmp).expect("mkdir tmp");
 
         // `FallbackConfig::default()` gene_min_reads is 30; gene_a pools 15
-        // here, so raise nothing and instead give gene_a enough anchors by
-        // adding a second transcript under the same gene.
+        // here, so give gene_a enough anchors by adding a second transcript
+        // under the same gene.
         let fxs = vec![
             TxFixture {
                 gene_id: "gene_a".into(),
@@ -2937,18 +2519,14 @@ mod tests {
     /// `tx_accums.get(..) == None`, but they are not the same thing, and the
     /// emitted row is where the difference has to survive.
     ///
-    /// Before this test's production change both took the same arm and both
-    /// were written `is_poly_a_competent = true`, which told the EM solver that
-    /// a deliberately suppressed transcript had a flawless poly(A)
-    /// distribution. The suppression was therefore silently undone downstream,
-    /// and the candidate ledger filed the transcript under `rows_emitted`
-    /// rather than `n_incompetent` -- `n_incompetent` being the bucket whose
-    /// documented question is "present, but pushed to `-inf`".
+    /// Writing both as `is_poly_a_competent = true` would tell the EM solver
+    /// that a deliberately suppressed transcript has a flawless poly(A)
+    /// distribution, silently undoing the suppression downstream.
     ///
     /// `tx_anchorless` is the CONTROL and it is not decoration. It is in the
     /// universe but was never anchored, so the filter never saw it and it must
-    /// stay competent. Without that row a mutation that marked *every*
-    /// `None` transcript incompetent would pass this test, while
+    /// stay competent. Without that row a mutation that marked *every* `None`
+    /// transcript incompetent would pass this test, while
     /// `test_universal_em_eligible_filtering` stays green because it supplies
     /// no universe.
     #[test]
@@ -3086,9 +2664,6 @@ mod tests {
         // The suppressed row carries the COHORT fit, not a fit of its own --
         // it had anchors once, but they were filtered out before any fitting
         // happened, so the cohort is the only thing that can have fitted it.
-        // This is what battery mutation `m13b_imputed_mu_off_cohort_suppressed`
-        // attacks; without the assertion, making M13 unique in Round 101 would
-        // have left this arm's fit unverified while the count went back to 43.
         let cohort_in: Vec<f64> = (10..20).map(|p| (p as f64).log2()).collect();
         let cohort = cohort_log_normal_fit(&cohort_in).expect("cohort fit");
         assert_eq!(sup.4, 0, "repeated for the reason stated at the assert");
@@ -3109,31 +2684,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// The failure mode `main.rs`'s conservation guard defends against, now
-    /// REJECTED at the door rather than documented as latent.
+    /// A reference universe that names a transcript twice is REJECTED at the
+    /// entry point, not de-duplicated.
     ///
-    /// W2' (Round 105) added a uniqueness check at the top of
-    /// `build_emission_from_anchors`. Before it, a universe naming a transcript
-    /// twice pushed the key into `tx_keys` once per occurrence, so the row was
-    /// emitted TWICE with byte-identical contents, while `imputed_keys` -- being
-    /// a `HashSet` -- counted it once. `n_after` then fell one short of
-    /// `n_reference`, and the CLI conservation law was the only thing that could
-    /// ever notice. It could not: both sides of that law are the cardinality of
-    /// `anchored UNION universe`, making it an identity on two SETS, and
-    /// `read_reference_universe` returns noodles' header MAP, so duplicates
-    /// arrive already collapsed one layer below this code.
+    /// A duplicate key would push the row into `tx_keys` once per occurrence,
+    /// so the row was emitted TWICE with byte-identical contents while
+    /// `imputed_keys` -- being a `HashSet` -- counted it once. The CLI
+    /// conservation law is the only thing that could notice, and it could not:
+    /// both sides of that law are the cardinality of `anchored UNION universe`,
+    /// an identity on two SETS.
     ///
-    /// The defect was therefore latent twice over -- unreachable through the CLI,
-    /// and witnessed only by a library-level call no production path makes.
-    /// Checking at the entry replaces both dependencies with one this repository
-    /// enforces itself.
-    ///
-    /// This is the RED half of that change. It drives the function directly with
-    /// the exact input that used to produce the corrupt table, and requires an
-    /// `Err` naming the offender. It is equally the regression guard in the other
-    /// direction: remove or weaken the check to a silent de-duplication and this
-    /// goes red, because `expect_err` would be handed back the `Ok` that used to
-    /// come. The final control rejects nothing: a distinct universe must still
+    /// The final control rejects nothing: a distinct universe must still
     /// build, so the check cannot be satisfied by refusing everything.
     #[test]
     fn a_duplicated_universe_key_is_rejected_at_the_entry_point() {
@@ -3197,14 +2758,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// `n == 0` inside the parquet is now ambiguous on purpose, and this pins
-    /// the ambiguity rather than leaving it to a reader to discover: with a
+    /// `n == 0` inside the parquet is ambiguous on purpose, and this pins the
+    /// ambiguity rather than leaving it to a reader to discover: with a
     /// universe, `0` means "imputed"; without one, it cannot occur at all.
     ///
     /// The two conditions are DISJOINT by construction, which is what makes a
     /// single marker usable: there is no run in which a `0` is ambiguous
-    /// between "imputed" and "observed zero times", because the second cannot
-    /// occur while the first is possible.
+    /// between "imputed" and "observed zero times".
     #[test]
     fn test_without_a_universe_no_row_is_imputed() {
         let tmp = local_scratch("telescope_test_nopad");

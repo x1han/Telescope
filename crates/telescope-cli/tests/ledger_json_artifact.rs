@@ -2,22 +2,16 @@
 //! document on disk, with the numbers in it?
 //!
 //! WHY THIS EXISTS ALONGSIDE `ledger_json.rs`'S UNIT TESTS. The unit tests
-//! prove the renderer formats the struct it is handed. This file proves the
-//! CLI reaches that call at all. Those are different failures: delete the
-//! `maybe_write_filter_ledger(...)` line from `main.rs`, add a `ledger` field
-//! to a subcommand's struct, and forget to wire it — every unit test in
-//! `ledger_json.rs` stays green and the flag silently does nothing.
+//! prove the renderer formats the struct it is handed; this file proves the
+//! CLI reaches that call at all — delete the `maybe_write_filter_ledger(...)`
+//! line from `main.rs` and every unit test stays green while the flag does
+//! nothing.
 //!
-//! It also pins the two structural rules that a future refactor would most
-//! plausibly break, both from the Round 65 ruling:
-//!
-//!   * the two levels are DIFFERENT POPULATIONS and go to different files;
-//!   * `--ledger` is OPT-IN, so an absent flag writes nothing.
-//!
-//! The `deficit != 0` direction is NOT here — it cannot be: producing an
-//! unbalanced ledger through the real binary requires unbalanced code. It
-//! lives in `ledger_json.rs::anchor_ledger_carries_the_deficit_field`, which
-//! hands the renderer a deliberately leaking `AnchorStats`.
+//! It also pins the two structural rules a future refactor would most
+//! plausibly break: the two levels are DIFFERENT POPULATIONS and go to
+//! different files; and `--ledger` is OPT-IN, so an absent flag writes
+//! nothing. The `deficit != 0` direction is NOT here — it needs unbalanced
+//! code, and lives in `ledger_json.rs::anchor_ledger_carries_the_deficit_field`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -46,27 +40,17 @@ const ANCHOR_BUCKETS: [&str; 12] = [
     "eligible_not_anchor",
 ];
 
-/// A BAM that trips all three of the filter paths Ticket 2B-Fix proved
-/// reachable, alongside two records that pass. Without the three defects the
-/// ledger's `deficit` would still be 0, and the test would pass without ever
-/// proving those buckets are countable in the artifact — which is exactly the
-/// `deficit == 0` ambiguity the whole ticket exists to remove.
+/// A BAM that trips all three of the filter paths, alongside two records that
+/// pass. The three defect counts are 1, 2 AND 3, NOT 1, 1 AND 1: a mutation
+/// that transposes two `render_anchor` arguments leaves every SUM unchanged, so
+/// only a per-bucket assertion against an EXPECTED value can see it, and such
+/// an assertion is a tautology unless the buckets are distinguishable.
 ///
-/// ⚠ EVERY "record that passes" HERE CARRIES `AS:i = 100`. Since R141 the gap is
+/// ⚠ EVERY "record that passes" HERE CARRIES `AS:i = 100`. The gap is
 /// `AS_1 - (AS_2 or 0)` against a shipped floor of 12, so a record with no `AS`
-/// tag measures 0 and is rejected — these fixtures used to pass `None` and
-/// built an empty pool, which the `passed == 2` assertion below would have
-/// reported as a missing record rather than as a floor that had moved.
-///
-/// **THE THREE DEFECT COUNTS ARE 1, 2 AND 3, NOT 1, 1 AND 1, AND THAT IS THE
-/// POINT.** The first version of this fixture used one record per defect. A
-/// mutation that transposes the `no_position` and `no_read_id` arguments in
-/// `render_anchor` leaves every SUM unchanged, so it is invisible to the
-/// identity check — the only thing that can see it is a per-bucket assertion
-/// comparing each bucket against an EXPECTED value. With equal fixtures that
-/// assertion is a tautology, and the mutation survived (`mutate_ledger_json.py`
-/// L3, 2026-10-13). A per-bucket assertion is worth nothing unless the fixture
-/// makes the buckets distinguishable from each other.
+/// tag measures 0 and is rejected — these fixtures used to build an empty pool,
+/// which the `passed == 2` assertion below would report as a missing record
+/// rather than as a floor that had moved.
 fn three_defect_bam(tag: &str) -> PathBuf {
     write_synthetic_bam(
         tag,
@@ -100,8 +84,7 @@ fn all_good_bam(tag: &str) -> PathBuf {
 /// 2 supplementary, 3 physically eligible but not selected as the anchor.
 ///
 /// The values are 1 / 2 / 3 for the same reason `three_defect_bam` uses them:
-/// equal values would make a transposition in the `format!` invisible, because
-/// it leaves the SUM unchanged and only a per-bucket expectation can see it.
+/// equal values would make a transposition in the `format!` invisible.
 fn three_new_buckets_bam(tag: &str) -> PathBuf {
     write_synthetic_bam(
         tag,
@@ -129,12 +112,8 @@ fn three_new_buckets_bam(tag: &str) -> PathBuf {
 ///     argmax and it is physically disqualified.
 ///   * `tx1` at AS 50, full length, physically eligible — the runner-up.
 ///
-/// Before R141 the rule argmaxed over the eligible subset, `tx0` simply ceased
-/// to exist, and `tx1` was emitted as the read's anchor. It is now refused.
-///
 /// The two AS values are 100 and 50 on purpose: DISTINCT is what makes this
-/// fixture different from a tie fixture, and the assertion on `rejected_tie`
-/// below is what says the two branches were not confused.
+/// fixture different from a tie fixture.
 fn usurpation_bam(tag: &str) -> PathBuf {
     write_synthetic_bam(
         tag,
@@ -149,8 +128,7 @@ fn usurpation_bam(tag: &str) -> PathBuf {
 ///
 /// This is the input `filtered_unique` used to absorb. It exists so the retired
 /// slot can be pinned on the path that actually runs the tool: the renderer unit
-/// test can only prove the key is still emitted, not that nothing increments it,
-/// because `AnchorStats::default()` is 0 whether the rule is enforced or not.
+/// test can only prove the key is still emitted, not that nothing increments it.
 fn retired_mapq_gate_bam(tag: &str) -> PathBuf {
     write_synthetic_bam(
         tag,
@@ -218,9 +196,9 @@ fn read(path: &Path) -> String {
 
 /// `build-anchors --ledger`: the anchor-level document.
 ///
-/// Recomputes the conservation identity from the ARTIFACT's own numbers. This
-/// is the assertion that would fail if a bucket were serialized under a name
-/// the consumer does not read, or if a `+ 1` were dropped from `total_records`.
+/// Recomputes the conservation identity from the ARTIFACT's own numbers, so a
+/// bucket serialized under a name the consumer does not read, or a dropped
+/// `+ 1` in `total_records`, fails here.
 #[test]
 fn build_anchors_writes_an_anchor_ledger_that_satisfies_the_identity() {
     let bam = three_defect_bam("pos");
@@ -246,9 +224,8 @@ fn build_anchors_writes_an_anchor_ledger_that_satisfies_the_identity() {
         "no anchor_level:\n{json}"
     );
 
-    // The three buckets must be present, non-zero, AND DISTINGUISHABLE. Equal
-    // expected values would make this loop tautological -- see the doc comment
-    // on `three_defect_bam`.
+    // The three buckets must be present, non-zero, AND DISTINGUISHABLE — equal
+    // expected values would make this loop tautological.
     for (bucket, want) in [("no_refid", 1), ("no_position", 2), ("no_read_id", 3)] {
         assert_eq!(
             int_field(&json, bucket),
@@ -276,26 +253,25 @@ fn build_anchors_writes_an_anchor_ledger_that_satisfies_the_identity() {
         "two records clear every filter; if this changed, so did the test"
     );
 
-    // Decision 2: `parse_errors` is disjoint from `total_records`, so folding
-    // it into the RHS would make the identity fail by exactly its value. It
-    // must be present and the identity must hold without it.
+    // `parse_errors` is disjoint from `total_records`, so folding it into the
+    // RHS would make the identity fail by exactly its value.
     let parse_errors = int_field(&json, "parse_errors");
     assert_eq!(
         parse_errors, 0,
         "synthetic BAMs do not produce parse errors"
     );
 
-    // Decision 4: the unit travels with the number, IN THE ARTIFACT.
+    // The unit travels with the number, IN THE ARTIFACT.
     assert!(
         json.contains("\"scope\""),
         "the unit must be in the artifact, not only in a doc comment:\n{json}"
     );
 }
 
-/// `build-anchors` emits `anchor_level` and NOT `record_level`. Round 65 §2.2:
-/// the two ledgers belong to different stages and must never share a document,
-/// because summing their `records_entered` values produces a number that looks
-/// like a population and is not one.
+/// `build-anchors` emits `anchor_level` and NOT `record_level`: the two ledgers
+/// belong to different stages and must never share a document, because summing
+/// their `records_entered` values produces a number that looks like a
+/// population and is not one.
 #[test]
 fn the_anchor_ledger_carries_no_record_level() {
     let bam = all_good_bam("lvl");
@@ -376,9 +352,9 @@ fn extract_evidence_writes_a_record_ledger_that_satisfies_the_identity() {
 }
 
 /// OPT-IN CONTRACT. `--ledger` defaults to `None`, so a run without it writes
-/// nothing. The negative case is what stops the flag from quietly becoming a
-/// default sidecar in a later change — which would put a file next to every
-/// profile parquet and make "is there a ledger for this run?" unanswerable.
+/// nothing — the negative case stops the flag from quietly becoming a default
+/// sidecar in a later change, which would put a file next to every profile
+/// parquet and make "is there a ledger for this run?" unanswerable.
 #[test]
 fn no_ledger_flag_writes_no_ledger() {
     let bam = all_good_bam("optin");
@@ -402,14 +378,14 @@ fn no_ledger_flag_writes_no_ledger() {
     );
 }
 
-/// THE THREE BUCKETS ADDED 2026-10-18 REACH THE ARTIFACT, WITH THE COUNTS THE
-/// TOOL ACTUALLY PRODUCED.
+/// THE THREE NEW RECORD BUCKETS REACH THE ARTIFACT, WITH THE COUNTS THE TOOL
+/// ACTUALLY PRODUCED.
 ///
-/// `three_defect_bam` proves the Ticket-2A buckets are countable; it cannot
-/// reach these three, because every fixture it builds has MAPQ 60 and no
-/// flag-only record. Without this the three new keys would be asserted only by
-/// the renderer unit test, and the CLI path — the one that would drop a key on
-/// the floor — would be uncovered.
+/// `three_defect_bam` proves the older buckets are countable; it cannot reach
+/// these three, because every fixture it builds has MAPQ 60 and no flag-only
+/// record. Without this the three new keys would be asserted only by the
+/// renderer unit test, and the CLI path — the one that would drop a key on the
+/// floor — would be uncovered.
 ///
 /// The per-bucket expectations are 1 / 2 / 3 on purpose; see the doc comment on
 /// `three_new_buckets_bam`.
@@ -471,9 +447,7 @@ fn build_anchors_serializes_the_three_new_record_buckets() {
     assert_eq!(int_field(&json, "rejected_tie"), 1);
     assert_eq!(int_field(&json, "anchors_emitted"), 0);
     // `reads_over_cap` is on the read block and must be serialized even when the
-    // cap never bit: an absent counter and a zero counter are different facts,
-    // and a consumer that reads it with `int_field` must not have to distinguish
-    // them by guessing.
+    // cap never bit: an absent counter and a zero counter are different facts.
     assert_eq!(
         int_field(&json, "reads_over_cap"),
         0,
@@ -489,14 +463,13 @@ fn build_anchors_serializes_the_three_new_record_buckets() {
 /// IT USED TO ABSORB ARE IN THE POOL INSTEAD.
 ///
 /// TWO ASSERTIONS, AND EITHER ALONE IS WORTH NOTHING. `unique == 0` on its own
-/// is satisfied by a `build-anchors` that deleted the records. `passed == 2` on
-/// its own is satisfied by a `build-anchors` that never had the gate. Together
-/// they say the gate is gone: the two MAPQ-below-20 records were dropped into
-/// `unique` before R139 and now reach the pool, and the slot they would have
-/// occupied is 0.
+/// is satisfied by a `build-anchors` that deleted the records; `passed == 2` on
+/// its own is satisfied by one that never had the gate. Together they say the
+/// gate is gone: the two MAPQ-below-20 records now reach the pool and the slot
+/// they would have occupied is 0.
 ///
-/// The fixture uses two DIFFERENT low MAPQs (3 and 11) on two transcripts so a
-/// re-added gate could not be mistaken for a fixture that happened to sit on
+/// The fixture uses two DIFFERENT low MAPQs (3 and 11) on two transcripts, so
+/// a re-added gate cannot be mistaken for a fixture that happened to sit on
 /// the boundary, and so the two records cannot tie into one read.
 #[test]
 fn build_anchors_reports_a_retired_unique_bucket_of_zero() {
@@ -667,8 +640,8 @@ fn build_anchors_serializes_rejected_usurpation_and_refuses_the_runner_up() {
 /// actually receives.
 ///
 /// It also pins the two facts that make the banner trustworthy: the banner says
-/// `active` at 12.0 (the `== 0.0` branch), and the effect is real — two reads
-/// identical except for a 12 AS gap behave differently under the DEFAULT.
+/// `active` at 12.0, and the effect is real — two reads identical except for a
+/// 12 AS gap behave differently under the DEFAULT.
 #[test]
 fn a_build_anchors_run_without_gap_abs_uses_the_ruled_default_of_twelve() {
     let bam = write_synthetic_bam(

@@ -1,0 +1,39 @@
+# Conda environment for the R reference implementation of Module 4.
+#
+#   mamba env create -f workflow/environment.yml
+#   mamba activate telescope-ref
+#   Rscript workflow/scripts/telescope_diff.R --help
+#
+# WHY THIS FILE EXISTS. The differential statistics in Module 4 are built on
+# Bioconductor packages (DEXSeq, limma, lmerTest). Those are not part of the
+# Rust binary, so the R reference implementation needs its own environment.
+#
+# The shipped `telescope` binary does NOT need any of this -- it is pure Rust
+# with no C, no system libraries and no runtime package manager. This
+# environment is for the reference implementation and for anyone who wants to
+# reproduce the published numbers from the reference rather than from the CLI.
+#
+# VERSION PINNING. Every pin below is the exact build that produced the
+# expected outputs in `workflow/test_data/results/`. One of them was NOT
+# reproducible before this file existed: limma had been installed into the R
+# library directly, so `conda list` did not know about it and
+# `conda env export` would silently drop it. It is pinned here explicitly.
+name: telescope-ref
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - r-base=4.3.3
+  # Bioconductor: DEXSeq is the ΔPAU track, limma the variance moderation.
+  - bioconductor-dexseq=1.48.0
+  - bioconductor-limma=3.58.1
+  # Mixed model for the ΔPAL track when there are technical replicates.
+  - r-lmertest=3.1_3
+  - r-lme4=1.1_37
+  - r-emmeans=1.11.2_8
+  # I/O and reshaping.
+  - r-arrow=21.0.0
+  - r-dplyr=1.1.4
+  - r-tidyr=1.3.1
+  - r-optparse=1.7.5
+  - r-matrixstats=1.5.0

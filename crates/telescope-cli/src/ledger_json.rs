@@ -1,29 +1,13 @@
 //! Schema v1 of the machine-readable filter ledger.
 //!
-//! Frozen by the Round 65 ruling in
-//! `workspace/comms/2026-10-13-round65-ticket2-a4-ledger-plan.md` §2.3. Two
-//! deviations from the literal text of that document are deliberate and
-//! recorded here rather than made silently:
+//! Two deliberate deviations from the original schema text are recorded here:
+//! `anchor_level.filtered` carries NINE keys, not six, because the code has
+//! nine filter buckets; and each command emits only the level it has, so the
+//! absent level is OMITTED rather than nulled.
 //!
-//! 1. **`anchor_level.filtered` carries NINE keys, not the six the ruling
-//!    lists.** The ruling's schema was written against the pre-Ticket-2A code,
-//!    which had six filter buckets. Ticket 2A added three
-//!    (`no_refid` / `no_position` / `no_read_id`), and decision 1 of the same
-//!    ruling requires `deficit` to be machine-readable IN THE ARTIFACT.
-//!    Emitting six buckets while the code has nine would make `deficit`
-//!    wrong in the one place it is supposed to be authoritative. The nested
-//!    shape, the key names, and the `schema` string are unchanged.
-//!
-//! 2. **Each command emits only the level it has.** Ruling §2.2: "它们分属
-//!    不同阶段,不能写进同一个文件 —— 一个命令只写自己有的那段." So
-//!    [`render_filter`] emits `record_level` and no `anchor_level`; the
-//!    absent level is OMITTED, not nulled. `--ledger` gives the caller an
-//!    explicit path, so the two can never land in one file by accident.
-//!
-//! JSON is hand-written with `format!`, matching `sim_bridge::write_stats`.
-//! `telescope-core` has no serde_json dependency and this adds none: a static
-//! artifact is not worth a new dependency surface. Every value is an integer
-//! or a fixed literal, so there is no escaping to get wrong.
+//! JSON is hand-written with `format!`: `telescope-core` has no serde_json
+//! dependency and this adds none. Every value is an integer or a fixed
+//! literal, so there is no escaping to get wrong.
 
 use std::io::Write;
 use std::path::Path;
@@ -35,32 +19,20 @@ use telescope_core::evidence::FilterCounts;
 /// The schema tag. Bump this, and the filename, together.
 const SCHEMA: &str = "telescope.filter_ledger/v1";
 
-/// Decision 4: the unit travels WITH the number. It used to live only in a
-/// doc comment on `print_filter_ledger`, where it stopped existing the moment
-/// the value was quoted out of the log.
+/// The unit travels WITH the number, so it survives being quoted out of the log.
 const RECORD_SCOPE: &str = "RECORDS, not reads, not molecules";
 
-/// Decision 2: `parse_errors` is disjoint from `total_records` (it is
-/// incremented before it), so a consumer that folds it into the sum reads
-/// `deficit = -1` and blames a bias. Say so in the artifact.
-///
-/// Decision 3's caveat is appended to the same string. The frozen schema's
-/// literal (ruling :97) carries the decision-2 caveat and NOT the decision-3
-/// one, which is an inconsistency inside the frozen document itself: :122-124
-/// requires `distinct_genes` / `distinct_transcripts` to be marked pool-level,
-/// and `scope` is where decision ② establishes that such caveats live. Putting
-/// it in the same place keeps one convention instead of two.
+/// `parse_errors` is disjoint from `total_records` (it is incremented before
+/// it), so a consumer that folds it into the sum reads `deficit = -1` and
+/// blames a bias; the pool-level caveat for `distinct_genes` /
+/// `distinct_transcripts` rides in the same string.
 const ANCHOR_SCOPE: &str = "RECORDS read from each anchor BAM; parse_errors is \
 a DISJOINT population; distinct_genes / distinct_transcripts are POOL-\
 level, assigned by build_anchor_pool and NOT summed over samples";
 
 /// The `reads` sub-block's own unit, carried in the artifact for the same
-/// reason [`RECORD_SCOPE`] exists: the unit used to live only in a doc comment
-/// and died the moment a number was quoted out of the log.
-///
-/// These counts are READS. They are deliberately NOT summed into `deficit`,
-/// which is a RECORDS identity, and a consumer that adds them to the record
-/// buckets gets a number that is neither a population nor an imbalance.
+/// reason [`RECORD_SCOPE`] exists. These counts are READS and are deliberately
+/// NOT summed into `deficit`, which is a RECORDS identity.
 const READ_SCOPE: &str = "READS, not records; NOT part of `deficit`, which is a \
 RECORDS identity. Every read contributes at most one anchor, so \
 reads_seen == anchors_emitted + rejected_tie + rejected_usurpation + \
@@ -221,11 +193,11 @@ mod tests {
 
     /// Pull `"key": <int>` out of the rendered text.
     ///
-    /// Deliberately a substring scan and not a JSON parser: the writer is
-    /// hand-written, and parsing it with serde_json would only prove it
-    /// against a schema, not against the identity the buckets have to satisfy.
-    /// Every value in the artifact is an integer or a fixed literal, so
-    /// `"key": ` followed by an optional `-` and digits is unambiguous.
+    /// Deliberately a substring scan and not a JSON parser: parsing it with
+    /// serde_json would prove it against a schema, not against the identity the
+    /// buckets have to satisfy. Every value in the artifact is an integer or a
+    /// fixed literal, so `"key": ` followed by an optional `-` and digits is
+    /// unambiguous.
     fn int_field(json: &str, key: &str) -> i64 {
         let needle = format!("\"{key}\": ");
         let at = json
@@ -248,30 +220,18 @@ mod tests {
     /// both go red rather than silently comparing a 12-term sum against a
     /// 13-term total.
     ///
-    /// ## `unique` IS A RETIRED COMPAT SLOT AND MUST STAY 0
+    /// **`unique` IS A RETIRED COMPAT SLOT AND MUST STAY 0.** The MAPQ < 20 gate
+    /// it counted is gone, so nothing increments it, but the key stays:
+    /// `telescope.filter_ledger/v1` is a published schema, a downstream
+    /// consumer reads this name, and `bucket_sum` sums all twelve.
     ///
-    /// It was `filtered_unique` = MAPQ < 20. That gate was removed in R139: on
-    /// HC2 every secondary carries MAPQ 0, so discarding on it deleted 32.5 M
-    /// of 39.4 M records and left every surviving read with exactly ONE
-    /// candidate — which made strict argmax, the gap floor and the same-gene
-    /// veto dead code on real data. Nothing increments the counter now.
-    ///
-    /// The KEY STAYS, and not for tidiness: `telescope.filter_ledger/v1` is a
-    /// published artifact schema, a downstream consumer reads this name, and
-    /// `bucket_sum` above sums all twelve. Removing it would change `deficit`
-    /// arithmetic in the one place `deficit` is supposed to be authoritative.
-    ///
-    /// ⚠ **A RETIRED COUNTER IS THE ONE KIND OF FIELD NO TEST WILL CATCH BEING
-    /// RE-ADDED.** `ANCHOR_BUCKETS` reads it (so it cannot vanish), but nothing
-    /// in this file asserted its VALUE — `bucket_sum` is happy with any number
-    /// that keeps the identity closed. The two fixtures that DO pin it are
+    /// Trap: a retired counter is the one kind of field no test here catches
+    /// being re-added — `bucket_sum` is happy with any value that keeps the
+    /// identity closed. Its value is pinned by
     /// `retired_unique_bucket_is_reported_as_zero` below and
     /// `build_anchors_reports_a_retired_unique_bucket_of_zero` in
-    /// `tests/ledger_json_artifact.rs`, which runs the real binary over a BAM
-    /// carrying a MAPQ-10 record — the exact input the gate used to swallow.
-    /// `balanced_stats` deliberately still pins `filtered_unique: 40`, because
-    /// it is the arithmetic fixture and 40 is what keeps its twelve-term sum at
-    /// 84; that fixture is NOT evidence about production.
+    /// `tests/ledger_json_artifact.rs`; `balanced_stats` pins 40 only to keep
+    /// its own twelve-term sum closed and is not production evidence.
     const ANCHOR_BUCKETS: [&str; 12] = [
         "unique",
         "no_refid",
@@ -290,20 +250,12 @@ mod tests {
     /// 40+5+3+2+1+4+6+2+1+10+3+7 == 84, plus `passed` 26, is exactly
     /// `total_records` 110.
     ///
-    /// THE THREE NEW BUCKETS CARRY 10, 3 AND 7, NOT 0, 0, 0. A fixture that
-    /// adds buckets and leaves them empty makes every assertion over this list
-    /// a tautology on those terms: transposing `unmapped` and `supplementary`
-    /// in the `format!` would leave the SUM unchanged and turn green, which is
-    /// the same defect `three_defect_bam`'s doc comment in the integration test
-    /// records having already been caught once. Distinct values are the only
-    /// thing that makes a per-bucket sum able to fail.
-    ///
-    /// `rejected_usurpation` carries **2** for exactly that reason. It is a READ
-    /// counter, so it does not enter `bucket_sum` — but a zero here would make
-    /// the read-identity term `+ int_field(&json, "rejected_usurpation")`
-    /// arithmetically inert, and dropping the term from the identity would then
-    /// leave the identity unchanged and green. 26+10+2+4+3 = 45 is only closed
-    /// when the new term is both serialized AND in the sum.
+    /// Trap: every bucket carries a DISTINCT value. A bucket left at 0 makes
+    /// each assertion over this list a tautology on that term — transposing
+    /// `unmapped` and `supplementary` in the `format!` would leave the SUM
+    /// unchanged and turn green. `rejected_usurpation` carries 2 for the same
+    /// reason: it is a READ counter outside `bucket_sum`, and a zero there
+    /// would make its term in the read identity arithmetically inert.
     fn balanced_stats() -> AnchorStats {
         AnchorStats {
             samples: 3,
@@ -360,8 +312,8 @@ mod tests {
         }
     }
 
-    /// Ruling §2.5 test 2: the artifact must carry the deficit as a FIELD.
-    /// Hardcoding it to 0 turns this red on an unbalanced fixture.
+    /// The artifact must carry the deficit as a FIELD; hardcoding it to 0
+    /// turns this red on an unbalanced fixture.
     #[test]
     fn anchor_ledger_carries_the_deficit_field() {
         let s = balanced_stats();
@@ -374,8 +326,8 @@ mod tests {
         assert_eq!(int_field(&render_anchor(&leaking), "deficit"), 2);
     }
 
-    /// Ruling §2.5 test 3: `scope` must be present, because the unit used to
-    /// live only in a comment and died the moment a number was quoted out.
+    /// `scope` must be present: the unit used to live only in a comment and
+    /// died the moment a number was quoted out.
     #[test]
     fn both_levels_carry_a_scope_string() {
         let a = render_anchor(&balanced_stats());
@@ -384,9 +336,9 @@ mod tests {
         assert!(f.contains(RECORD_SCOPE), "record_level lost its scope");
     }
 
-    /// The identity must hold when recomputed from the artifact's OWN numbers
-    /// -- not from the struct that produced it. This is the check that catches
-    /// a key being dropped from the `format!`, which no other test would.
+    /// The identity must hold when recomputed from the artifact's OWN numbers,
+    /// not from the struct that produced it — this is the check that catches a
+    /// key being dropped from the `format!`, which no other test would.
     #[test]
     fn anchor_identity_recomputes_from_the_rendered_json() {
         let s = balanced_stats();
@@ -433,24 +385,21 @@ mod tests {
         assert_eq!(deficit, 0);
     }
 
-    /// Decision 2: `parse_errors` is aggregated but must stay OUT of the
-    /// identity. It is deliberately non-zero in the fixture, so folding it in
-    /// turns this red.
+    /// `parse_errors` is aggregated but must stay OUT of the identity. It is
+    /// deliberately non-zero in the fixture, so folding it in turns this red.
     #[test]
     fn parse_errors_is_reported_but_excluded_from_the_identity() {
         let s = balanced_stats();
         let json = render_anchor(&s);
         assert_eq!(int_field(&json, "parse_errors"), 7, "not serialized");
-        // Folding parse_errors into the RHS would make the sum 117 and the
-        // deficit -7, which reads like a bias parameter rather than the
-        // bookkeeping mistake it is. The fixture's parse_errors is
-        // deliberately non-zero so that mistake is visible here.
+        // Folding parse_errors into the RHS would give sum 117 and deficit -7,
+        // which reads like a bias parameter rather than a bookkeeping mistake.
         assert_eq!(bucket_sum(&json) + int_field(&json, "passed"), 110);
         assert_eq!(s.unaccounted(), 0);
     }
 
-    /// Ruling §2.2: the two levels must not share a document, and the absent
-    /// one is omitted rather than nulled.
+    /// The two levels must not share a document, and the absent one is omitted
+    /// rather than nulled.
     #[test]
     fn each_command_emits_only_its_own_level() {
         let a = render_anchor(&balanced_stats());
@@ -462,6 +411,7 @@ mod tests {
         assert!(!f.contains("\"anchor_level\""));
     }
 
+    /// The schema tag is pinned so a consumer can detect the artifact version.
     #[test]
     fn schema_tag_is_pinned() {
         assert!(render_anchor(&balanced_stats()).contains(SCHEMA));
@@ -469,15 +419,14 @@ mod tests {
     }
 
     /// The `reads` block is a DIFFERENT DENOMINATION and says so in the
-    /// artifact. Two things have to hold and neither is visible from the other:
-    /// every counter reaches the JSON, and folding any of them into `deficit`
-    /// breaks the records identity.
+    /// artifact. Every counter must reach the JSON, and folding any of them
+    /// into `deficit` must break the records identity.
     ///
-    /// The negative half is the one that can fail. `int_field` scans for the
-    /// FIRST occurrence of a key, so a reads counter that was never serialized
-    /// would leave `deficit` at 0 and make the first half vacuous — which is
-    /// why the fixture populates reads counters with values that are NOT the
-    /// record ones (reads_seen 43 vs passed 26).
+    /// Trap: `int_field` scans for the FIRST occurrence of a key, so a reads
+    /// counter that was never serialized would leave `deficit` at 0 and make
+    /// the first half vacuous — which is why the fixture populates reads
+    /// counters with values that are NOT the record ones (reads_seen 43 vs
+    /// passed 26).
     #[test]
     fn the_reads_block_is_emitted_carries_its_unit_and_stays_out_of_the_identity() {
         let s = balanced_stats();
@@ -514,11 +463,8 @@ mod tests {
         }
 
         // The reads block's own identity, recomputed from the ARTIFACT rather
-        // than from the struct. `reads_over_cap` and `rejected_usurpation` are
-        // the two terms that were added to it, so this is the assertion that
-        // would catch either being omitted from the JSON or from `READ_SCOPE`:
-        // without `reads_over_cap` the sum is 42 against a reads_seen of 45, and
-        // without `rejected_usurpation` it is 43 — both short, both visible.
+        // than from the struct: without `reads_over_cap` the sum is 42 against
+        // a reads_seen of 45, and without `rejected_usurpation` it is 43.
         assert_eq!(
             int_field(&json, "reads_seen"),
             int_field(&json, "anchors_emitted")
@@ -555,20 +501,16 @@ mod tests {
 
     /// THE RETIRED `unique` SLOT IS EMITTED, AND IT IS 0.
     ///
-    /// `AnchorStats::default()` is the cheapest possible witness that the key
-    /// survives `render_anchor` — removing the line would make `int_field`
-    /// panic rather than return a wrong number, which is the failure this whole
-    /// file's substring scan is built to surface.
+    /// `AnchorStats::default()` is the cheapest witness that the key survives
+    /// `render_anchor`: removing the line would make `int_field` panic rather
+    /// than return a wrong number.
     ///
-    /// It is NOT sufficient on its own, and the reason is the point of the test:
-    /// `default()` is 0 whether the production code increments the counter or
-    /// not, so this assertion says the KEY exists and nothing about the RULE.
-    /// The fixture that carries the rule — a real `build-anchors` run over a BAM
-    /// whose records include MAPQ 10, the input the removed gate used to
-    /// swallow — is
+    /// It is NOT sufficient on its own: `default()` is 0 whether the production
+    /// code increments the counter or not, so this says the KEY exists and
+    /// nothing about the RULE. Read it as "the slot is still in the schema",
+    /// not as "the slot is still 0"; the rule is pinned by
     /// `build_anchors_reports_a_retired_unique_bucket_of_zero` in
-    /// `tests/ledger_json_artifact.rs`. Read this one as "the slot is still in
-    /// the schema", not as "the slot is still 0".
+    /// `tests/ledger_json_artifact.rs`.
     #[test]
     fn retired_unique_bucket_is_reported_as_zero() {
         let json = render_anchor(&AnchorStats::default());

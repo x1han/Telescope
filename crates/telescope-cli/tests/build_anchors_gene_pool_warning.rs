@@ -1,13 +1,12 @@
-//! End-to-end: does `telescope build-anchors` actually WARN, on stderr, when it
-//! emits a pool in the degenerate state?
+//! End-to-end: does `telescope build-anchors` WARN, on stderr, when it emits a
+//! pool in the degenerate state (no gene structure)?
 //!
 //! WHY AN END-TO-END TEST AND NOT ONLY THE HELPER'S UNIT TEST. The helper in
 //! `anchor_builder` is pure and easy to test, and it is tested. But the defect
-//! this fixes was not in the helper — it was that the CLI never said anything.
-//! `L2=0` sat in four run logs for three days because `tx_to_gene entries: 0`
-//! and `L2=0` are printed far apart and neither names the consequence. A test
-//! of the helper alone cannot see that regression: delete the `eprintln!` in
-//! `main.rs` and it stays green. This file is what goes red instead.
+//! was not in the helper — it was that the CLI never said anything: the
+//! `tx_to_gene entries: 0` and `L2=0` lines are printed far apart and neither
+//! names the consequence. A test of the helper alone cannot see that
+//! regression: delete the `eprintln!` in `main.rs` and it stays green.
 //!
 //! Both directions are here on purpose. The negative case is the one that keeps
 //! the warning from becoming noise on every legitimate run.
@@ -21,14 +20,11 @@ use telescope_core::evidence::test_support::{synth_record, write_synthetic_bam};
 /// anchor criteria: MAPQ 60, full-length so 3'-anchored with coverage 1.0,
 /// `pt:i = 100`, and `AS:i = 100`.
 ///
-/// ⚠ THE `AS:i = 100` IS LOAD-BEARING SINCE R141, and its absence is the reason
-/// this fixture has to carry it explicitly. The gap is measured on C_raw as
-/// `AS_1 - (AS_2 or 0)`, so a record with NO `AS` tag scores 0 and its lone
-/// candidate measures a delta of 0 — below the shipped `--gap-abs` of 12, and
-/// therefore rejected into `rejected_gap`. These fixtures were written with
-/// `None` and used to pass; under the new rule they build an EMPTY pool, and
-/// this file's `passed=4` assertion reports it as "the fixture lost its
-/// records" rather than as what it is.
+/// ⚠ THE `AS:i = 100` IS LOAD-BEARING. The gap is measured on C_raw as
+/// `AS_1 - (AS_2 or 0)`, so a record with NO `AS` tag scores 0 — below the
+/// shipped `--gap-abs` of 12, and therefore rejected into `rejected_gap`. A
+/// fixture written with `None` builds an EMPTY pool, and this file's `passed=4`
+/// assertion reports that as "the fixture lost its records".
 fn three_tx_bam(tag: &str) -> PathBuf {
     write_synthetic_bam(
         tag,
@@ -108,8 +104,7 @@ fn build_anchors_warns_that_l2_is_unreachable_without_a_gene_map() {
 
     // The thresholds live on `build-emission`, which this function cannot see,
     // so the warning must NOT assert reachability unconditionally: at
-    // `--gene-min-reads 3` the same degenerate pool does fire L2. A message
-    // claiming otherwise would be false for a real, reachable configuration.
+    // `--gene-min-reads 3` the same degenerate pool does fire L2.
     assert!(
         !stderr.contains("STRUCTURALLY UNREACHABLE"),
         "the warning must not claim L2 is unconditionally unreachable; the \
@@ -134,14 +129,10 @@ fn build_anchors_is_silent_when_the_pool_has_real_gene_structure() {
     let stderr = run_build_anchors(&bam, &out, Some(&tsv));
     cleanup(&[&bam, &out, &tsv]);
 
-    // Assert on a string the message ACTUALLY emits. An earlier version of this
-    // test asserted the absence of "STRUCTURALLY UNREACHABLE" — a phrase that
-    // was then removed from the message to scope the claim to the default
-    // thresholds. That silently turned the guard into a tautology: forcing the
-    // warning to fire in both configurations left this test green. A negative
-    // assertion is only worth anything if the string it forbids is one the
-    // positive case really produces. "NO gene structure" is that string, and
-    // the positive test above already pins its presence.
+    // Assert on a string the message ACTUALLY emits. A negative assertion is
+    // only worth anything if the string it forbids is one the positive case
+    // really produces, and the positive test above already pins the presence of
+    // "NO gene structure".
     assert!(
         !stderr.contains("NO gene structure"),
         "a run WITH --tx-to-gene supplying real structure must not warn; got:\n{stderr}"

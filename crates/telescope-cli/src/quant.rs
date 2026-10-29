@@ -1,11 +1,9 @@
 //! The `quant` subcommand: Module 2 (evidence) -> Module 3 (TEL-EM).
 //!
-//! `QuantArgs` is a clap `Args` struct rather than a set of positional
-//! parameters so that BOTH binaries can declare the subcommand from ONE
-//! definition. A research binary that retyped the 18 flags would compile, run,
-//! and silently be a different model the moment a default drifted; the frozen
-//! defaults below are the same constants the shipped binary uses, and there is
-//! now only one copy of them.
+//! `QuantArgs` is a clap `Args` struct so both binaries declare the subcommand
+//! from ONE definition: a retyped flag list would silently be a different model
+//! the moment a default drifted. The frozen defaults below are the same
+//! constants the shipped binary uses.
 
 use std::path::PathBuf;
 
@@ -19,6 +17,7 @@ use crate::{
     POLY_A_WEIGHT_DEFAULT, PRUNE_MAX_DELTA_AS_DEFAULT,
 };
 
+/// Arguments for the `quant` subcommand, shared by both binaries.
 #[derive(Args, Debug)]
 pub struct QuantArgs {
     /// Path to AIDRS-aligned transcriptome BAM.
@@ -41,12 +40,9 @@ pub struct QuantArgs {
     #[arg(long, default_value_t = 35)]
     tes_slack: usize,
 
-    // The ruling specifies this spelling, and the FATAL message in
-    // `evidence.rs` quotes it -- the flag and the error that names it have
-    // to agree, or the error tells the user to type something that does not
-    // exist. The lowercase form is accepted as an alias for the same
-    // reason the flag itself is spelled in both cases: a quant command
-    // invoked from a shell script should not fail on letter case alone.
+    // The FATAL message in `evidence.rs` quotes this spelling, so the flag and
+    // the error that names it must agree; the lowercase alias is accepted so a
+    // shell script does not fail on letter case alone.
     #[arg(
         long = "polyA-source",
         alias = "polya-source",
@@ -58,10 +54,9 @@ pub struct QuantArgs {
     /// Write the record-level filter ledger here as JSON
     /// (`telescope.filter_ledger/v1`). See `extract-evidence --ledger`.
     ///
-    /// `quant` runs the same Module-2 filter chain as `extract-evidence`,
-    /// so its ledger describes the same population; the profile it writes
-    /// is built from those records, and without this the only trace of the
-    /// drop is a stderr block that no later script can read back.
+    /// `quant` runs the same Module-2 filter chain as `extract-evidence`, so
+    /// its ledger describes the same population; without this the only trace of
+    /// the drop is a stderr block no later script can read back.
     #[arg(long)]
     ledger: Option<PathBuf>,
 
@@ -76,19 +71,10 @@ pub struct QuantArgs {
     /// Scale λ of the F-EM-4 alignment term `ln A_rk = (AS_rk − max_j AS_rj) / λ`
     /// (default: 20.0). Must be > 0. Larger λ = weaker alignment prior.
     ///
-    /// PROVENANCE — this default was 1000.0 until the 5'-anchoring work, and
-    /// that value is superseded. 1000 came from a ONE-gene (PGAM1) grid on
-    /// the COPD29 pilot BAM whose oracle was minimap2's own primary
-    /// alignment, i.e. the term was being judged against the aligner that
-    /// produced it. More decisively, at λ = 1000 every evidence term
-    /// compresses to ≤ 0.1 nat, so the EM was barely using the alignment
-    /// evidence it exists to weigh. At λ = 20 with the `ΔAS > 50` prune the
-    /// term spans `[−2.5, 0]` nats, which is the range the 5' weight of 1.8
-    /// was chosen to compete inside.
-    ///
-    /// No value of λ is validated library-wide. Full curve, the superseded
-    /// single-gene calibration, and the frozen-parameter table:
-    /// `workspace/notes/EXPERIMENT.md`.
+    /// Trap: no value of λ is validated library-wide, and λ is not a tuning
+    /// knob — at λ = 1000 every evidence term compresses to ≤ 0.1 nat; at
+    /// λ = 20 with the `ΔAS > 50` prune the term spans `[−2.5, 0]` nats, the
+    /// range the 5' weight of 1.8 competes inside.
     #[arg(long, default_value_t = ALN_WEIGHT_LAMBDA_DEFAULT)]
     aln_weight_lambda: f64,
 
@@ -99,23 +85,17 @@ pub struct QuantArgs {
     /// `g_k` is the start of the read's BEST alignment to candidate k, in
     /// candidate k's OWN cDNA coordinates — not a genomic span.
     ///
-    /// STRAND IS A KNOWN GAP, not a handled case. The frozen spec was
-    /// validated on a forward-only population and the reverse fraction is
-    /// 0.0000 across 200,000 mapped records in each of the AIDRS / Bambu /
-    /// IsoQuant BAMs, so `g_k = s_k − 1` is applied unconditionally here.        /// If the Bambu/IsoQuant general path (Phase F1/F2) ever carries
-    /// antisense alignments this term would silently read the wrong end of
-    /// the molecule; that needs a separately validated definition, not an
-    /// inline guess. See `test_reverse_alignment_uses_the_forward_formula_as_a_documented_gap`.
+    /// Trap: STRAND IS A KNOWN GAP, not a handled case. The reverse fraction
+    /// is 0.0000 across the validated BAMs, so `g_k = s_k − 1` is applied
+    /// unconditionally; antisense alignments would make this term read the
+    /// wrong end of the molecule and need a separately validated definition.
+    /// See `test_reverse_alignment_uses_the_forward_formula_as_a_documented_gap`.
     ///
     /// **Set to 0 to switch the term off.** That makes `ln_5p ≡ 0` exactly,
     /// so it drops out of the softmax exactly; it is the correct way to run
-    /// the Test A / Test B ablation. Note that redrawing each read's 5' start
-    /// (Test B) is a different intervention and is not the same as turning
-    /// the weight to 0 — a redraw leaves the term active but decorrelated.
-    ///
-    /// PROVENANCE — 7.9 was tried and rejected: with the `ΔAS > 50` prune
-    /// and λ = 20 the alignment term spans only `[−2.5, 0]` nats, so a
-    /// 7.9-nat bonus is an unconditional override. 1.8 competes instead.
+    /// the Test A / Test B ablation. Redrawing each read's 5' start (Test B)
+    /// is a different intervention and is not the same as turning the weight
+    /// to 0 — a redraw leaves the term active but decorrelated.
     #[arg(long, default_value_t = FIVE_PRIME_WEIGHT_DEFAULT)]
     five_prime_weight: f64,
 
@@ -129,17 +109,11 @@ pub struct QuantArgs {
     /// Scale on the poly(A) mixture term. 1.0 is the shipped model.
     /// **0.0 removes the poly(A) evidence entirely.**
     ///
-    /// It does NOT leave an alignment-only model. `ln w_rk = ln alpha_k +
-    /// poly_a_weight * ln P(polyA|k) + ln a_rk + ln 5p_k`, so the mixture
-    /// prior `ln alpha_k` survives at any weight, including 0. With both
-    /// this and `--five-prime-weight` at 0 the likelihood is
-    /// `ln alpha_k + ln a_rk` — abundance prior PLUS alignment. Calling that
-    /// arm "alignment-only" is wrong, and the prior cannot be dropped from
-    /// the outside either: pinning `mu`/`sigma2` in the emission parquet
-    /// does nothing, because `alpha` is re-estimated by the M-step and
-    /// would still leak into every candidate's score. A genuinely
-    /// prior-free baseline is a different estimator (e.g. argmax-`AS`
-    /// assignment), not an ablation of this one.
+    /// Trap: 0.0 does NOT leave an alignment-only model. The mixture prior
+    /// `ln alpha_k` survives at any weight, and with `--five-prime-weight 0`
+    /// too the likelihood is `ln alpha_k + ln a_rk` — abundance prior PLUS
+    /// alignment. The prior cannot be dropped from outside either, because
+    /// `alpha` is re-estimated by the M-step.
     #[arg(long, default_value_t = POLY_A_WEIGHT_DEFAULT)]
     poly_a_weight: f64,
 
@@ -148,10 +122,9 @@ pub struct QuantArgs {
     /// greater-than, so `ΔAS = 50` survives. The read's own best candidate
     /// has `ΔAS = 0` against itself and can never be pruned.
     ///
-    /// At λ = 20 the alignment term is too weak to delete candidates on its
-    /// own — reaching the `min_weight` cutoff costs `ΔAS > 4.595 × 20 = 91.9`,
-    /// past this threshold — so the deletion responsibility sits here. Use
-    /// a very large value to switch the prune off.
+    /// Trap: at the shipped λ the alignment term is too weak to delete
+    /// candidates on its own, so the deletion responsibility sits here. Use a
+    /// very large value to switch the prune off.
     #[arg(long, default_value_t = PRUNE_MAX_DELTA_AS_DEFAULT)]
     prune_max_delta_as: i32,
 
@@ -159,18 +132,15 @@ pub struct QuantArgs {
     /// (read × candidate) row is emitted only if its posterior is >= this,
     /// and each read's surviving rows are renormalised to 1.0.
     ///
-    /// THIS IS NOT COSMETIC FOR A/B WORK. Two arms of an ablation can emit
-    /// different row counts on the same reads — measured on GNG11, 2726 rows
-    /// with the 5' term on vs 1816 with it off — because the arm that shifts
-    /// mass onto a candidate is the arm that clears the cutoff. The arms are
-    /// then not scored on the same support. Any ablation whose arms differ in
-    /// row count must be re-run at `--min-weight 0` (no truncation at all)
-    /// before its delta is quoted. 0.0 is legal; values >= 1.0 are rejected.
+    /// Trap: this is not cosmetic for A/B work. Two arms of an ablation can
+    /// emit different row counts on the same reads, so the arms are then not
+    /// scored on the same support; any ablation whose arms differ in row
+    /// count must be re-run at `--min-weight 0` before its delta is quoted.
+    /// 0.0 is legal; values >= 1.0 are rejected.
     #[arg(long, default_value_t = 0.01)]
     min_weight: f64,
 
-    /// Optional TSV with header `bam_id\toriginal_id` for ID translation
-    /// (replaces offline Python workaround for AIDRS re-keying).
+    /// Optional TSV with header `bam_id\toriginal_id` for ID translation.
     #[arg(long)]
     tx_id_mapping: Option<PathBuf>,
 
@@ -184,53 +154,33 @@ pub struct QuantArgs {
     ///
     /// The profile parquet is per (read, candidate) PAIR and carries no
     /// per-read summary, so "which transcript did this read end up on, and
-    /// how sure was it" is not recoverable from it. This exists for
-    /// comparing two runs read-by-read (e.g. an alignment re-run at a
-    /// different `-N`), which needs a per-read key.
+    /// how sure was it" is not recoverable from it.
     ///
-    /// `top_tx_id` is the transcript NAME, not a pool index, so the table
-    /// can be joined against another run's table. It is null for a read
-    /// with no nameable transcript. `top_weight` is the raw E-step weight
-    /// and is deliberately NOT the profile's `posterior_weight` (that one
-    /// is post-truncation and renormalised).
+    /// `top_tx_id` is the transcript NAME, not a pool index, so the table can
+    /// be joined against another run's table; it is null for a read with no
+    /// nameable transcript. `top_weight` is the raw E-step weight and is
+    /// deliberately NOT the profile's `posterior_weight` (post-truncation and
+    /// renormalised).
     #[arg(long)]
     read_assignments: Option<PathBuf>,
 
     /// Also write the `(mu, sigma2)` the FINAL E-step consumed
     /// (`--dump-emission-params <path>.parquet`).
     ///
-    /// WHY. There are two different μ in this program and nothing on disk
-    /// distinguished them: the one LOADED from `--emission`, and the one the
-    /// M-step FITTED. The posterior is computed from whichever the last
-    /// E-step saw, so an analysis that bins reads by Δμ must bin by that
-    /// one. Before this flag the only μ on disk was the loaded one, which is
-    /// the right value only when the last E-step is the FIRST one — i.e. at
-    /// `--max-iter 1`, or on a graph with no contested reads. On any longer
-    /// run the M-step has moved μ and the loaded value is wrong, whether or
-    /// not the run converged.
+    /// There are two different μ in this program: the one LOADED from
+    /// `--emission` and the one the M-step FITTED. The posterior is computed
+    /// from whichever the last E-step saw, so an analysis that bins reads by
+    /// Δμ must bin by that one.
     ///
-    /// This is a DIAGNOSTIC / AUDIT SNAPSHOT. It is NOT a re-loadable
-    /// model, and the previous version of this help text said it was --
-    /// wrongly. Do not pass it back as `--emission`.
+    /// Trap: this is a DIAGNOSTIC / AUDIT SNAPSHOT, not a re-loadable model.
+    /// The writer omits `n_cohort_flnc`, which the loader requires, so the
+    /// round trip dies there; and re-loading would be wrong even if it parsed,
+    /// because `load_emission_parameters` re-anchors both shrinkage priors to
+    /// the already-fitted values and applies τ₀ and 2β₀ a second time. Do not
+    /// pass it back as `--emission`.
     ///
-    /// Why it cannot be re-loaded: the writer emits five of the six columns
-    /// `load_emission_parameters` requires (`transcript_id`, `gene_id`,
-    /// `is_polyA_competent`, `mu_logPAL`, `sigma2_logPAL`) plus its own
-    /// audit columns, but it does NOT emit `n_cohort_flnc`. The loader reads
-    /// that column as REQUIRED (`.context("Missing 'n_cohort_flnc'")?`, on
-    /// purpose, so a hand-built model cannot silently classify every row as
-    /// anchored), so the round trip dies there rather than producing a
-    /// number. Pinned by
-    /// `test_the_sidecar_cannot_be_reloaded_as_an_emission_model`, which
-    /// fails if `n_cohort_flnc` is ever added -- at which point this text
-    /// and the prior-reanchoring hazard below have to be re-decided.
-    ///
-    /// And re-loading would be wrong even if it parsed. `load_emission_
-    /// parameters` sets `mu_cohort = mu_logPAL` and `sigma2_cohort =
-    /// sigma2_logPAL`, so a second pass would re-anchor BOTH shrinkage
-    /// priors to the already-fitted values and apply τ₀ and 2β₀ a second
-    /// time. The columns are present so an analyst can SEE that; do not
-    /// feed them back in.
+    /// Pinned by `test_the_sidecar_cannot_be_reloaded_as_an_emission_model`,
+    /// which fails if `n_cohort_flnc` is ever added.
     ///
     /// The published profile and read-assignments schemas are unchanged.
     #[arg(long)]
@@ -241,9 +191,8 @@ pub struct QuantArgs {
 ///
 /// `sigma2_dof_offset`: `None` means "the shipped model's offset", i.e.
 /// `SIGMA2_DOF_OFFSET`. `Some(c)` is reachable ONLY from the research binary;
-/// the production `telescope` never passes it, which is what keeps the frozen
-/// `Model A c = 2` guarantee a compile-time property of the shipped artifact
-/// rather than a runtime promise.
+/// the production `telescope` never passes it, so the frozen `Model A c = 2`
+/// guarantee is a property of the shipped artifact, not a runtime promise.
 pub fn run_quant(args: QuantArgs, sigma2_dof_offset: Option<f64>) -> Result<()> {
     let QuantArgs {
         bam,
@@ -269,10 +218,9 @@ pub fn run_quant(args: QuantArgs, sigma2_dof_offset: Option<f64>) -> Result<()> 
 
     let poly_a = evidence::parse_poly_a_source(&poly_a_source)?;
     // `--polyA-source none` fills `log_pal` with a placeholder, not a
-    // measurement. The ruling requires the inconsistent pairing to be
-    // UNEXPRESSIBLE rather than merely warned about, so the weight is
-    // forced here instead of erroring on a value the user may have set
-    // for a different reason (a global default, a wrapper script).
+    // measurement, so the inconsistent pairing is made UNEXPRESSIBLE rather
+    // than merely warned about: the weight is forced instead of erroring on a
+    // value the user may have set for another reason.
     let poly_a_weight = if matches!(poly_a, evidence::PolyASource::None) {
         if poly_a_weight != 0.0 {
             eprintln!(
@@ -297,9 +245,8 @@ pub fn run_quant(args: QuantArgs, sigma2_dof_offset: Option<f64>) -> Result<()> 
     // propagates into every posterior weight. 0.0 is legal and is the
     // documented off switch for the 5' term.
     //
-    // clippy's `neg_cmp_op_on_partial_ord` wants this rewritten with
-    // `partial_cmp`, which would be a REGRESSION: the point of the
-    // negated form is that it is false for NaN. Do not "fix" this.
+    // clippy's `neg_cmp_op_on_partial_ord` wants `partial_cmp` here, which
+    // would be a REGRESSION: the negated form is false for NaN. Do not "fix" it.
     #[allow(clippy::neg_cmp_op_on_partial_ord)]
     if !(five_prime_weight >= 0.0) {
         anyhow::bail!(
@@ -346,7 +293,6 @@ pub fn run_quant(args: QuantArgs, sigma2_dof_offset: Option<f64>) -> Result<()> 
     eprintln!("  debug:      {}", debug);
 
     // Parse optional `bam_id\toriginal_id` TSV (header row skipped).
-    // This replaces the previous offline Python re-keying workaround.
     let id_mapping: Option<std::collections::HashMap<String, String>> = if let Some(ref p) =
         tx_id_mapping
     {
@@ -395,7 +341,7 @@ pub fn run_quant(args: QuantArgs, sigma2_dof_offset: Option<f64>) -> Result<()> 
         graph.transcript_names.len()
     );
 
-    // Phase A: candidate_count histogram (telemetry).
+    // candidate_count histogram (telemetry).
     let cand_hist = graph.candidate_count_histogram();
     let n_total_reads = graph.molecules.len() as f64;
     eprintln!("[telescope]    candidate_count histogram:");
@@ -454,14 +400,12 @@ pub fn run_quant(args: QuantArgs, sigma2_dof_offset: Option<f64>) -> Result<()> 
     let mut em_trace: Vec<(usize, f64, f64)> = Vec::new();
     let trace_sink: Option<&mut Vec<(usize, f64, f64)>> =
         if debug { Some(&mut em_trace) } else { None };
-    // Collected only when the caller asked for the per-read table. The
-    // Vec is always declared (it is empty otherwise and is never
-    // filled), which keeps the borrow a plain `&mut` for the duration
-    // of the call rather than a borrow of a temporary.
+    // Collected only when the caller asked for the per-read table. The Vec is
+    // always declared (empty otherwise and never filled), which keeps the
+    // borrow a plain `&mut` for the duration of the call.
     let mut read_sink: Vec<em::ReadAssignment> = Vec::new();
-    // Same idiom as `read_sink`: declared unconditionally so the borrow
-    // is a plain `&mut` for the call rather than a borrow of a
-    // temporary, and filled only when the flag asked for it.
+    // Same idiom as `read_sink`: declared unconditionally so the borrow is a
+    // plain `&mut` for the call, and filled only when the flag asked for it.
     let mut params_sink: Vec<Option<em::TranscriptParam>> = Vec::new();
     let stats = em::solve_and_write_profile_with_dof_offset(
         graph,
@@ -525,13 +469,12 @@ pub fn run_quant(args: QuantArgs, sigma2_dof_offset: Option<f64>) -> Result<()> 
         stats.n_ambiguous
     );
     eprintln!("[telescope]    EM iterations:          {}", stats.n_em_iter);
-    // Drop taxonomy. Every number in the two groups below is a count
-    // of READS, and each group is printed under the denominator that
-    // population actually has: a single shared denominator would be
-    // meaningless, because an unambiguous read and a contested read
-    // cannot be dropped for the same reason at the same site. The
-    // tripwire after them is a ROW count and is deliberately outside
-    // both groups.
+    // Drop taxonomy. Every number in the two groups below is a count of READS,
+    // and each group is printed under the denominator that population actually
+    // has: a single shared denominator would be meaningless, because an
+    // unambiguous read and a contested read cannot be dropped for the same
+    // reason at the same site. The tripwire after them is a ROW count and is
+    // deliberately outside both groups.
     let n_ghost = stats.n_dropped_no_competent_candidates;
     eprintln!("[telescope]    reads dropped, no profile row:");
     eprintln!(
@@ -575,22 +518,20 @@ pub fn run_quant(args: QuantArgs, sigma2_dof_offset: Option<f64>) -> Result<()> 
          tripwire that must stay 0: {}",
         stats.n_dropped_output_row_competence
     );
-    // CANDIDATE CONSERVATION LEDGER. A count of CANDIDATE ROWS, on its
-    // own denominator, for the same reason the two groups above are not
-    // pooled: a candidate cannot be lost for the same reason a read
-    // cannot, and reading the two ladders against each other is how the
-    // original 20.10% deficit went unexamined for a round.
+    // CANDIDATE CONSERVATION LEDGER. A count of CANDIDATE ROWS, on its own
+    // denominator, for the same reason the two groups above are not pooled: a
+    // candidate cannot be lost for the same reason a read cannot, and reading
+    // the two ladders against each other hides a deficit.
     let led = &stats.ledger;
     eprintln!("[telescope]    candidate ledger (every candidate, one terminal fate):");
     eprintln!(
         "[telescope]      candidates on the graph (LHS)     : {}",
         led.total_candidates
     );
-    // The census tests these four in this order and `continue`s, so a
-    // candidate that is BOTH pruned and emission-less is counted ONLY
-    // as pruned. The `no emission row` line is not a count of
-    // candidates lacking an emission row; it is a count of candidates
-    // that got past the prune and then had none.
+    // The census tests these four in this order and `continue`s, so a candidate
+    // that is BOTH pruned and emission-less is counted ONLY as pruned. The
+    // `no emission row` line counts candidates that got past the prune and
+    // then had no emission row.
     eprintln!("[telescope]      -- contested, decided by the E-step (tested in this order):");
     eprintln!(
         "[telescope]         pruned by delta-AS            : {}",
@@ -665,14 +606,12 @@ pub fn run_quant(args: QuantArgs, sigma2_dof_offset: Option<f64>) -> Result<()> 
         stats.n_entropy_degenerate,
         stats.n_entropy_degenerate as f64 / n_ambig * 100.0
     );
-    // The degenerate reads split by MECHANISM, because the two are
-    // flat for different reasons and a single number cannot be read.
-    // Both are printed against the SAME denominator -- the degenerate
-    // total, not n_ambig -- because the question is "of the degenerate
-    // reads, how many are this kind", and dividing by n_ambig here would
-    // silently answer a different question. The CLI prints the
-    // residual `n_ambig - degenerate` nowhere, so this is the only
-    // place the composition is visible.
+    // The degenerate reads split by MECHANISM, because the two are flat for
+    // different reasons and a single number cannot be read. Both are printed
+    // against the SAME denominator -- the degenerate total, not n_ambig --
+    // because dividing by n_ambig here would silently answer a different
+    // question. The CLI prints the residual `n_ambig - degenerate` nowhere,
+    // so this is the only place the composition is visible.
     eprintln!(
         "[telescope]        of which padded-padded ambiguity: {} ({:.1}% of degenerate)",
         stats.n_degenerate_all_imputed,
@@ -683,16 +622,10 @@ pub fn run_quant(args: QuantArgs, sigma2_dof_offset: Option<f64>) -> Result<()> 
         stats.n_degenerate_with_anchored,
         stats.n_degenerate_with_anchored as f64 / stats.n_entropy_degenerate.max(1) as f64 * 100.0
     );
-    // (The two zero-power counters that used to be reported here are gone; see
-    // the comment further down. The paragraph below is retained because
-    // it still governs the two lines that remain.)
-    //
-    // A denominator of ZERO PRINTS `n/a`, NOT `0.0%`. `0.0 / 0.0` in
-    // Rust is NaN, so an unguarded line prints "NaN%" -- and a
-    // `.max(1)` guard alone fixes the NaN while making "no read
-    // qualified" render as a confident 0.0%. That is the same class of
-    // defect as the metric this change is about: a number that looks
-    // measured and is not.
+    // A denominator of ZERO PRINTS `n/a`, NOT `0.0%`. `0.0 / 0.0` in Rust is
+    // NaN, so an unguarded line prints "NaN%", and a `.max(1)` guard alone
+    // fixes the NaN while rendering "no read qualified" as a confident 0.0%
+    // -- a number that looks measured and is not.
     let n_with_cand = stats.n_unambiguous + stats.n_ambiguous;
     eprintln!("[telescope]    emission model coverage (reads with >=1 candidate):");
     eprintln!(
@@ -707,40 +640,17 @@ pub fn run_quant(args: QuantArgs, sigma2_dof_offset: Option<f64>) -> Result<()> 
         n_with_cand,
         pct(stats.n_reads_single_emission_candidate, n_with_cand as u64)
     );
-    // The two zero-power counters used to be printed here, under the
-    // header `poly(A) discriminative power:`. They are deliberately NOT
-    // printed any more, and this comment exists so the removal is not
-    // "tidied up" by a later reader who never saw the reason.
+    // The two zero-power counters are deliberately NOT printed here, under the
+    // header `poly(A) discriminative power:`. The counter fires on a contested
+    // read whose candidates all share ONE identical `(mu, sigma2)` -- i.e. it
+    // fires exactly when the M-step did NOT personalise them -- so a LOW value
+    // means non-degenerate and says nothing about whether poly(A) can
+    // discriminate; its complement would read as a false positive claim.
     //
-    // WHAT WAS WRONG WITH THEM. The counter FIRES on a contested read whose
-    // candidates all share ONE identical `(mu, sigma2)` -- i.e. it fires
-    // exactly when the M-step did NOT personalise them, and the poly(A)
-    // term cancels in every pairwise odds ratio. So a LOW value means
-    // non-degenerate, and it says nothing about whether the poly(A) term
-    // can actually discriminate. On HC2 it printed
-    // `zero-power_all: 886 of 4,380,726 ambiguous (0.02%)`.
-    //
-    // THE TRAP WAS THE COMPLEMENT. 0.02% is one number away from
-    // "poly(A) discriminates on 99.98% of contested reads", and that
-    // inference is false: measured on HC2 the per-read poly(A) residual
-    // sd is 0.7521 log2 against a median candidate separation of 0.1919
-    // -- SNR 0.255 -- and a controlled experiment at that real
-    // separation scored 54.86%, BELOW the 70.0% majority-class
-    // baseline. An earlier round of notes made exactly that
-    // complement error and wrote the 99.98% claim up as a result.
-    //
-    // The header was the worst of it: leaving `zero-power_resolved`
-    // printed under "poly(A) discriminative power:" would have
-    // preserved the same defect, which is why both lines went and not
-    // just the one named in the ruling.
-    //
-    // THE FIELDS STAY. `n_polya_zero_power` and
-    // `n_polya_zero_power_resolved` remain on `TelEmStats`. Nothing at
-    // runtime reads them any more -- the only consumer is `em.rs`'s
-    // unit tests, which assert on the fields directly and cannot see
-    // this file -- so they are a tripwire for parameters collapsing
-    // numerically into one identical float, and they must never be cited
-    // as evidence of poly(A) validity or discriminative power.
+    // Trap: `n_polya_zero_power` and `n_polya_zero_power_resolved` remain on
+    // `TelEmStats` as a tripwire for parameters collapsing numerically into one
+    // identical float, and they must never be cited as evidence of poly(A)
+    // validity or discriminative power.
     // `crates/telescope-cli/tests/quant_does_not_report_polya_validity.rs`
     // fails if either string reappears on stderr.
     if debug && !stats.em_trace.is_empty() {
