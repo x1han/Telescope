@@ -1,4 +1,4 @@
-//! Schema v1 of the machine-readable filter ledger.
+//! Schema of the machine-readable filter ledger.
 //!
 //! Two deliberate deviations from the original schema text are recorded here:
 //! `anchor_level.filtered` carries NINE keys, not six, because the code has
@@ -16,8 +16,8 @@ use anyhow::Context as _;
 use telescope_core::anchor_builder::AnchorStats;
 use telescope_core::evidence::FilterCounts;
 
-/// The schema tag. Bump this, and the filename, together.
-const SCHEMA: &str = "telescope.filter_ledger/v1";
+/// The schema tag. Change it only together with the artifact format it names.
+const SCHEMA: &str = "telescope.filter_ledger";
 
 /// The unit travels WITH the number, so it survives being quoted out of the log.
 const RECORD_SCOPE: &str = "RECORDS, not reads, not molecules";
@@ -222,7 +222,7 @@ mod tests {
     ///
     /// **`unique` IS A RETIRED COMPAT SLOT AND MUST STAY 0.** The MAPQ < 20 gate
     /// it counted is gone, so nothing increments it, but the key stays:
-    /// `telescope.filter_ledger/v1` is a published schema, a downstream
+    /// `telescope.filter_ledger` is a published schema, a downstream
     /// consumer reads this name, and `bucket_sum` sums all twelve.
     ///
     /// Trap: a retired counter is the one kind of field no test here catches
@@ -518,8 +518,8 @@ mod tests {
             int_field(&json, "unique"),
             0,
             "`unique` is a retired compat slot: the MAPQ < 20 gate is gone, so \
-             nothing may increment it, and the key must stay in the frozen v1 \
-             schema.\n{json}"
+             nothing may increment it, and the key must stay in the frozen \
+             ledger schema.\n{json}"
         );
         // And it is still inside the twelve-term sum rather than dangling:
         // `bucket_sum` would not raise on a zero term, so pin the count.

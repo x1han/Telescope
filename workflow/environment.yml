@@ -1,11 +1,11 @@
-# Conda environment for the R engine of Module 4.
+# Conda environment for the R engine of the differential-statistics layer.
 #
 #   mamba env create -f workflow/environment.yml
 #   mamba activate telescope-ref
 #   Rscript workflow/scripts/telescope_diff.R --help
 #
-# WHY THIS FILE EXISTS. The differential statistics in Module 4 are built on
-# Bioconductor packages (DEXSeq, limma, lmerTest). Those are not part of the
+# WHY THIS FILE EXISTS. The differential statistics are built on
+# Bioconductor packages (DEXSeq, DESeq2, limma). Those are not part of the
 # Rust binary, so the R engine needs its own environment.
 #
 # `telescope diff` NEEDS this environment: it aggregates in Rust and then
@@ -31,16 +31,20 @@ channels:
   - bioconda
 dependencies:
   - r-base=4.3.3
-  # Bioconductor: DEXSeq is the ΔPAU track, limma the variance moderation.
+  # Bioconductor: DEXSeq is the usage track, DESeq2 the gene track, limma the
+  # variance moderation.
   - bioconductor-dexseq=1.48.0
+  - bioconductor-deseq2=1.42.0
   - bioconductor-limma=3.58.1
-  # Mixed model for the ΔPAL track when there are technical replicates.
-  - r-lmertest=3.1_3
-  - r-lme4=1.1_37
-  - r-emmeans=1.11.2_8
   # I/O and reshaping.
   - r-arrow=21.0.0
   - r-dplyr=1.1.4
   - r-tidyr=1.3.1
   - r-optparse=1.7.5
   - r-matrixstats=1.5.0
+  # The polyadenylation track's caller. LAPA is on neither bioconda nor
+  # conda-forge -- it is a PyPI package. 0.0.5 is the version this track was
+  # verified against.
+  - pip
+  - pip:
+    - lapa==0.0.5

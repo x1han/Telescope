@@ -1,18 +1,7 @@
-//! Module: Universal Mode Anchor Pool Builder (`anchor_builder.rs`)
-//!
-//! Streams one or more BAM files, applies poly(A) anchor criteria, and writes
-//! a unified `telescope.anchor_pool.parquet` for the downstream emission model.
-//!
-//! Criteria: 3' TES anchor `ref_end + tes_slack >= ref_len`; valid poly(A)
-//! `pt:i >= 10`; coverage `alignment_length / ref_len >= min_coverage`
-//! (default 0.80); per-sample 200-read cap per transcript.
-//!
-//! Ambiguity is resolved PER READ (strict argmax over that read's candidates),
-//! NOT by an NH/MAPQ record filter. A 5' TSS anchor is NOT required (5'
-//! truncation is normal in DRS).
-//!
-//! Output schema: sample_id, read_id, gene_id, transcript_id, poly_a_length,
-//! posterior_weight (float64 = 1.0 for anchors).
+//! Criteria: 3' TES anchor `ref_end + tes_slack >= ref_len`; poly(A) `pt:i >= 10`; coverage
+//! `alignment_length / ref_len >= min_coverage` (default 0.80); per-sample 200-read cap per
+//! transcript. Ambiguity is resolved PER READ (strict argmax); no NH/MAPQ filter. Output schema:
+//! sample_id, read_id, gene_id, transcript_id, poly_a_length, posterior_weight.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -37,8 +26,7 @@ const TAG_PT: Tag = Tag::new(b'p', b't');
 /// minimap2 alignment score SAM tag: `AS:i`. Drives the per-read argmax.
 const TAG_AS: Tag = Tag::new(b'A', b'S');
 
-/// Transcript → Gene lookup table. Built from a TSV (one `transcript_id\tgene_id`
-/// per line) or empty (in which case `transcript_id` is used as `gene_id`).
+/// Transcript → Gene lookup table: a TSV of `transcript_id\tgene_id` lines, or empty (then `transcript_id` is its own `gene_id`, and the gene relation is `Unknown`).
 #[derive(Debug, Default, Clone)]
 pub struct TxToGene {
     map: HashMap<String, String>,
@@ -51,14 +39,13 @@ impl TxToGene {
         }
     }
 
-    /// Load from a TSV with header `transcript_id\tgene_id`.
     pub fn from_tsv<P: AsRef<Path>>(path: P) -> Result<Self> {
         let mut map = HashMap::new();
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("Failed to read tx-to-gene TSV: {:?}", path.as_ref()))?;
         for (i, line) in content.lines().enumerate() {
             if i == 0 && line.starts_with("transcript_id") {
-                continue; // header
+                continue;
             }
             let mut parts = line.splitn(2, '\t');
             let tx = parts.next().unwrap_or("").to_string();
@@ -77,53 +64,25 @@ impl TxToGene {
         self.map.len()
     }
 
-    /// Whether the map carries no entries at all.
-    ///
-    /// Load-bearing: with an EMPTY map every transcript is its own gene, so the
-    /// per-read same-gene veto can never fire. The veto reads this to route
-    /// those reads to `same_gene_unknown` and to count `gene_veto_disabled`
-    /// instead of pretending it decided.
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
     }
 }
 
-/// Per-run knobs for [`build_anchor_pool`].
-///
-/// Grouped into one struct so the entry point stays under clippy's
-/// `too_many_arguments` threshold.
 #[derive(Debug, Clone, Copy)]
 pub struct AnchorParams {
-    /// 3' TES slack in bp: an alignment is 3'-anchored when
-    /// `alignment_end + tes_slack >= ref_len`.
+    /// 3' TES slack in bp: 3'-anchored when `alignment_end + tes_slack >= ref_len`.
     pub tes_slack: usize,
     /// Minimum coverage ratio `alignment_length / ref_len`.
     pub min_coverage: f64,
     /// Per-sample cap on anchors per transcript.
     pub max_reads_per_sample: usize,
-    /// Absolute floor on `delta_AS_raw`.
-    ///
-    /// **THE SHIPPED DEFAULT IS 12.0, AND IT IS A RULED VALUE, NOT A DEFAULT.**
-    /// The criterion is ON: a single mismatch on this data costs 6 AS and a
-    /// 1 bp indel 6–8 AS, so a 12 AS floor sits above the cost of one edit and
-    /// far below the cost of the isoform divergence this pass exists to resolve.
-    ///
-    /// **`delta_AS_raw` is `AS_1 - (AS_2 or 0)`, MEASURED ON C_raw** — the
-    /// full deduped candidate set BEFORE the physical filters — so a read with
-    /// exactly one raw candidate is measured against 0 and the floor applies to
-    /// it too.
+    /// Absolute floor on `delta_AS_raw` (shipped default 12.0; a single mismatch costs 6 AS). `delta_AS_raw = AS_1 - (AS_2 or 0)`, MEASURED ON C_raw — the deduped candidate set BEFORE the physical filters — so a lone raw candidate is measured against 0.
     pub gap_abs: f64,
-    /// Floor on `delta_AS_raw` as a FRACTION of `AS_best`.
-    ///
-    /// **THE SHIPPED DEFAULT IS 0.0 AND THAT IS A CHOICE, NOT AN OMISSION.**
-    /// The two floors are combined with `max`, so a relative floor of 0.0 is
-    /// arithmetically inert next to a non-zero [`AnchorParams::gap_abs`] and
-    /// simply says "the absolute floor is the only floor". Read it that way,
-    /// never as "off" — with `gap_abs` at 12.0 the criterion is on either way.
+    /// Floor on `delta_AS_raw` as a FRACTION of `AS_best` (shipped default 0.0); the two floors are combined with `max`, so a relative floor of 0.0 is inert.
     pub gap_rel: f64,
 }
 
-/// One filtered alignment that passes the anchor criteria.
 #[derive(Debug, Clone)]
 pub struct AnchorRecord {
     pub sample_id: String,
@@ -133,13 +92,7 @@ pub struct AnchorRecord {
     pub poly_a_length: i32,
 }
 
-/// Build anchor pool from one or more BAMs.
-///
-/// `bams_and_samples` is parallel: `bams_and_samples[i] = (path, sample_id)`.
-/// `tx_to_gene` maps `transcript_id` -> `gene_id`; if it is empty the
-/// transcript_id is used as the gene_id, which is appropriate for novel
-/// single-transcript loci — but see [`TxToGene::is_empty`] for what that costs
-/// the same-gene veto.
+/// `bams_and_samples` is parallel: `bams_and_samples[i] = (path, sample_id)`. `tx_to_gene` maps `transcript_id` -> `gene_id`, falling back to the transcript itself when empty.
 pub fn build_anchor_pool<P, Q>(
     bams_and_samples: &[(P, &str)],
     tx_to_gene: &TxToGene,
@@ -159,10 +112,6 @@ where
         all_anchors.extend(anchors);
     }
 
-    // Pool-level, from the records already in hand: NOT the per-sample
-    // accumulation `add` does. Distinct gene/transcript counts cannot be
-    // summed across samples, so they are assigned once, over the whole pool,
-    // after the loop.
     let (distinct_genes, distinct_transcripts) = pool_gene_tx_cardinality(&all_anchors);
     stats.distinct_genes = distinct_genes;
     stats.distinct_transcripts = distinct_transcripts;
@@ -173,40 +122,14 @@ where
     Ok(stats)
 }
 
-/// Distinct `(gene_id, transcript_id)` counts over a built pool. Used to detect
-/// the degenerate state in which every gene holds exactly one transcript's
-/// anchors (see [`degenerate_gene_pool_warning`]).
+/// Distinct `(gene_id, transcript_id)` counts; the exact detector of the degenerate state.
 fn pool_gene_tx_cardinality(anchors: &[AnchorRecord]) -> (usize, usize) {
     let genes: HashSet<&str> = anchors.iter().map(|a| a.gene_id.as_str()).collect();
     let transcripts: HashSet<&str> = anchors.iter().map(|a| a.transcript_id.as_str()).collect();
     (genes.len(), transcripts.len())
 }
 
-/// The `[telescope][WARN]` line for a pool in the degenerate state — every gene
-/// holds exactly one transcript's anchors — or `None` when the pool carries
-/// real gene structure.
-///
-/// WHY THIS IS EXACT, NOT A HEURISTIC. The degenerate state is precisely
-/// `distinct gene_id == distinct transcript_id`, and the consequence follows
-/// from that alone: no two transcripts ever share fitted poly(A) parameters
-/// through the L2 tier.
-///
-/// Note what the counts do and do not prove. They show the gene -> transcript
-/// relation is INJECTIVE; they do not show `gene_id` is literally the
-/// `transcript_id` string. A legitimate 1:1 map that renames (`T1 -> G1`) is
-/// equally degenerate and equally deserves the warning, so the message must not
-/// claim the ids were equal — for that user that would be false.
-///
-/// The threshold claims in the message are scoped to the DEFAULT
-/// `build-emission` flags, which this function cannot see. It must not state
-/// an unconditional claim about them, and it must not branch on "no
-/// `--tx-to-gene` was passed": a TSV that genuinely maps one transcript to one
-/// gene is equally degenerate and needs the warning just as much, while a TSV
-/// that maps several transcripts onto a shared gene must stay silent.
-///
-/// An empty pool is exempt (`None`): the counts are vacuously equal there, but
-/// the consequence that matters is that no anchors passed at all, and a message
-/// about the fallback cascade would point at the wrong problem.
+/// The `[telescope][WARN]` line for a pool in the degenerate state — every gene holds exactly one transcript's anchors — or `None` when the pool carries real gene structure. The degenerate state is exactly `distinct gene_id == distinct transcript_id`, so no two transcripts ever share fitted poly(A) parameters through the L2 tier.
 pub fn degenerate_gene_pool_warning(
     distinct_genes: usize,
     distinct_transcripts: usize,
@@ -239,11 +162,7 @@ pub fn degenerate_gene_pool_warning(
     ))
 }
 
-/// One alignment that survived the record-level filter chain, reduced to the
-/// five fields the per-read decision needs.
-///
-/// FIXED SIZE, 20 bytes. The staging map holds one of these per surviving
-/// record, so anything variable-length here would be multiplied by that count.
+/// FIXED SIZE, 20 bytes: the staging map holds one of these per surviving record.
 #[derive(Debug, Clone, Copy)]
 struct Staged {
     ref_id: u32,
@@ -253,36 +172,17 @@ struct Staged {
     pt: i32,
 }
 
-/// One read's staging state. `cands` is in BAM order on entry from the
-/// streaming pass; the per-read pass sorts it in place.
+/// One read's staging state; `cands` arrives in BAM order and is sorted in place.
 struct ReadGroup {
-    /// The 128-bit read-name hash this group was filed under.
-    ///
-    /// STORED rather than recomputed: it is the per-transcript cap's sort key,
-    /// so cap membership has to be a deterministic function of the read's own
-    /// name, and the name lives in the arena rather than in the map that pass 1
-    /// used.
+    /// The 128-bit read-name hash this group was filed under: the per-transcript cap's sort key.
     key: u128,
     /// Byte range of this read's QNAME inside the shared name arena.
-    ///
-    /// NAMES are kept as bytes in one arena rather than as a `String` per read;
-    /// only the reads that actually become anchors ever need an owned
-    /// `String`.
     name_off: u32,
     name_len: u32,
     cands: Vec<Staged>,
 }
 
-/// 128-bit grouping key for a read name.
-///
-/// WHY A HASH AND NOT THE NAME. A `u128` key is 16 bytes, lives inline in the
-/// map and allocates nothing; a name as a map key costs one heap allocation
-/// per read.
-///
-/// The two halves are not independent — they are the same keyed function over
-/// two different messages — so the real guarantee is not a probability estimate
-/// but the per-record comparison in the staging loop, which fails the run
-/// outright if any two distinct QNAMEs ever land on one key.
+/// 128-bit grouping key for a read name. The guarantee is the per-record comparison in the staging loop, which fails the run if two distinct QNAMEs share a key.
 fn read_key(name: &[u8]) -> u128 {
     let mut lo = DefaultHasher::new();
     name.hash(&mut lo);
@@ -292,27 +192,13 @@ fn read_key(name: &[u8]) -> u128 {
     (u128::from(hi.finish()) << 64) | u128::from(lo.finish())
 }
 
-/// How a read's top two candidates relate under `tx_to_gene`.
 enum GeneRelation {
-    /// Both transcripts resolve to the same gene.
     Same,
-    /// The map is empty, so `gene_id == transcript_id` for both and the
-    /// relation is genuinely unknown — NOT the same as `Cross`, which is a
-    /// statement the data supports.
     Unknown,
-    /// The two transcripts resolve to different genes.
     Cross,
 }
 
-/// Resolve a transcript's gene, or fail loudly when a non-empty map does not
-/// cover it.
-///
-/// The EMPTY map falls back to `gene_id := transcript_id`, which is legitimate
-/// for novel single-transcript loci. The NON-EMPTY map missing a transcript is
-/// a different situation entirely: the map and the BAM's `@SQ` header
-/// disagree, and the silent fallback would then decide the same-gene veto on a
-/// gene id that was invented on the spot — a veto that never fires reads
-/// exactly like a veto that correctly found no shared gene.
+/// Resolve a transcript's gene, or fail loudly when a non-empty map does not cover it. The EMPTY map falls back to `gene_id := transcript_id`, legitimate for novel single-transcript loci; a NON-EMPTY map missing a transcript means the map and the BAM's `@SQ` header disagree.
 fn resolve_gene(tx: &str, tx_to_gene: &TxToGene) -> Result<String> {
     match tx_to_gene.get(tx) {
         Some(g) => Ok(g.clone()),
@@ -329,52 +215,8 @@ fn resolve_gene(tx: &str, tx_to_gene: &TxToGene) -> Result<String> {
     }
 }
 
-/// Extract anchors from a single BAM. Returns the emitted anchors plus
-/// per-sample stats (counts at each filter step).
-///
-/// # TWO PASSES, AND WHY TWO
-///
-/// **Pass 1** streams the file once, reducing every record that clears the
-/// record-level chain to a 20-byte [`Staged`] filed under its read's group.
-/// **Pass 2** walks the groups in READ-ID-HASH order — derived from the
-/// grouping key, NOT from `HashMap` iteration order and NOT from BAM order —
-/// because cap membership must be a deterministic function of the read's own
-/// name, or two runs over the same file would emit two different pools.
-///
-/// # THE ORDER OF THE CHECKS IS THE SPECIFICATION, not an accident
-///
-/// unmapped → supplementary → refid → position → QNAME → ref_len (pass 1; there
-/// is NO MAPQ gate and `filtered_unique` is a retired slot that stays 0), then
-/// per read: dedup by ref_id keeping max AS → mark every deduped candidate
-/// ELIGIBLE or not (3' TES, coverage, poly(A)) → the per-read decision, taken
-/// on **C_raw**, the whole deduped candidate set, NOT on the eligible subset →
-/// per-transcript cap.
-///
 /// # THE PER-READ DECISION IS TAKEN ON C_raw
-///
-/// **C_raw** is the read's full deduped candidate set, before the physical
-/// filters. The previous rule evaluated argmax / tie / gap on the ELIGIBLE
-/// subset, which made the physical filters decide not just which candidate is
-/// usable but WHICH ONE IS BEST — a runner-up homolog that survived a filter
-/// the true argmax failed silently inherited the read. The five branches, in
-/// the order they are evaluated:
-///
-///   (a) no candidate is eligible at all → `reads_no_eligible_candidate`
-///   (b) the top two RAW candidates tie EXACTLY on AS → `rejected_tie`
-///   (c) the raw argmax is NOT eligible → `rejected_usurpation`
-///   (d) `delta_AS_raw < max(gap_abs, gap_rel * AS_1)` → `rejected_same_gene`
-///       / `rejected_cross_gene` / `rejected_gap` by the gene relation
-///   (e) otherwise → cap check → emit
-///
-/// The tie branch precedes the usurpation branch because a tie has exactly one
-/// well-defined verdict, whereas checking eligibility first would make the
-/// label depend on which of the two AS-identical candidates sorted first.
-///
-/// `delta_AS_raw = AS_1 - (AS_2 or 0)`: an absent runner-up counts as 0, so a
-/// read with a single raw candidate is measured against the floor too.
-///
-/// SECONDARY ALIGNMENTS ARE KEPT (`0x100`). Dropping them would reintroduce
-/// exactly the defect this pass exists to fix.
+/// **C_raw** is the read's full deduped candidate set, before the physical filters. Branches, in order: no eligible candidate → `reads_no_eligible_candidate`; top two RAW candidates tie EXACTLY on AS → `rejected_tie`; raw argmax NOT eligible → `rejected_usurpation`; `delta_AS_raw < max(gap_abs, gap_rel * AS_1)` → rejected_*; otherwise cap check → emit.
 fn extract_anchors_from_bam<P: AsRef<Path>>(
     bam: P,
     sample_id: &str,
@@ -386,7 +228,6 @@ fn extract_anchors_from_bam<P: AsRef<Path>>(
     let mut reader = BamReader::new(file);
     let header = reader.read_header().context("Failed to read BAM header")?;
 
-    // Build ref_id → ref_len map from @SQ records.
     let mut ref_len: HashMap<usize, usize> = HashMap::new();
     let ref_seqs: Vec<String> = (0..header.reference_sequences().len())
         .map(|i| {
@@ -402,13 +243,11 @@ fn extract_anchors_from_bam<P: AsRef<Path>>(
         })
         .collect();
 
-    // Track per-(transcript_id) count for the per-sample cap.
     let mut per_tx_count: HashMap<String, usize> = HashMap::new();
 
     let mut anchors: Vec<AnchorRecord> = Vec::new();
     let mut stats = SampleStats::default();
 
-    // ===================== PASS 1: per RECORD =============================
     let mut name_arena: Vec<u8> = Vec::new();
     let mut groups: Vec<ReadGroup> = Vec::new();
     let mut group_index: HashMap<u128, u32> = HashMap::new();
@@ -419,12 +258,7 @@ fn extract_anchors_from_bam<P: AsRef<Path>>(
         let read = match reader.read_record(&mut record) {
             Ok(n) => n,
             Err(_) => {
-                // The old `reader.records()` iterator skipped a bad record and
-                // asked for the next one; `read_record` cannot be re-entered
-                // after a failure without risking a spin on the same truncated
-                // stream, so the scan stops here. `parse_errors` stays a
-                // DISJOINT population, so the ledger identity is unaffected
-                // either way.
+                // `read_record` cannot be re-entered after a failure without risking a spin on the same truncated stream, so the scan stops here.
                 stats.parse_errors += 1;
                 break;
             }
@@ -434,37 +268,19 @@ fn extract_anchors_from_bam<P: AsRef<Path>>(
         }
         stats.total_records += 1;
 
-        // 0x4. Checked BEFORE MAPQ, which is the point of the move: every
-        // unmapped record carries MAPQ 0 and used to die at the MAPQ gate
-        // counted as "non-unique", so the ledger could not tell a record with
-        // no alignment from an ambiguously-placed one.
+        // 0x4. Checked BEFORE MAPQ: every unmapped record carries MAPQ 0.
         if record.flags().is_unmapped() {
             stats.filtered_unmapped += 1;
             continue;
         }
-        // 0x800. A supplementary record is one segment of a split molecule, so
-        // its poly(A) and its 3' end are not the molecule's; it must not reach
-        // the pool even when it carries a high MAPQ.
+        // 0x800. A supplementary record is one segment of a split molecule, so its poly(A) and 3' end are not the molecule's.
         if record.flags().is_supplementary() {
             stats.filtered_supplementary += 1;
             continue;
         }
         // 0x100 (secondary) is deliberately NOT dropped.
 
-        // ⚠ THERE IS NO MAPQ GATE HERE, AND ITS ABSENCE IS THE POINT.
-        //
-        // MAPQ was never a uniqueness criterion for this pipeline: `--secondary`
-        // is PRESERVED, so MAPQ 0 on a secondary is the aligner reporting that
-        // it did not claim the placement, not that the placement does not
-        // exist. Filtering on it discarded most records and, with them, the
-        // ambiguity this whole pass exists to resolve.
-        //
-        // `filtered_unique` therefore stays as a RETIRED compat slot at 0. It is
-        // still emitted, still inside the ledger's bucket sum, and still in the
-        // frozen ledger schema; removing the key would break a published
-        // artifact for no gain. Nothing increments it.
-        //
-        // Position + length on reference.
+        // ⚠ THERE IS NO MAPQ GATE HERE: MAPQ was never a uniqueness criterion here, `--secondary` is PRESERVED, and `filtered_unique` stays a RETIRED compat slot at 0.
         let ref_id = match record.reference_sequence_id() {
             Some(Ok(i)) => i,
             _ => {
@@ -487,11 +303,7 @@ fn extract_anchors_from_bam<P: AsRef<Path>>(
             }
         };
 
-        // NOTE THE POSITION OF THIS CHECK. It used to be LAST, after the
-        // per-transcript cap had already been incremented, so that a record
-        // with no QNAME consumed a cap slot. Grouping by QNAME makes that
-        // impossible to preserve: a record with no name cannot be assigned to
-        // a read at all.
+        // A record with no QNAME cannot be assigned to a read, so it cannot consume a cap slot.
         let name: &[u8] = match record.name() {
             Some(n) => n,
             None => {
@@ -513,10 +325,7 @@ fn extract_anchors_from_bam<P: AsRef<Path>>(
             },
             _ => 0,
         };
-        // A tag-less AS reads as 0, matching `evidence.rs`'s convention. Two
-        // tag-less candidates on one read therefore tie, and a tie yields no
-        // anchor — which is the honest answer for a pair the aligner gave no
-        // score to distinguish.
+        // A tag-less AS reads as 0, matching `evidence.rs`'s convention: two tag-less candidates on one read tie, and a tie yields no anchor.
         let as_score: i32 = match record.data().get(&TAG_AS) {
             Some(Ok(value)) => match value.as_int() {
                 Some(n) => i32::try_from(n).unwrap_or(0),
@@ -557,11 +366,7 @@ fn extract_anchors_from_bam<P: AsRef<Path>>(
         });
     }
 
-    // The falsifiable form of "no two anchors share a read_id". One anchor per
-    // GROUP is emitted by construction, so a literal duplicate check over the
-    // emitted anchors could never fire — the grouping would have hidden the
-    // collision before it could produce one. Checking the hash instead, on
-    // every record, catches the same defect at the moment it happens.
+    // A literal duplicate check over the emitted anchors could never fire: the grouping would hide the collision first.
     assert_eq!(
         read_key_collisions, 0,
         "two distinct QNAMEs hashed to the same 128-bit grouping key, so their \
@@ -570,42 +375,20 @@ fn extract_anchors_from_bam<P: AsRef<Path>>(
          keying by hash instead of by name; see `read_key`."
     );
 
-    // ===================== PASS 2: per READ ===============================
-    // IN READ-ID-HASH ORDER, AND THAT IS THE POINT. Pass 1 fully materialised
-    // `groups`, so the visiting order is free — and iterating the `HashMap`
-    // would make the cap depend on a per-process hash seed, so two runs over
-    // the same BAM would emit two different pools; iterating `groups` in
-    // insertion order would make it depend on BAM layout.
-    //
-    // `sort_by_key`, NOT `sort_unstable_by_key`. The keys are asserted unique,
-    // so an unstable sort would be deterministic TODAY — and the sort would
-    // silently stop being deterministic the moment that assert was relaxed.
+    // IN READ-ID-HASH ORDER: iterating the `HashMap` would make the cap depend on a per-process hash seed, and insertion order would make it depend on BAM layout. `sort_by_key`, NOT `sort_unstable_by_key`: the keys are asserted unique.
     let mut order: Vec<u32> = (0..groups.len() as u32).collect();
     order.sort_by_key(|&i| groups[i as usize].key);
-    // `scratch` is C_raw: EVERY deduped run of the current read, whether or not
-    // it survived the physical filters. The `.0` is the `Staged`
-    // representative, so `scratch[0].0` is still the raw argmax.
+    // `scratch` is C_raw: EVERY deduped run of the current read, whether or not it survived the physical filters. `.0` is the `Staged` representative.
     let mut scratch: Vec<(Staged, u64, bool)> = Vec::new();
     for &i in &order {
         let g = &mut groups[i as usize];
         stats.reads_seen += 1;
 
-        // DEDUP BY ref_id, KEEPING MAX AS. `sort_by` is stable, so two records
-        // on the same ref_id with the SAME AS keep their BAM order — a choice
-        // that is arbitrary but deterministic, and never decisive, because a
-        // same-ref_id pair is one transcript by construction and so cannot
-        // produce the cross-transcript argmax tie checked below.
+        // DEDUP BY ref_id, KEEPING MAX AS; `sort_by` is stable, so equal-AS records on one ref_id keep their BAM order — arbitrary but deterministic.
         g.cands
             .sort_by(|a, b| a.ref_id.cmp(&b.ref_id).then_with(|| b.as_.cmp(&a.as_)));
 
-        // WALK THE RUNS, applying the physical filters once per transcript and
-        // attributing the result to EVERY record collapsed into it (`mult`).
-        // That is what keeps the ledger closed in RECORDS: a read with three
-        // identical records on one transcript that fails the 3' test has lost
-        // three records, not one.
-        //
-        // ⚠ EVERY RUN IS PUSHED, NOT ONLY THE SURVIVORS. The filters below
-        // decide ELIGIBILITY; they no longer decide which candidate is best.
+        // WALK THE RUNS, applying the physical filters once per transcript and attributing the result to EVERY record collapsed into it (`mult`), so the ledger stays closed in RECORDS. ⚠ EVERY RUN IS PUSHED: the filters decide ELIGIBILITY, not which is best.
         scratch.clear();
         let mut eligible_records: u64 = 0;
         let mut i = 0;
@@ -619,9 +402,7 @@ fn extract_anchors_from_bam<P: AsRef<Path>>(
 
             let rl = *ref_len.get(&(rep.ref_id as usize)).unwrap_or(&0);
             let eligible = if rl == 0 {
-                // Unreachable while pass 1 filters it, and kept anyway: a zero
-                // here would make the coverage test `NaN < min_coverage`, which
-                // is FALSE, so the record would sail through as eligible.
+                // Unreachable while pass 1 filters it: a zero makes the coverage test `NaN < min_coverage`, which is FALSE.
                 stats.filtered_no_reflen += mult;
                 false
             } else if (rep.end as usize + p.tes_slack) < rl {
@@ -651,34 +432,13 @@ fn extract_anchors_from_bam<P: AsRef<Path>>(
             i = j;
         }
 
-        // (a) NO CANDIDATE IS ELIGIBLE AT ALL. Every record this read
-        // contributed is already in a physical bucket. Nothing to reject at the
-        // read level.
         if eligible_records == 0 {
             stats.reads_no_eligible_candidate += 1;
             continue;
         }
-        // Sort by AS descending. Stable, so a tie keeps the dedup order.
         scratch.sort_by(|a, b| b.0.as_.cmp(&a.0.as_));
 
-        // (b) EXACT RAW TIE. An exact tie on the top two RAW AS yields NO
-        // anchor — and it is checked BEFORE the winner's eligibility, because a
-        // tie is the one branch whose verdict does not depend on which of the
-        // two tied candidates happens to sort first.
-        //
-        // THE TIE RATE IS **POPULATION-DEPENDENT**, AND THE POPULATION MUST BE
-        // NAMED. The rate on the raw (pre-physical-filter) candidate set is far
-        // higher than on the post-filter set. Quote a rate only together with
-        // its population.
-        //
-        // MECHANISM, not coincidence: a tie means the read sits in sequence its
-        // top candidates SHARE, which is overwhelmingly INTERNAL, and the 3' TES
-        // test requires the read to reach the transcript's 3' end. The physical
-        // filters therefore remove precisely the reads that tie.
-        //
-        // Vetoing ties is still the right behaviour: such a read carries no
-        // isoform information, and a tie-break would invent an isoform
-        // assignment out of nothing.
+        // (b) EXACT RAW TIE. An exact tie on the top two RAW AS yields NO anchor, and is checked BEFORE the winner's eligibility because a tie's verdict does not depend on which candidate sorts first. THE TIE RATE IS POPULATION-DEPENDENT.
         if scratch.len() >= 2 && scratch[0].0.as_ == scratch[1].0.as_ {
             stats.rejected_tie += 1;
             stats.filtered_eligible_not_anchor += eligible_records;
@@ -688,38 +448,24 @@ fn extract_anchors_from_bam<P: AsRef<Path>>(
         let best = scratch[0].0;
         let runner_up: Option<Staged> = scratch.get(1).map(|e| e.0);
 
-        // (c) RUNNER-UP USURPATION. The aligner's own best alignment for this
-        // read is not eligible, and only a LOWER-AS homolog survived the
-        // physical filters. Emitting that homolog would attribute the read to a
-        // transcript the aligner ranked BELOW another one it preferred, which is
-        // a different and much weaker statement than "this is the read's
-        // transcript".
+        // (c) RUNNER-UP USURPATION. The aligner's own best alignment for this read is not eligible and only a LOWER-AS homolog survived the physical filters.
         if !scratch[0].2 {
             stats.rejected_usurpation += 1;
             stats.filtered_eligible_not_anchor += eligible_records;
             continue;
         }
 
-        // (d) THE GAP, MEASURED ON C_raw.
-        //
-        // `delta_AS_raw = AS_1 - (AS_2 or 0)`. An absent runner-up counts as 0,
-        // so the floor applies to a read with a single raw candidate too.
+        // (d) THE GAP, MEASURED ON C_raw. `delta_AS_raw = AS_1 - (AS_2 or 0)`: an absent runner-up counts as 0, so the floor applies to a lone raw candidate too.
         let gap = (best.as_ as f64) - runner_up.map_or(0.0, |s| s.as_ as f64);
         if gap < p.gap_abs || gap < p.gap_rel * (best.as_ as f64) {
-            // THE GENE RELATION IS A PROPERTY OF A PAIR. A read with no second
-            // RAW candidate has no pair, so its relation is `Unknown` — and
-            // saying so needs no gene resolution at all.
+            // THE GENE RELATION IS A PROPERTY OF A PAIR: a read with no second RAW candidate has no pair, so its relation is `Unknown`.
             if let Some(second) = runner_up {
                 let g_best = resolve_gene(tx_name(&ref_seqs, best.ref_id), tx_to_gene)?;
                 let g_second = resolve_gene(tx_name(&ref_seqs, second.ref_id), tx_to_gene)?;
                 match relation(&g_best, &g_second, tx_to_gene) {
                     GeneRelation::Same => stats.rejected_same_gene += 1,
-                    // A cross-gene pair rejected on the gap is still a
-                    // cross-gene pair; without this the counter would have no
-                    // producer at all and would report 0 forever.
+                    // A cross-gene pair rejected on the gap is still a cross-gene pair; without this the counter would have no producer at all.
                     GeneRelation::Cross => stats.rejected_cross_gene += 1,
-                    // Gene relation unknown: the map is empty, so there is
-                    // nothing to attribute the rejection to but the gap.
                     GeneRelation::Unknown => stats.rejected_gap += 1,
                 }
             } else {
@@ -729,24 +475,7 @@ fn extract_anchors_from_bam<P: AsRef<Path>>(
             continue;
         }
 
-        // THE GATE IS THE ONLY ARITHMETIC GATE. There is deliberately no
-        // unconditional same-gene veto here, and the reason is physical rather
-        // than aesthetic.
-        //
-        // A read that scores AS_1 on T_1 and AS_2 << AS_1 on T_2, where T_1
-        // and T_2 are SIBLING ISOFORMS OF ONE GENE, has aligned over sequence
-        // that T_2 does not contain — that is the only way its score can be
-        // lower. The measured cost of a single mismatch on this data is 6 AS
-        // and of a 1 bp indel 6–8 AS, so a gap of even a few hundred is tens
-        // of edits, not aligner noise. A same-gene pair is a CLASSIFICATION of
-        // a gap failure (see the `GeneRelation::Same` arm above), not an
-        // independent veto.
-        //
-        // What the veto used to protect against — a gene id invented on the
-        // spot when no map was supplied — is handled where it actually arises:
-        // `resolve_gene` refuses to fall back once a map exists, and with NO
-        // map the relation is `Unknown`, which is counted below and reported,
-        // never silently treated as "same gene" or "cross gene".
+        // THE GATE IS THE ONLY ARITHMETIC GATE: there is deliberately no unconditional same-gene veto. A read scoring AS_1 on T_1 and AS_2 << AS_1 on T_2, SIBLING ISOFORMS OF ONE GENE, has aligned over sequence T_2 does not contain. A single mismatch costs 6 AS, so a gap of even a few hundred is tens of edits.
         if let Some(second) = runner_up {
             let rel = relation(
                 &resolve_gene(tx_name(&ref_seqs, best.ref_id), tx_to_gene)?,
@@ -754,9 +483,7 @@ fn extract_anchors_from_bam<P: AsRef<Path>>(
                 tx_to_gene,
             );
             if matches!(rel, GeneRelation::Unknown) {
-                // NOT a read-level rejection: this read still clears the gap and
-                // will be emitted. It is counted so the ledger states plainly that
-                // the relation was unavailable for it.
+                // NOT a read-level rejection: this read still clears the gap and will be emitted. It is counted so the ledger states the relation was unavailable.
                 stats.gene_veto_disabled += 1;
                 stats.same_gene_unknown += 1;
             }
@@ -768,19 +495,7 @@ fn extract_anchors_from_bam<P: AsRef<Path>>(
 
         let count = per_tx_count.entry(transcript_id.clone()).or_insert(0);
         if *count >= p.max_reads_per_sample {
-            // THE CAP REJECTS A READ, AND A READ IS `eligible_records` RECORDS.
-            //
-            // `filtered_cap` is READ-denominated — it is the counterpart of
-            // `reads_over_cap`, and the two must be equal, so it counts rejected
-            // READS. Making it absorb records would double it. The remaining
-            // `eligible_records - 1` RECORDS go to `filtered_eligible_not_anchor`,
-            // exactly as the tie / usurpation / gap branches absorb
-            // `eligible_records` and the emit branch absorbs
-            // `eligible_records - 1`.
-            //
-            // `eligible_records >= 1` always: branch (a) `continue`s when it is
-            // 0, and branch (c) guarantees `best` is itself one of the eligible
-            // records.
+            // THE CAP REJECTS A READ, AND A READ IS `eligible_records` RECORDS. `filtered_cap` is READ-denominated: it is the counterpart of `reads_over_cap` and the two must be equal. The remaining `eligible_records - 1` RECORDS go to `filtered_eligible_not_anchor`.
             stats.filtered_cap += 1;
             stats.filtered_eligible_not_anchor += eligible_records - 1;
             stats.reads_over_cap += 1;
@@ -788,9 +503,6 @@ fn extract_anchors_from_bam<P: AsRef<Path>>(
         }
         *count += 1;
 
-        // THE ONE `String` PER READ THAT THIS DESIGN BUYS. Everything above
-        // worked on bytes; this is where the name becomes owned text, and it
-        // happens once per read that actually reaches the pool.
         let read_id = String::from_utf8_lossy(
             &name_arena[g.name_off as usize..(g.name_off + g.name_len) as usize],
         )
@@ -804,21 +516,11 @@ fn extract_anchors_from_bam<P: AsRef<Path>>(
         });
         stats.passed += 1;
         stats.anchors_emitted += 1;
-        // Every OTHER eligible record of this read — the argmax losers and the
-        // duplicates the dedup collapsed into the winner. One record became
-        // `passed`, so the remainder is exactly `eligible_records - 1`.
+        // Every OTHER eligible record of this read — the argmax losers and the duplicates the dedup collapsed into the winner — so the remainder is exactly `eligible_records - 1`.
         stats.filtered_eligible_not_anchor += eligible_records - 1;
     }
 
-    // `filtered_cap` is read-denominated and `reads_over_cap` is the same
-    // population written down twice under the two names the two denominations
-    // need. They are incremented on one line pair and nowhere else, so this
-    // cannot fire today; it is here because a future edit that adds a second
-    // `filtered_cap += 1` would break the read identity in the READ direction.
-    //
-    // UNCONDITIONAL, not a `debug_assert!`. The release profile compiles debug
-    // assertions out, and the ledger must be closed by the PRODUCTION binary,
-    // not only by the test build.
+    // UNCONDITIONAL, not a `debug_assert!`: the release profile compiles debug assertions out, and the ledger must be closed by the PRODUCTION binary.
     assert_eq!(
         stats.filtered_cap, stats.reads_over_cap,
         "filtered_cap counts rejected READS and must stay equal to reads_over_cap; \
@@ -826,12 +528,7 @@ fn extract_anchors_from_bam<P: AsRef<Path>>(
         stats.filtered_cap, stats.reads_over_cap
     );
 
-    // THE READ IDENTITY ITSELF, in the release binary. `unaccounted()` proves the
-    // RECORD half closes; nothing proved the READ half did.
-    //
-    // `gene_veto_disabled` is deliberately absent: it counts reads that CLEARED
-    // the gap with no gene map and were therefore emitted, so it is not a
-    // destination of `reads_seen`.
+    // THE READ IDENTITY ITSELF, in the release binary: `unaccounted()` proves the RECORD half closes, nothing proved the READ half did. `gene_veto_disabled` is deliberately absent: it counts reads that CLEARED the gap and were emitted.
     assert_eq!(
         stats.reads_seen,
         stats.anchors_emitted
@@ -867,12 +564,7 @@ fn tx_name(ref_seqs: &[String], ref_id: u32) -> &str {
     ref_seqs.get(ref_id as usize).map_or("", String::as_str)
 }
 
-/// Classify two resolved gene ids.
-///
-/// `tx_to_gene.is_empty()` is consulted rather than inferring from the ids,
-/// because with an empty map `gene_id == transcript_id` and "the same id" then
-/// means "the same transcript", not "the same gene" — a distinction this whole
-/// function exists to keep.
+/// `tx_to_gene.is_empty()` is consulted rather than inferring from the ids: with an empty map "the same id" means "the same transcript", not "the same gene".
 fn relation(a: &str, b: &str, tx_to_gene: &TxToGene) -> GeneRelation {
     if tx_to_gene.is_empty() {
         GeneRelation::Unknown
@@ -932,229 +624,102 @@ fn write_anchor_parquet<P: AsRef<Path>>(anchors: &[AnchorRecord], output: P) -> 
     Ok(())
 }
 
-/// Per-sample stats for one BAM input.
 #[derive(Debug, Default, Clone)]
 pub struct SampleStats {
     pub total_records: u64,
     pub parse_errors: u64,
-    /// MAPQ < 20. NOTE this is NOT "non-unique" -- it is "low MAPQ".
-    ///
-    /// RETIRED: there is no MAPQ gate any more, so this slot always stays 0. It
-    /// is still emitted because it is in the frozen ledger schema, and
-    /// removing the key would break a published artifact for no gain.
+    /// MAPQ < 20 — NOT "non-unique" but "low MAPQ". RETIRED: no MAPQ gate any more, so this slot stays 0, but it is still in the frozen ledger schema.
     pub filtered_unique: u64,
-    /// SAM `0x4`, unmapped. A record with no alignment has no transcript, no 3'
-    /// end and no poly(A) to anchor on; the MAPQ gate used to absorb it because
-    /// every unmapped record also carries MAPQ 0.
+    /// SAM `0x4`, unmapped: no alignment, so no transcript, no 3' end, no poly(A).
     pub filtered_unmapped: u64,
-    /// SAM `0x800`, supplementary alignment.
-    ///
-    /// THIS ONE CHANGED BEHAVIOUR, NOT JUST BOOKKEEPING. A supplementary
-    /// record is one segment of a split molecule, so its poly(A) and its 3' end
-    /// are not the molecule's. They were entering the anchor pool whenever they
-    /// carried MAPQ >= 20.
+    /// SAM `0x800`, supplementary alignment: one segment of a split molecule.
     pub filtered_supplementary: u64,
     /// Dropped because `reference_sequence_id()` yielded `None`/Err.
     pub filtered_no_refid: u64,
-    /// Same, for `alignment_start()` / `alignment_end()`. Two call sites, one
-    /// bucket: a record can reach only one of them.
+    /// Same, for `alignment_start()` / `alignment_end()`: two call sites, one bucket.
     pub filtered_no_position: u64,
-    /// Same, for `record.name()` being `None`. A record with no name cannot be
-    /// written to the pool, so this is not a discard we could avoid.
+    /// Same, for `record.name()` being `None`: it cannot be written to the pool.
     pub filtered_no_read_id: u64,
     pub filtered_no_reflen: u64,
     pub filtered_3p_anchor: u64,
     pub filtered_coverage: u64,
     pub filtered_polya_invalid: u64,
-    /// Physically eligible records that were NOT emitted as an anchor, and the
-    /// bucket that makes the per-read decision closeable in RECORDS.
-    ///
-    /// It absorbs three distinct populations, which is why the read-level
-    /// counters exist alongside it: the argmax losers of a read that did win,
-    /// the duplicates a same-`ref_id` dedup collapsed, and every record of a
-    /// read rejected by the tie / gap / same-gene rules.
+    /// Physically eligible records that were NOT emitted as an anchor: the argmax losers, the duplicates a same-`ref_id` dedup collapsed, and every record of a rejected read.
     pub filtered_eligible_not_anchor: u64,
-    /// Rejected by the per-transcript cap. **READ-DENOMINATED**, despite living
-    /// among the record buckets: the cap rejects a read, not a record.
-    ///
-    /// The records that read carried but did not contribute — `eligible_records
-    /// - 1` of them — go to `filtered_eligible_not_anchor`, so the two together
-    /// absorb every record the read brought. Always equal to
-    /// [`SampleStats::reads_over_cap`].
+    /// Rejected by the per-transcript cap. **READ-DENOMINATED**: the cap rejects a read, not a record, and the `eligible_records - 1` other RECORDS go to `filtered_eligible_not_anchor`. Always equal to [`SampleStats::reads_over_cap`].
     pub filtered_cap: u64,
-    /// Anchors emitted. This is the ledger's terminal bucket: `passed`
-    /// counts RECORDS that became anchors, and since selection is per read it
-    /// also counts how many reads reached the pool.
+    /// Anchors emitted. The ledger's terminal bucket: since selection is per read, `passed` counts the RECORDS that became anchors and the reads that reached the pool.
     pub passed: u64,
 
-    // ------------------------------------------------------------------
-    // READ-LEVEL COUNTERS. A SEPARATE DENOMINATION.
-    //
-    // Everything above counts RECORDS. Everything below counts READS. They are
-    // never added together and none of these fields appears in
-    // `AnchorStats::unaccounted()` — mixing the two is how a number stops
-    // meaning anything. The read-level identity, when the list is closed, is
-    //
-    //   reads_seen == anchors_emitted
-    //               + rejected_tie + rejected_usurpation
-    //               + rejected_gap + rejected_same_gene + rejected_cross_gene
-    //               + reads_no_eligible_candidate + reads_over_cap
-    //
-    // `reads_over_cap` is INSIDE it and `filtered_cap` is NOT — those two name
-    // the same population in the two denominations, and only the read-denominated
-    // one belongs in a read identity.
-    //
-    // `gene_veto_disabled` is OUTSIDE, and its exclusion is not bookkeeping: it
-    // counts reads that CLEARED the gap with no gene map available and were
-    // therefore EMITTED. `same_gene_unknown` is outside for the same reason
-    // and counts the same population.
-    // ------------------------------------------------------------------
-    /// Reads that reached the per-read decision stage — i.e. that contributed
-    /// at least one record clearing the record-level chain.
-    ///
-    /// NOT "reads in the file". A read whose every record died at `0x4`, tid
-    /// or POS never forms a group and is not counted here; its records are
-    /// already accounted in the record buckets, and counting the read as well
-    /// would double it.
+    // READ-LEVEL COUNTERS. A SEPARATE DENOMINATION: everything above counts RECORDS, everything
+    // below counts READS, and the two are never added together. None of these fields appears in
+    // `AnchorStats::unaccounted()`; `gene_veto_disabled` is OUTSIDE because it counts reads that
+    // CLEARED the gap and were EMITTED.
+    /// Reads that reached the per-read decision stage. NOT "reads in the file": a read whose every record died at `0x4`, tid or POS never forms a group.
     pub reads_seen: u64,
     /// Reads that produced an anchor. Equal to `passed`.
     pub anchors_emitted: u64,
-    /// Reads whose top two RAW candidates (before the physical filters) had
-    /// EXACTLY equal AS, so the strict argmax had no winner.
-    ///
-    /// The population is C_raw, not the eligible subset.
+    /// Reads whose top two RAW candidates had EXACTLY equal AS, so the strict argmax had no winner. The population is C_raw, not the eligible subset.
     pub rejected_tie: u64,
-    /// **RUNNER-UP USURPATION.** Reads whose raw argmax is NOT physically
-    /// eligible while a strictly LOWER-AS candidate is, so emitting that
-    /// candidate would attribute the read to a transcript the aligner ranked
-    /// BELOW another one it preferred.
-    ///
-    /// A READ-level counter, and a destination of the read identity.
+    /// **RUNNER-UP USURPATION.** Reads whose raw argmax is NOT physically eligible while a strictly LOWER-AS candidate is.
     pub rejected_usurpation: u64,
-    /// Reads rejected because `delta_AS_raw` was below the gap floors, AND
-    /// whose gene relation could not be classified — either because there is
-    /// no second raw candidate to compare against, or because `tx_to_gene` is
-    /// empty.
-    ///
-    /// Scoped to the unclassifiable case on purpose: when the gene relation IS
-    /// known, a gap rejection is attributed to `rejected_same_gene` or
-    /// `rejected_cross_gene` instead, because that is the more specific fact
-    /// and the one a reader needs.
+    /// Reads rejected because `delta_AS_raw` was below the gap floors, AND whose gene relation could not be classified — no second raw candidate, or `tx_to_gene` empty.
     pub rejected_gap: u64,
-    /// Reads whose top two RAW candidates share a gene and whose
-    /// `delta_AS_raw` fell below the floors. A same-gene pair is a
-    /// CLASSIFICATION of a gap failure, never an independent veto.
+    /// Reads whose top two RAW candidates share a gene and whose `delta_AS_raw` fell below the floors. A same-gene pair is a CLASSIFICATION of a gap failure.
     pub rejected_same_gene: u64,
-    /// Reads whose top two RAW candidates are in DIFFERENT genes and whose
-    /// `delta_AS_raw` fell below the floors.
-    ///
-    /// A cross-gene pair that clears the gap becomes an anchor and is counted
-    /// by `anchors_emitted`, so this counter exists to keep the cross-gene
-    /// rejection visible.
+    /// Reads whose top two RAW candidates are in DIFFERENT genes and whose `delta_AS_raw` fell below the floors.
     pub rejected_cross_gene: u64,
-    /// Reads whose same-gene status could not be evaluated because
-    /// `tx_to_gene` was empty, and which therefore never reached a
-    /// same-gene/cross-gene verdict.
-    ///
-    /// With an empty map `gene_id == transcript_id`, so the veto compares each
-    /// transcript with itself and can never fire; without this counter that
-    /// reads as a veto that correctly found nothing.
+    /// Reads whose same-gene status could not be evaluated because `tx_to_gene` was empty: with an empty map `gene_id == transcript_id`, so the relation compares each transcript with itself and can never fire.
     pub gene_veto_disabled: u64,
-    /// Reads ROUTED to the "unknown" class rather than to `cross_gene`. Equal
-    /// to `gene_veto_disabled` in this implementation, and the two names are
-    /// kept because they answer different questions: this one says where the
-    /// read WENT, the other says why the decision was unavailable.
+    /// Reads ROUTED to the "unknown" class rather than to `cross_gene`. Equal to `gene_veto_disabled` in this implementation.
     pub same_gene_unknown: u64,
-    /// Reads that reached the per-read stage but had no physically eligible
-    /// candidate at all. Without this counter the read-level identity would be
-    /// short by exactly these reads.
+    /// Reads that reached the per-read stage but had no physically eligible candidate at all.
     pub reads_no_eligible_candidate: u64,
-    /// Reads whose argmax transcript was already at `max_reads_per_sample`, so
-    /// the per-transcript cap rejected them.
-    ///
-    /// WHICH READS SURVIVE IS A DETERMINISTIC READ-ID-HASH RULE, not
-    /// coordinate-sorted BAM order: see the pass-2 ordering comment. The COUNT
-    /// is order-invariant either way — it is
-    /// `max(0, n_reads_argmaxing_on_tx - cap)` — so only the identity of the
-    /// survivors depends on the rule, not this number.
+    /// Reads whose argmax transcript was already at `max_reads_per_sample`. WHICH READS SURVIVE IS A DETERMINISTIC READ-ID-HASH RULE, not BAM order; the COUNT is order-invariant.
     pub reads_over_cap: u64,
 }
 
-/// Aggregated stats across all input BAMs.
 #[derive(Debug, Default, Clone)]
 pub struct AnchorStats {
     pub samples: usize,
     pub total_records: u64,
-    /// Records the BAM decoder could not read at all, summed over samples.
-    ///
-    /// A DISJOINT POPULATION, deliberately excluded from `unaccounted()`: it
-    /// is incremented BEFORE `total_records`, so folding it into the identity's
-    /// right-hand side would make the deficit read -1 for every parse failure
-    /// -- a number that looks like a tunable bias rather than a bookkeeping
-    /// mistake.
-    ///
-    /// It exists because the frozen ledger schema requires it and
-    /// `SampleStats` already counted it per sample; without this field the
-    /// cohort-level ledger was blind to a population that leaves the stream
-    /// before the LHS is even incremented.
+    /// Records the BAM decoder could not read at all, summed over samples. A DISJOINT POPULATION, deliberately excluded from `unaccounted()`: it is incremented BEFORE `total_records`, so folding it in would make the deficit read -1 per parse failure.
     pub parse_errors: u64,
     pub filtered_unique: u64,
-    /// See [`SampleStats::filtered_unmapped`].
     pub filtered_unmapped: u64,
-    /// See [`SampleStats::filtered_supplementary`].
     pub filtered_supplementary: u64,
-    /// See [`SampleStats::filtered_no_refid`].
     pub filtered_no_refid: u64,
-    /// See [`SampleStats::filtered_no_position`].
     pub filtered_no_position: u64,
-    /// See [`SampleStats::filtered_no_read_id`].
     pub filtered_no_read_id: u64,
     pub filtered_no_reflen: u64,
     pub filtered_3p_anchor: u64,
     pub filtered_coverage: u64,
     pub filtered_polya_invalid: u64,
-    /// See [`SampleStats::filtered_eligible_not_anchor`].
     pub filtered_eligible_not_anchor: u64,
     pub filtered_cap: u64,
     pub passed: u64,
 
-    // --- READ-LEVEL. Summed by `add`, but NEVER folded into `unaccounted()`;
-    // see the block comment on [`SampleStats::reads_seen`]. ------------------------
+    // --- READ-LEVEL. Summed by `add`, but NEVER folded into `unaccounted()`.
     pub reads_seen: u64,
-    /// See [`SampleStats::anchors_emitted`].
     pub anchors_emitted: u64,
-    /// See [`SampleStats::rejected_tie`].
     pub rejected_tie: u64,
-    /// See [`SampleStats::rejected_usurpation`].
     pub rejected_usurpation: u64,
-    /// See [`SampleStats::rejected_gap`].
     pub rejected_gap: u64,
-    /// See [`SampleStats::rejected_same_gene`].
     pub rejected_same_gene: u64,
-    /// See [`SampleStats::rejected_cross_gene`].
     pub rejected_cross_gene: u64,
-    /// See [`SampleStats::gene_veto_disabled`].
     pub gene_veto_disabled: u64,
-    /// See [`SampleStats::same_gene_unknown`].
     pub same_gene_unknown: u64,
-    /// See [`SampleStats::reads_no_eligible_candidate`].
     pub reads_no_eligible_candidate: u64,
-    /// See [`SampleStats::reads_over_cap`].
     pub reads_over_cap: u64,
 
-    /// Distinct `gene_id` values in the emitted pool. POOL-LEVEL: assigned by
-    /// `build_anchor_pool` from the built records, never summed by `add`
-    /// (distinctness does not survive summation across samples). Read with
-    /// `distinct_transcripts` via [`degenerate_gene_pool_warning`].
+    /// Distinct `gene_id` values in the emitted pool. POOL-LEVEL: assigned by `build_anchor_pool` from the built records, never summed by `add`.
     pub distinct_genes: usize,
     /// Distinct `transcript_id` values in the emitted pool. See `distinct_genes`.
     pub distinct_transcripts: usize,
 }
 
 impl AnchorStats {
-    /// Accumulate one sample's counts. Deliberately leaves `distinct_genes` /
-    /// `distinct_transcripts` untouched: those are pool-level, not per-sample,
-    /// and are assigned once by `build_anchor_pool` after every sample is in.
+    /// Accumulate one sample's counts. Deliberately leaves `distinct_genes` / `distinct_transcripts` untouched: those are pool-level, not per-sample.
     fn add(&mut self, s: &SampleStats) {
         self.samples += 1;
         self.total_records += s.total_records;
@@ -1185,18 +750,7 @@ impl AnchorStats {
         self.reads_over_cap += s.reads_over_cap;
     }
 
-    /// Render the stats line.
-    ///
-    /// FIELD ORDER IS A COMPATIBILITY CONSTRAINT, DO NOT REORDER. A downstream
-    /// scraper pins BOTH `filtered(unique=N no_reflen=M ... cap=K)` AND
-    /// `passed=P` immediately after that closing paren, so any new field must
-    /// be APPENDED after `passed=`. Inserting one inside the group, or between
-    /// `)` and `passed=`, breaks the match.
-    ///
-    /// The `reads(...)` block after them is a DIFFERENT UNIT and says so in
-    /// its own name. It is read-denominated and takes no part in
-    /// `unaccounted()`; putting read counts inside the record ledger is how a
-    /// deficit starts reading as a bias.
+    /// FIELD ORDER IS A COMPATIBILITY CONSTRAINT, DO NOT REORDER. A downstream scraper pins BOTH `filtered(unique=N no_reflen=M ... cap=K)` AND `passed=P` immediately after that closing paren, so any new field must be APPENDED after `passed=`. The `reads(...)` block after them is a DIFFERENT UNIT and says so in its own name.
     pub fn report(&self) -> String {
         format!(
             "samples={} total={} filtered(unique={} no_reflen={} 3p_anchor={} coverage={} \
@@ -1234,15 +788,7 @@ impl AnchorStats {
         )
     }
 
-    /// `total_records` minus every bucket that is supposed to absorb a record.
-    ///
-    /// This is the number that must be 0 for the ledger to be conservative.
-    ///
-    /// `parse_errors` is deliberately NOT in this sum. It is aggregated onto
-    /// this struct, so a reader meeting the field in the ledger will not
-    /// conclude it was never counted -- it was counted and then deliberately
-    /// excluded, because it is incremented BEFORE `total_records` and is
-    /// therefore a disjoint population.
+    /// `total_records` minus every bucket that is supposed to absorb a record; must be 0 for the ledger to be conservative. `parse_errors` is deliberately NOT in this sum: it is incremented BEFORE `total_records`.
     pub fn unaccounted(&self) -> u64 {
         let bucket_sum = self.filtered_unique
             + self.filtered_unmapped
@@ -1258,14 +804,7 @@ impl AnchorStats {
             + self.filtered_cap
             + self.passed;
 
-        // Over-count (bucket_sum > total_records) is the ONE direction the
-        // `saturating_sub` chain below cannot report: it clamps to 0 and reads
-        // as "balanced". The under-count direction is surfaced correctly by
-        // the returned value itself, so assert on this one only.
-        //
-        // ⚠ NOT THE GATE. The release profile does not set `debug-assertions`,
-        // so this compiles out under `--release`; the test must carry its own
-        // `assert_eq!` in the test body.
+        // Over-count (bucket_sum > total_records) is the ONE direction the `saturating_sub` chain below cannot report: it clamps to 0 and reads as "balanced". The under-count direction is surfaced by the returned value, so assert on this one. ⚠ NOT THE GATE: the release profile compiles debug assertions out.
         debug_assert!(
             bucket_sum <= self.total_records,
             "buckets sum to {} but total_records is {}: a record reached two \
@@ -1300,20 +839,7 @@ mod tests {
         synth_record_with_flags, synth_record_with_gap, write_synthetic_bam,
     };
 
-    /// The knobs every pre-existing fixture was written against: `tes_slack`
-    /// 35, `min_coverage` 0.80, cap 200, and BOTH GAP FLOORS AT 0.0.
-    ///
-    /// ⚠ **THESE 0.0s ARE NOT THE SHIPPED DEFAULTS ANY MORE.** The shipped
-    /// `--gap-abs` default is 12.0; this fixture deliberately stays in the
-    /// no-gap REGIME, kept because two thirds of these fixtures are about the
-    /// other rules — dedup, eligibility, the cap, the record ledger — and a
-    /// 12 AS floor silently reclassifies their reads as gap failures. The
-    /// fixtures that DO test the shipped configuration are the ones that say
-    /// `params_with_gap(12.0, 0.0)` explicitly.
-    ///
-    /// Spelling the thresholds out here rather than inheriting a `Default`
-    /// impl is deliberate: a fixture that read them from somewhere silent could
-    /// keep passing while they changed underneath it.
+    /// The knobs every pre-existing fixture was written against: `tes_slack` 35, `min_coverage` 0.80, cap 200, and BOTH GAP FLOORS AT 0.0.
     fn params() -> AnchorParams {
         AnchorParams {
             tes_slack: 35,
@@ -1324,7 +850,6 @@ mod tests {
         }
     }
 
-    /// `params()` with the two gap floors opened up to a specific value.
     fn params_with_gap(gap_abs: f64, gap_rel: f64) -> AnchorParams {
         AnchorParams {
             gap_abs,
@@ -1351,22 +876,14 @@ mod tests {
         assert_eq!(agg.samples, 2);
         assert_eq!(agg.total_records, 150);
         assert_eq!(agg.passed, 42);
-        // `add` is per-sample; the pool-level distinctness fields are assigned
-        // by `build_anchor_pool` and must not be summed here.
+        // `add` is per-sample; the pool-level distinctness fields must not be summed.
         assert_eq!(agg.distinct_genes, 0);
         assert_eq!(agg.distinct_transcripts, 0);
     }
 
-    // --- The degenerate gene pool -------------------------------------------
-    //
-    // The failure these pin: with no `--tx-to-gene`, `gene_id := transcript_id`,
-    // so the L2 gene-level fallback can never fire — a gene's pool IS its
-    // transcript's pool. It used to be silent, and `L2=0` sat in run logs
-    // unannotated.
+    // The degenerate gene pool: with no `--tx-to-gene`, `gene_id := transcript_id`, so the L2 gene-level fallback can never fire.
 
-    /// A three-transcript synthetic BAM whose reads all clear the anchor
-    /// criteria (MAPQ 60, full-length so 3'-anchored and coverage 1.0,
-    /// `pt:i = 100`). Returns its path; the caller removes it.
+    /// A three-transcript synthetic BAM whose reads all clear the anchor criteria (MAPQ 60, full-length so 3'-anchored and coverage 1.0, `pt:i = 100`).
     fn three_tx_anchor_bam(tag: &str) -> std::path::PathBuf {
         let recs = vec![
             synth_record("a0", 0, None, 0, 60),
@@ -1377,10 +894,6 @@ mod tests {
         write_synthetic_bam(tag, recs)
     }
 
-    /// POSITIVE. No gene map: the pool IS degenerate, and the warning must say
-    /// the things a user cannot currently work out for themselves — L2 is
-    /// unreachable, the cascade is 2-level not 3-level, and `--tx-to-gene` is
-    /// the remedy.
     #[test]
     fn test_degenerate_gene_pool_without_tx_to_gene_warns_and_names_the_consequence() {
         let bam = three_tx_anchor_bam("degen_pos");
@@ -1418,9 +931,7 @@ mod tests {
         ] {
             assert!(msg.contains(needle), "warning must name {what}; got: {msg}");
         }
-        // Scoped, not absolute. `--gene-min-reads 3` makes L2 fire on this very
-        // pool, so a message asserting unconditional unreachability would be
-        // false.
+        // Scoped, not absolute: `--gene-min-reads 3` makes L2 fire on this very pool.
         assert!(
             !msg.contains("STRUCTURALLY UNREACHABLE"),
             "must not claim L2 is unconditionally unreachable; the thresholds \
@@ -1428,10 +939,6 @@ mod tests {
         );
     }
 
-    /// NEGATIVE — the one that stops the warning becoming noise. The SAME BAM
-    /// and the SAME command, given a gene map that puts all three transcripts
-    /// on one shared gene. Real structure, so silence is the only correct
-    /// output. A warning here would fire on every legitimate run.
     #[test]
     fn test_pool_with_real_gene_structure_does_not_warn() {
         let bam = three_tx_anchor_bam("degen_neg");
@@ -1468,11 +975,7 @@ mod tests {
         );
     }
 
-    /// The unit test behind the end-to-end pair above: the detector is the
-    /// equality of the two distinct counts, and nothing else. Note what that
-    /// means for a legitimately single-transcript-per-gene dataset: it too
-    /// yields equal counts, and it too warns. That is the honest reading — the
-    /// cascade really is 2-level there — not a false positive.
+    /// The detector is the equality of the two distinct counts, and nothing else.
     #[test]
     fn test_detector_is_exactly_equality_of_the_two_distinct_counts() {
         let row = |gene: &str, tx: &str| AnchorRecord {
@@ -1482,11 +985,6 @@ mod tests {
             transcript_id: tx.into(),
             poly_a_length: 100,
         };
-        // 4 rows, 2 genes, 2 transcripts. Real structure in the pool, and yet
-        // the COUNTS are equal: the pair (2, 2) carries no more information
-        // than (3, 3) does about whether gene_id was assigned per transcript.
-        // The count is the exact detector of the STATE, and the state is what
-        // the warning is about.
         let one_tx_per_gene = vec![row("G1", "T1"), row("G1", "T1"), row("G2", "T2")];
         assert_eq!(pool_gene_tx_cardinality(&one_tx_per_gene), (2, 2));
         assert!(
@@ -1504,34 +1002,16 @@ mod tests {
         assert_eq!(pool_gene_tx_cardinality(&degenerate), (3, 3));
         assert!(degenerate_gene_pool_warning(3, 3).is_some());
 
-        // Strict inequality, either direction, is the only silence: more genes
-        // than transcripts is impossible from `build_anchor_pool` (each row
-        // carries one of each), but the detector is stated without relying on
-        // that and is pinned here so it stays that way.
+        // Strict inequality, either direction, is the only silence.
         assert!(degenerate_gene_pool_warning(1, 3).is_none());
         assert!(degenerate_gene_pool_warning(2, 3).is_none());
 
-        // The exemption, pinned so it cannot be widened by accident: an empty
-        // pool is vacuously "equal", and the honest complaint about it is that
-        // no anchors passed — not that L2 was skipped.
         assert_eq!(pool_gene_tx_cardinality(&[]), (0, 0));
         assert!(degenerate_gene_pool_warning(0, 0).is_none());
     }
 
-    // === The conservation invariant, made enforced ========================
-    //
-    // The identity `total_records == sum(filtered_*) + passed` held only
-    // ACCIDENTALLY, on data that happened not to trigger four of the drop
-    // paths. Nothing enforced it. The gap was auditability, not a wrong
-    // number.
-    //
-    // REACHABILITY IS NOW 9/10, enforced by
-    // `test_the_three_observable_drop_paths_really_execute` below. The one
-    // that remains is `filtered_no_reflen`: `ref_len` is built from the
-    // header, whose lengths are `NonZero` — that is a statement about a
-    // constructor, not a failed attempt, and it is labelled as one.
-
-    /// Σ of every bucket that is supposed to absorb a record.
+    // The identity `total_records == sum(filtered_*) + passed` is enforced. REACHABILITY IS 9/10; the
+    // one path that remains is `filtered_no_reflen`, because `ref_len` is built from the header, whose lengths are `NonZero`.
     fn counted_buckets(s: &SampleStats) -> u64 {
         s.filtered_unique
             + s.filtered_unmapped
@@ -1559,28 +1039,15 @@ mod tests {
         nopt.data_mut().insert(nm, Value::from(1i32));
 
         let mut recs = vec![
-            synth_record("ok0", 0, None, 0, 60), // -> passed
-            synth_record("ok1", 1, None, 0, 60), // -> passed
-            // MAPQ 10. There is NO MAPQ gate any more, so this used to land in
-            // `filtered_unique` and now clears every filter and becomes a third
-            // anchor. It is kept, rather than deleted, precisely so the
-            // retirement of that bucket is witnessed by this fixture instead of
-            // asserted on an input where it was never in play.
-            synth_record("lowq", 0, None, 0, 10), // -> passed (was filtered_unique)
-            synth_record_with_gap("gap3p", 1, 100, true, None, 0, 60), // 3' too short
-            synth_record_with_gap("shortcov", 1, 500, false, None, 0, 60), // coverage
-            nopt,                                 // no poly(A)
+            synth_record("ok0", 0, None, 0, 60),
+            synth_record("ok1", 1, None, 0, 60),
+            // MAPQ 10: there is NO MAPQ gate any more, so this clears every filter and becomes a third anchor. The next three records each fail exactly one physical filter.
+            synth_record("lowq", 0, None, 0, 10),
+            synth_record_with_gap("gap3p", 1, 100, true, None, 0, 60),
+            synth_record_with_gap("shortcov", 1, 500, false, None, 0, 60),
+            nopt,
         ];
-        // 205 records on one transcript with the cap at 200 -> 5 over cap.
-        //
-        // ⚠ ALL 205 ARE SINGLE-RECORD READS, one QNAME each, which is exactly
-        // why the cap branch's record leak was invisible here for so long:
-        // `eligible_records == 1` for every one of them, so
-        // `filtered_cap += 1` absorbed the whole read and the missing
-        // `eligible_records - 1` term was zero. The multi-record counterpart is
-        // `test_a_multi_record_read_over_the_cap_absorbs_every_record_it_contributed`.
-        // Do not "tidy" this into a multi-record fixture: the arithmetic pinned
-        // above (203 passed / 5 over cap) is easier to read here than there.
+        // 205 records on one transcript with the cap at 200 -> 5 over cap. ALL 205 ARE SINGLE-RECORD READS, one QNAME each, so `eligible_records == 1` for every one.
         for i in 0..205 {
             recs.push(synth_record(&format!("cap{i}"), 2, None, 0, 60));
         }
@@ -1589,12 +1056,7 @@ mod tests {
         let (anchors, s) =
             extract_anchors_from_bam(&bam, "conserve", &TxToGene::new(), params()).unwrap();
 
-        // --- THE INVARIANT, FIRST ------------------------------------------
-        // Asserted before the per-counter expectations on purpose. The
-        // invariant holds for ANY input as long as every drop is counted, so a
-        // fixture drift keeps it green and is caught by the per-counter
-        // asserts below; an uncounted drop breaks it and must be reported as
-        // the conservation failure it is, not as "the fixture lost a record".
+        // Asserted before the per-counter expectations on purpose: an uncounted drop must be reported as the conservation failure it is.
         assert_eq!(
             s.total_records,
             counted_buckets(&s) + s.passed,
@@ -1604,20 +1066,14 @@ mod tests {
             counted_buckets(&s),
             s.passed
         );
-        // The terminal really is `passed`.
         assert_eq!(
             anchors.len() as u64,
             s.passed,
             "passed counts records that never reached the pool"
         );
-        // parse_errors is incremented BEFORE total_records, so it is a disjoint
-        // population and must NOT appear in the identity. Asserted so a future
-        // edit that adds it to the sum is caught rather than silently accepted.
+        // parse_errors is incremented BEFORE total_records, so it is a disjoint population and must NOT appear in the identity.
         assert_eq!(s.parse_errors, 0);
 
-        // --- the fixture really exercises what it claims to ----------------
-        // Without these the test could pass on a fixture that filters nothing,
-        // which is the shape of vacuity this project keeps shipping.
         assert_eq!(
             s.filtered_unique, 0,
             "`lowq` carries MAPQ 10 and there is no MAPQ gate any more, so the \
@@ -1636,9 +1092,6 @@ mod tests {
             1 + 1 + 1 + 5 + 203,
             "the fixture's record count changed; re-derive the expectations"
         );
-        // The four paths this fixture cannot reach are pinned at zero, so a
-        // future change that makes one fire shows up here as a count change
-        // rather than as a silently different total.
         assert_eq!(s.filtered_no_refid, 0);
         assert_eq!(s.filtered_no_position, 0);
         assert_eq!(s.filtered_no_read_id, 0);
@@ -1647,50 +1100,27 @@ mod tests {
         let _ = std::fs::remove_file(&bam);
     }
 
-    /// Reachability is 9/10, and this is the test that says so.
-    ///
-    /// Three of the four previously-unreachable paths execute; the test below
-    /// exercises all three in one composition:
-    ///
-    /// ```text
-    /// total=6  no_refid=1  no_position=1  no_read_id=1  3p_anchor=1  passed=2
-    /// ```
-    ///
-    /// ## The one that remains
-    ///
-    /// `filtered_no_reflen` fires when `ref_len.get(&ref_id)` returns 0. It is
-    /// NOT TESTED — no attempt was made — and the reason it is not merely
-    /// "hard" is that `ref_len` is built from the header, whose lengths are
-    /// `NonZero`. **That is a library statement about a constructor, not a
-    /// proof that it was tried**, and it is labelled as one.
+    /// Reachability is 9/10. The one path this fixture does not reach is `filtered_no_reflen`, because `ref_len` is built from the header, whose lengths are `NonZero`.
     #[test]
     fn test_the_three_observable_drop_paths_really_execute() {
         let recs = vec![
-            synth_record("ok0", 0, None, 0, 60), // -> passed
-            synth_record("ok1", 1, None, 0, 60), // -> passed
-            // No tid. MAPQ 60 clears the MAPQ gate, so it dies at
-            // reference_sequence_id() rather than one line earlier.
-            synth_record_no_refid("norid", None, 0, 60), // -> filtered_no_refid
-            // Valid tid, MAPQ 60, POS never set -> encoder writes 0 ->
-            // alignment_start() cannot make a Position.
-            synth_record_no_position(2, None, 0, 60), // -> filtered_no_position
-            // No QNAME, valid tid, FLAG 0: clears every filter but the last.
-            synth_record_no_read_id(0, None, 0, 60), // -> filtered_no_read_id
-            // reverse + gap => 3' end lands short of the TES by more than
-            // tes_slack, so this exercises a FOURTH bucket and keeps the
-            // per-bucket expectations from being three-field trivial.
-            synth_record_with_gap("gap3p", 1, 100, true, None, 0, 60), // -> filtered_3p_anchor
+            synth_record("ok0", 0, None, 0, 60),
+            synth_record("ok1", 1, None, 0, 60),
+            // No tid: dies at reference_sequence_id() -> filtered_no_refid
+            synth_record_no_refid("norid", None, 0, 60),
+            // Valid tid, POS never set -> encoder writes 0 -> no Position -> filtered_no_position
+            synth_record_no_position(2, None, 0, 60),
+            // No QNAME, valid tid, FLAG 0: clears every filter but the last -> filtered_no_read_id
+            synth_record_no_read_id(0, None, 0, 60),
+            // reverse + gap => 3' end lands short of the TES by more than tes_slack -> filtered_3p_anchor
+            synth_record_with_gap("gap3p", 1, 100, true, None, 0, 60),
         ];
 
         let bam = write_synthetic_bam("reach", recs);
         let (anchors, s) =
             extract_anchors_from_bam(&bam, "reach", &TxToGene::new(), params()).unwrap();
 
-        // --- THE INVARIANT, FIRST ------------------------------------------
-        // Same ordering rule as `test_anchor_record_conservation`, and for the
-        // same reason: the identity must be the thing that reports an
-        // uncounted drop rather than a fixture expectation noticing a number
-        // moved.
+        // The identity must be the thing that reports an uncounted drop rather than a fixture expectation noticing a number moved.
         assert_eq!(
             s.total_records,
             counted_buckets(&s) + s.passed,
@@ -1701,7 +1131,6 @@ mod tests {
             s.passed
         );
 
-        // The whole point of this test: these three are NON-ZERO on a real BAM.
         assert_eq!(s.total_records, 6);
         assert_eq!(s.passed, 2);
         assert_eq!(
@@ -1718,10 +1147,7 @@ mod tests {
         );
         assert_eq!(s.filtered_3p_anchor, 1);
         assert_eq!(anchors.len() as u64, s.passed);
-        // Signed, so an OVER-count is visible too. `AnchorStats::unaccounted()`
-        // clamps with `saturating_sub`, which would read a record bumped into
-        // two buckets as "balanced" -- this cannot, because the sum is
-        // subtracted as a whole rather than clamped per step.
+        // Signed, so an OVER-count is visible too: `unaccounted()` clamps with `saturating_sub` and would read a double-count as "balanced".
         assert_eq!(
             s.total_records as i64 - counted_buckets(&s) as i64 - s.passed as i64,
             0,
@@ -1731,12 +1157,6 @@ mod tests {
         let _ = std::fs::remove_file(&bam);
     }
 
-    /// The SAME identity, evaluated over a `SampleStats` built by hand.
-    ///
-    /// What is left for THIS test is the arithmetic on a counter no fixture
-    /// populates (`filtered_no_reflen`, untested): it asserts that a stats
-    /// value carrying all twelve buckets at once still balances, and that a
-    /// leak is reported rather than absorbed.
     #[test]
     fn test_unaccounted_is_zero_when_every_bucket_is_populated() {
         use noodles_sam::alignment::record::data::field::Tag;
@@ -1782,7 +1202,6 @@ mod tests {
             "twelve populated buckets summing to total_records must leave 0"
         );
 
-        // One record lost: the helper must surface it, not absorb it.
         let leaking = AnchorStats {
             total_records: 101,
             ..agg.clone()
@@ -1794,15 +1213,6 @@ mod tests {
         );
     }
 
-    // =================================================================
-    // PER-READ SELECTION
-    //
-    // Every test below is written so that the PRE-SELECTION code — one anchor
-    // per record, no vetoes — makes it go red. A fixture that only proves the
-    // new code runs is a fixture that cannot catch the new code being wrong.
-    // =================================================================
-
-    /// A `tx_to_gene` TSV, removed with the rest of the scratch files.
     fn tx2gene_tsv(tag: &str, body: &str) -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!(
             "telescope_tx2gene_{tag}_{}.tsv",
@@ -1812,8 +1222,6 @@ mod tests {
         p
     }
 
-    /// Run the extractor over a fixture and hand back the stats, cleaning the
-    /// BAM up.
     fn run_extract(
         tag: &str,
         recs: Vec<noodles_sam::alignment::record_buf::RecordBuf>,
@@ -1826,10 +1234,7 @@ mod tests {
         out
     }
 
-    /// The conservation identity, asserted the way `test_anchor_record_conservation`
-    /// asserts it: FIRST, before any per-counter expectation, so an uncounted
-    /// drop is reported as the ledger failure it is rather than as a fixture
-    /// that quietly changed.
+    /// The conservation identity, asserted FIRST, before any per-counter expectation.
     fn record_deficit(s: &SampleStats) -> u64 {
         s.total_records - counted_buckets(s) - s.passed
     }
@@ -1846,15 +1251,7 @@ mod tests {
         );
     }
 
-    /// A SAME-GENE PAIR WHOSE GAP IS CLEAR **EMITS**. This is the falsifiable
-    /// form of the removed unconditional veto.
-    ///
-    /// The read's best alignment is 10 AS ahead of its second and both
-    /// transcripts sit in ONE gene. Under the rule this replaced, the shared gene
-    /// alone refused the read, so no same-gene multi-candidate read could ever
-    /// produce an anchor.
-    ///
-    /// Restore the veto (or make it fire at any gap) and this goes red.
+    /// A SAME-GENE PAIR WHOSE GAP IS CLEAR **EMITS**: there is no unconditional same-gene veto.
     #[test]
     fn test_a_same_gene_pair_with_a_clear_gap_emits_rather_than_being_vetoed() {
         let tsv = tx2gene_tsv("samegene", "tx0\tGA\ntx1\tGA\ntx2\tGA\n");
@@ -1899,12 +1296,7 @@ mod tests {
         assert_eq!(record_deficit(&s), 0);
     }
 
-    /// ...AND WITH A GAP THAT IS **NOT** CLEAR, THE SAME PAIR IS REJECTED AND
-    /// CLASSIFIED AS SAME-GENE. The veto did not die; it became a bucket.
-    ///
-    /// Identical to the test above except the floors are raised above the 10 AS
-    /// the read actually has. Without this, `rejected_same_gene` would have lost
-    /// its only producer and would print 0 forever.
+    /// ...AND WITH A GAP THAT IS **NOT** CLEAR, THE SAME PAIR IS REJECTED AND CLASSIFIED AS SAME-GENE. The floors are raised above the 10 AS the read actually has.
     #[test]
     fn test_a_same_gene_pair_rejected_by_the_gap_is_classified_as_same_gene() {
         let tsv = tx2gene_tsv("samegenegap", "tx0\tGA\ntx1\tGA\ntx2\tGA\n");
@@ -1938,15 +1330,7 @@ mod tests {
         assert_eq!(record_deficit(&s), 0);
     }
 
-    /// CROSS-GENE PAIR REJECTED BY THE GAP, COUNTED SEPARATELY. Same shape as
-    /// the test above with one fact changed — `tx1` moves to its own gene — and
-    /// the gap raised to 15 so the pair is rejected for the gap rather than
-    /// for sharing a gene.
-    ///
-    /// This is the only thing that gives `rejected_cross_gene` a producer. A
-    /// cross-gene pair that CLEARS the gap becomes an anchor, so without this
-    /// the counter would print 0 forever and a reader would take that for "no
-    /// cross-gene pair was ever rejected".
+    /// CROSS-GENE PAIR REJECTED BY THE GAP, COUNTED SEPARATELY. `tx1` is in its own gene and the gap is raised to 15, so the pair is rejected for the gap rather than for sharing a gene.
     #[test]
     fn test_a_cross_gene_pair_rejected_by_the_gap_is_counted_separately() {
         let tsv = tx2gene_tsv("crossgene", "tx0\tGA\ntx1\tGB\ntx2\tGC\n");
@@ -1975,16 +1359,7 @@ mod tests {
         assert_eq!(s.filtered_eligible_not_anchor, 2);
     }
 
-    /// EXACT ARGMAX TIE. AS 100 vs AS 100 — not "close", identical. The
-    /// strict argmax has no winner, so there is no anchor.
-    ///
-    /// WHY THIS IS THE COMMON CASE AND NOT A CORNER CASE: such a read lies in
-    /// sequence the tied candidates SHARE, so it carries no isoform information
-    /// at all, and 98.7% of those reads have every candidate inside one gene.
-    /// Emitting an anchor anyway would be inventing an isoform assignment.
-    ///
-    /// Cross-gene on purpose: it proves the tie fires BEFORE the gene
-    /// comparison, so a tie is not silently reclassified as a same-gene veto.
+    /// EXACT ARGMAX TIE. AS 100 vs AS 100 — not "close", identical. The strict argmax has no winner, so there is no anchor. Cross-gene on purpose: it proves the tie fires BEFORE the gene comparison, so a tie is not silently reclassified as a same-gene veto.
     #[test]
     fn test_an_exact_argmax_tie_yields_no_anchor() {
         let tsv = tx2gene_tsv("argmaxtie", "tx0\tGA\ntx1\tGB\ntx2\tGC\n");
@@ -2013,8 +1388,6 @@ mod tests {
         assert_eq!(s.filtered_eligible_not_anchor, 2);
 
         // And the same tie under a SAME-gene map is still a tie, not a veto.
-        // The rule that fires is the one the data triggers, whichever map is
-        // supplied.
         let tsv2 = tx2gene_tsv("argmaxtie2", "tx0\tGA\ntx1\tGA\ntx2\tGA\n");
         let map2 = TxToGene::from_tsv(&tsv2).unwrap();
         let (anchors2, s2) = run_extract(
@@ -2032,26 +1405,8 @@ mod tests {
         assert_eq!(s2.rejected_same_gene, 0, "the tie fired first");
     }
 
-    // =================================================================
-    // C_raw -- THE DECISION IS TAKEN ON THE RAW CANDIDATE SET
-    //
-    // Every test below is written so that the PRE-C_raw code — argmax over the
-    // ELIGIBLE subset, gap skipped when there is no second eligible candidate —
-    // makes it go red.
-    // =================================================================
-
-    /// THE PHYSICALLY-QUALIFIED ARGMAX IS REFUSED, NOT SILENTLY REPLACED BY ITS
-    /// RUNNER-UP. This is the core of the change.
-    ///
-    /// The read's best alignment (tx0, AS 100) is reverse-strand with a 100 bp
-    /// 5' gap, so its 3' end lands 100 bp short of the TES — beyond the slack
-    /// of 35 — and it is disqualified. tx1 (AS 50) is full length and passes
-    /// every filter.
-    ///
-    /// Under the pre-C_raw rule `tx0` was removed from the candidate list before
-    /// the argmax, so `tx1` became "the read's best eligible alignment" and was
-    /// emitted. Delete the `if !scratch[0].2` branch and this goes red with
-    /// `anchors.len() == 1`.
+    /// THE PHYSICALLY-QUALIFIED ARGMAX IS REFUSED, NOT SILENTLY REPLACED BY ITS RUNNER-UP. tx0 (AS 100)
+    /// is reverse-strand with a 100 bp 5' gap, so its 3' end lands 100 bp short of the TES — beyond the slack of 35 — and it is disqualified. tx1 (AS 50) is full length.
     #[test]
     fn test_a_physically_disqualified_argmax_is_refused_rather_than_emitted() {
         let tsv = tx2gene_tsv("usurp", "tx0\tGA\ntx1\tGB\ntx2\tGC\n");
@@ -2105,25 +1460,16 @@ mod tests {
         );
     }
 
-    /// A RAW TOP-TWO TIE WITH EXACTLY ONE PHYSICALLY-PASSING MEMBER IS A **TIE**,
-    /// not an usurpation and not an anchor.
-    ///
-    /// This pins the ORDER of branches (b) and (c). The two candidates tie
-    /// EXACTLY on AS, so "which of them sorts first" is arbitrary — and with
-    /// the eligibility check first, the verdict of this read would depend on
-    /// that arbitrary order. A tie has exactly one well-defined verdict, so it
-    /// is checked first.
-    ///
-    /// Swap the two branches and every read in this state is mislabelled — this
-    /// fixture makes that visible in a single read.
+    /// A RAW TOP-TWO TIE WITH EXACTLY ONE PHYSICALLY-PASSING MEMBER IS A **TIE**, not an usurpation
+    /// and not an anchor. This pins the ORDER of branches (b) and (c): the two candidates tie
+    /// EXACTLY on AS, so "which of them sorts first" is arbitrary — and with the eligibility check
+    /// first, the verdict of this read would depend on that arbitrary order.
     #[test]
     fn test_a_raw_top_two_tie_with_one_passing_member_is_a_tie_not_an_usurpation() {
         let tsv = tx2gene_tsv("rawtie", "tx0\tGA\ntx1\tGB\ntx2\tGC\n");
         let map = TxToGene::from_tsv(&tsv).unwrap();
 
-        // tx0 AS 100 disqualified on the 3' test; tx1 AS 100 full length. The
-        // raw top two are exactly equal, so `scratch[0].2` is false while
-        // `scratch[1].2` is true — the exact state that is order-sensitive.
+        // tx0 AS 100 disqualified on the 3' test; tx1 AS 100 full length. The raw top two are exactly equal, so `scratch[0].2` is false while `scratch[1].2` is true — the exact state that is order-sensitive.
         let (anchors, s) = run_extract(
             "rawtie",
             vec![
@@ -2154,17 +1500,12 @@ mod tests {
         assert_eq!(s.passed, 0);
     }
 
-    /// THE CONTRAST THAT MAKES THE FIXTURE ABOVE MEANINGFUL. Make the tied
-    /// candidate PASS and it is still a tie; make it score HIGHER and it is
-    /// still a tie. Only the equality decides the branch, and the two cases
-    /// differ from the usurpation fixture by exactly one AS point.
     #[test]
     fn test_the_tie_fixture_differs_from_the_usurpation_fixture_by_one_as_point() {
         let tsv = tx2gene_tsv("tieadj", "tx0\tGA\ntx1\tGB\ntx2\tGC\n");
         let map = TxToGene::from_tsv(&tsv).unwrap();
 
-        // tx0 AS 101 disqualified, tx1 AS 100 eligible: no tie any more, so the
-        // read is a genuine usurpation.
+        // tx0 AS 101 disqualified, tx1 AS 100 eligible: no tie any more.
         let (a1, s1) = run_extract(
             "tieadj",
             vec![
@@ -2183,8 +1524,7 @@ mod tests {
         );
         assert_eq!(s1.rejected_tie, 0);
 
-        // tx0 AS 99 disqualified, tx1 AS 100 eligible: the INELIGIBLE one is no
-        // longer the argmax, so tx1 wins outright.
+        // tx0 AS 99 disqualified, tx1 AS 100 eligible: tx1 wins outright.
         let (a2, s2) = run_extract(
             "tieadj2",
             vec![
@@ -2202,19 +1542,7 @@ mod tests {
         assert_eq!(s2.rejected_tie, 0);
     }
 
-    /// A READ WITH **ONE** RAW CANDIDATE IS NOW MEASURED AGAINST THE FLOOR.
-    ///
-    /// `delta_AS_raw = AS_1 - 0`. Two reads identical except for their single
-    /// candidate's AS: 11 (below a floor of 12) and 12 (exactly on it). One AS
-    /// point decides the run.
-    ///
-    /// Before C_raw a lone eligible candidate bypassed the gap entirely, so
-    /// both of these emitted. Restoring that skip — by computing `gap` only
-    /// when a runner-up exists — turns this red.
-    ///
-    /// The 12/0.0 floors are the SHIPPED configuration, so this is also the
-    /// fixture that exercises the ruled default rather than the no-gap `params()`
-    /// regime the rest of this module sits in.
+    /// A READ WITH **ONE** RAW CANDIDATE IS MEASURED AGAINST THE FLOOR: `delta_AS_raw = AS_1 - 0`. Two reads identical except for their single candidate's AS: 11 (below a floor of 12) and 12 (exactly on it).
     #[test]
     fn test_a_read_with_one_raw_candidate_is_still_measured_against_the_gap_floor() {
         let tsv = tx2gene_tsv("solo_gap", "tx0\tGA\ntx1\tGB\ntx2\tGC\n");
@@ -2246,17 +1574,10 @@ mod tests {
         assert_eq!(s.filtered_eligible_not_anchor, 1);
     }
 
-    /// THE GAP IS MEASURED AGAINST THE **RAW** RUNNER-UP, EVEN WHEN THAT
-    /// RUNNER-UP IS INELIGIBLE.
-    ///
-    /// tx0 AS 100 is eligible, tx1 AS 92 is full length but its poly(A) fails
-    /// (`pt < 10`). Under the pre-C_raw rule tx1 was not a candidate at all, so
-    /// the read had nothing to be measured against and emitted. On C_raw the
-    /// runner-up exists and is 8 AS behind, so a 15-point floor rejects the
-    /// read into `rejected_cross_gene`.
-    ///
-    /// This is the same mechanism as the usurpation branch seen from the other
-    /// side: a physically disqualified candidate must not simply cease to exist.
+    /// THE GAP IS MEASURED AGAINST THE **RAW** RUNNER-UP, EVEN WHEN THAT RUNNER-UP IS INELIGIBLE.
+    /// tx0 AS 100 is eligible, tx1 AS 92 is full length but its poly(A) fails (`pt < 10`). On
+    /// C_raw the runner-up exists and is 8 AS behind, so a 15-point floor rejects the read into
+    /// `rejected_cross_gene`.
     #[test]
     fn test_the_gap_is_measured_against_an_ineligible_raw_runner_up() {
         let tsv = tx2gene_tsv("rawrunnerup", "tx0\tGA\ntx1\tGB\ntx2\tGC\n");
@@ -2293,14 +1614,9 @@ mod tests {
         );
     }
 
-    /// GAP BOUNDARY, AT THE ARITHMETIC'S OWN EDGE.
-    ///
-    /// Two reads, identical in every way except the AS gap: 10 and 20. The
-    /// floor is 15. One gap-1 either side decides the run, so the comparison
-    /// cannot be `<=` on one side and `<` on the other without this going red.
-    ///
-    /// A cross-gene map, because with a same-gene map the gap would never be
-    /// the deciding rule.
+    /// GAP BOUNDARY, AT THE ARITHMETIC'S OWN EDGE. Two reads, identical in every way except the
+    /// AS gap: 10 and 20. The floor is 15. One gap-1 either side decides the run, so the
+    /// comparison cannot be `<=` on one side and `<` on the other.
     #[test]
     fn test_the_gap_boundary_is_inclusive_and_exact() {
         let tsv = tx2gene_tsv("gapbound", "tx0\tGA\ntx1\tGB\ntx2\tGC\n");
@@ -2315,8 +1631,7 @@ mod tests {
                 // gap 20: five above -> accepted, and tx0/GA beats tx1/GB
                 synth_record("wide", 0, Some(100), 0, 60),
                 synth_record("wide", 1, Some(80), 0, 60),
-                // gap exactly 15: ON the floor -> accepted, since the rule is
-                // `gap >= floor`.
+                // gap exactly 15: ON the floor -> accepted, since the rule is `gap >= floor`.
                 synth_record("exact", 0, Some(100), 0, 60),
                 synth_record("exact", 1, Some(85), 0, 60),
             ],
@@ -2343,8 +1658,7 @@ mod tests {
         );
         assert!(!ids.contains(&"narrow"), "gap 10 is below the floor of 15");
 
-        // THE OTHER FLOOR, exercised on its own. `gap_rel` is a fraction of
-        // AS_best, so with AS_best = 100 a floor of 0.05 is a gap of 5.
+        // THE OTHER FLOOR, exercised on its own: `gap_rel` is a fraction of AS_best, so with AS_best = 100 a floor of 0.05 is a gap of 5.
         let (a2, s2) = run_extract(
             "gaprel",
             vec![
@@ -2359,25 +1673,15 @@ mod tests {
         assert_record_ledger_closes(&s2);
     }
 
-    /// DEDUP BY ref_id, KEEPING MAX AS. Two records on the SAME transcript
-    /// are one candidate, not two, so they cannot produce the cross-transcript
-    /// argmax tie, and only the highest-scoring one is put through the
-    /// physical filters.
-    ///
-    /// The fixture makes the ORDER of those two steps observable, which a
-    /// simple "three identical records -> one anchor" fixture does not: the
-    /// 3'-truncated record carries the HIGHER AS, so dedup-first evaluates the
-    /// truncated alignment and rejects the read, while filters-first would have
-    /// dropped the truncated one and let the full-length one through. If the
-    /// order is ever swapped, the two buckets below swap with it.
+    /// DEDUP BY ref_id, KEEPING MAX AS. Two records on the SAME transcript are one candidate,
+    /// not two, so they cannot produce the cross-transcript argmax tie, and only the highest-scoring one is put through the physical filters.
     #[test]
     fn test_two_records_to_the_same_reference_dedup_to_the_max_as() {
         let tsv = tx2gene_tsv("dedup", "tx0\tGA\ntx1\tGB\ntx2\tGC\n");
         let map = TxToGene::from_tsv(&tsv).unwrap();
 
-        // Read 1: on tx0 only. The AS-100 record is reverse-strand with a 100 bp
-        // 5' gap, so its 3' end lands 100 bp short of the TES — beyond the
-        // slack of 35 — and it is the max-AS record, hence the one evaluated.
+        // Read 1: on tx0 only. The AS-100 record is reverse-strand with a 100 bp 5' gap, so its 3'
+        // end lands 100 bp short of the TES — beyond the slack of 35 — and it is the max-AS record, hence the one evaluated.
         let (anchors, s) = run_extract(
             "dedup",
             vec![
@@ -2400,9 +1704,7 @@ mod tests {
              counting them here would misfile them"
         );
 
-        // Read 2: three identical-AS records on one transcript. Dedup collapses
-        // them to one candidate, so this read has no argmax tie with itself and
-        // emits exactly one anchor. Three records in, one out.
+        // Read 2: three identical-AS records on one transcript. Dedup collapses them to one candidate, so this read has no argmax tie with itself.
         let (anchors2, s2) = run_extract(
             "dedup2",
             vec![
@@ -2429,28 +1731,12 @@ mod tests {
         assert_eq!(s2.reads_seen, 1, "three records, ONE read");
     }
 
-    /// DEDUP GROUPS NON-ADJACENT RECORDS, WHICH IS THE ONLY WAY TO SEE IT.
-    ///
-    /// ⚠ THIS CASE EXISTS BECAUSE THE TWO ABOVE DID NOT TEST DEDUP. Both put a
-    /// read's records to one `ref_id` ADJACENT in the BAM, and the per-read pass
-    /// collapses runs of equal `ref_id` — so they collapse whether or not the
-    /// group was sorted first. Deleting the sort entirely left the whole suite
-    /// GREEN. The two cases above are still worth having — they pin the
-    /// multiplicity accounting — but on their own they do not pin dedup.
-    ///
-    /// Here the same reference is split across the read by another one, so the
-    /// two `tx0` records only become one candidate if the sort really ran.
-    ///
-    /// Sorted: the `tx0` representative is the TRUNCATED one (AS 100), so it
-    /// fails the 3' filter and stands for BOTH of its records
-    /// (`filtered_3p_anchor == 2`). It is ALSO the read's raw argmax, and it is
-    /// ineligible, so under the C_raw rule the read is a runner-up usurpation
-    /// and `tx1` is not emitted.
-    ///
-    /// Unsorted: the truncated record is a representative on its own
-    /// (`filtered_3p_anchor == 1`), the full-length `tx0` survives as a second
-    /// candidate, and it ties with `tx1` on AS 50 → `rejected_tie`. Three
-    /// different counters move, so the sort cannot be deleted silently.
+    /// DEDUP GROUPS NON-ADJACENT RECORDS, WHICH IS THE ONLY WAY TO SEE IT. Here the same reference
+    /// is split across the read by another one, so the two `tx0` records only become one candidate
+    /// if the sort really ran. Sorted: the `tx0` representative is the TRUNCATED one (AS 100), so
+    /// it fails the 3' filter and stands for BOTH of its records (`filtered_3p_anchor == 2`). It is
+    /// ALSO the read's raw argmax, and it is ineligible, so under the C_raw rule the read is a
+    /// runner-up usurpation and `tx1` is not emitted.
     #[test]
     fn test_dedup_groups_records_that_are_not_adjacent_in_the_bam() {
         let tsv = tx2gene_tsv("dedupadj", "tx0\tGA\ntx1\tGB\ntx2\tGC\n");
@@ -2494,14 +1780,8 @@ mod tests {
         assert_eq!(s.passed, 0);
     }
 
-    /// SUPPLEMENTARY AND UNMAPPED RECORDS DO NOT REACH THE POOL — INCLUDING
-    /// AT MAPQ >= 20.
-    ///
-    /// A third of the supplementary records carry MAPQ >= 20, so a MAPQ filter
-    /// alone would let a split segment into the pool as if it were a complete
-    /// molecule. `filtered_unique == 0` below is the load-bearing assert: it
-    /// says the records did NOT die at the MAPQ gate, which is the route they
-    /// would otherwise take.
+    /// SUPPLEMENTARY AND UNMAPPED RECORDS DO NOT REACH THE POOL — INCLUDING AT MAPQ >= 20: a MAPQ
+    /// filter alone would let a split segment into the pool as if it were a complete molecule.
     #[test]
     fn test_supplementary_and_unmapped_records_never_become_anchors_even_at_high_mapq() {
         use noodles_sam::alignment::record::Flags;
@@ -2542,13 +1822,8 @@ mod tests {
         );
     }
 
-    /// SECONDARY ALIGNMENTS ARE ADMITTED, and the record ledger still closes
-    /// with them in the stream.
-    ///
-    /// `0x100` is the flag the input contract requires be preserved. A
-    /// secondary with MAPQ 60 is a real alignment to a real transcript and must
-    /// be allowed to win an argmax; dropping it would reintroduce exactly the
-    /// ambiguity this pass exists to resolve.
+    /// SECONDARY ALIGNMENTS ARE ADMITTED, and the record ledger still closes with them in the stream.
+    /// `0x100` is the flag the input contract requires be preserved.
     #[test]
     fn test_the_record_ledger_closes_while_secondaries_are_admitted() {
         use noodles_sam::alignment::record::Flags;
@@ -2586,17 +1861,10 @@ mod tests {
             s.filtered_unique, 0,
             "a secondary with MAPQ 60 must not be counted as low-MAPQ"
         );
-        // SET-WISE, NOT SEQUENCE-WISE. Anchor ROW ORDER is a deterministic
-        // function of the read's 128-bit name hash (see the pass-2 ordering
-        // comment), not of BAM order: `p0` and `s0` are emitted in whichever
-        // order their keys sort into, which is not the order they were written
-        // to the fixture. Asserting the input order here would pin a property
-        // the code deliberately does not have.
-        //
-        // Nothing downstream may depend on the order: the emission model
-        // accumulates every row into per-transcript collections and never
-        // indexes across rows, so a permutation of the pool is invisible to
-        // it.
+        // SET-WISE, NOT SEQUENCE-WISE. Anchor ROW ORDER is a deterministic function of the read's
+        // 128-bit name hash (see the pass-2 ordering comment), not of BAM order. Nothing downstream
+        // may depend on the order: the emission model accumulates every row into per-transcript
+        // collections and never indexes across rows.
         let mut tx: Vec<&str> = anchors.iter().map(|a| a.transcript_id.as_str()).collect();
         tx.sort_unstable();
         assert_eq!(tx, vec!["tx0", "tx1"]);
@@ -2605,13 +1873,7 @@ mod tests {
         assert_eq!(ids, vec!["p0", "s0"]);
     }
 
-    /// ANCHORS EMITTED <= READS SEEN, AND THE READ BLOCK CLOSES.
-    ///
-    /// The inequality is the one that can only break if selection ever stops
-    /// being per read — a re-introduced per-record push would put two anchors
-    /// on one read and break it. The closure is the denominator check: it says
-    /// every read that reached the per-read stage landed in exactly one
-    /// outcome, so a rejection cannot be counted twice or lost.
+    /// ANCHORS EMITTED <= READS SEEN, AND THE READ BLOCK CLOSES. The inequality is the one that can only break if selection ever stops being per read.
     #[test]
     fn test_anchors_emitted_never_exceed_reads_seen_and_the_read_block_closes() {
         use noodles_sam::alignment::record::Flags;
@@ -2621,24 +1883,17 @@ mod tests {
         let (anchors, s) = run_extract(
             "closure",
             vec![
-                // 1. one candidate -> anchor
                 synth_record("solo", 0, Some(100), 0, 60),
-                // 2. cross-gene, gap clear -> anchor
                 synth_record("cross", 0, Some(100), 0, 60),
                 synth_record("cross", 1, Some(80), 0, 60),
-                // 3. exact tie -> rejected_tie
                 synth_record("tie", 0, Some(100), 0, 60),
                 synth_record("tie", 1, Some(100), 0, 60),
-                // 4. same gene (tx0/GA, tx2/GA) but gap 30 > 0 -> EMITS.
-                //    Under the removed unconditional veto this read was refused
-                //    for having a sibling isoform in the same gene, which made
-                //    every isoform of every multi-isoform gene unanchorable as
-                //    soon as the aligner emitted a secondary for it.
+                // same gene (tx0/GA, tx2/GA) but gap 30 > 0 -> EMITS.
                 synth_record("samegene", 0, Some(100), 0, 60),
                 synth_record("samegene", 2, Some(70), 0, 60),
-                // 5. physically ineligible everywhere -> no eligible candidate
+                // physically ineligible everywhere -> no eligible candidate
                 synth_record_with_gap("dead", 1, 100, true, Some(100), 0, 60),
-                // 6. dropped before grouping, so NOT a read
+                // dropped before grouping, so NOT a read
                 synth_record_with_flags("gone", 0, Flags::UNMAPPED, Some(100)),
             ],
             &map,
@@ -2665,9 +1920,9 @@ mod tests {
         );
 
         assert_eq!(s.rejected_tie, 1);
-        // NOT 1 any more: `rejected_same_gene` is now only how a GAP failure is
-        // CLASSIFIED, never an independent veto. With `params()` the floors are
-        // 0.0, nothing fails the gap, so both same-gene and cross-gene are 0.
+        // `rejected_same_gene` is only how a GAP failure is CLASSIFIED, never an independent veto.
+        // With `params()` the floors are 0.0, nothing fails the gap, so both same-gene and
+        // cross-gene are 0.
         assert_eq!(s.rejected_same_gene, 0);
         assert_eq!(s.rejected_cross_gene, 0);
         assert_eq!(s.gene_veto_disabled, 0);
@@ -2699,11 +1954,7 @@ mod tests {
             s.reads_over_cap,
             s.anchors_emitted,
         );
-        // `reads_over_cap` and `rejected_usurpation` are both 0 on this fixture,
-        // so adding them above is arithmetically inert and would leave those two
-        // directions of the identity untested. The fixtures that make them
-        // non-zero are `test_a_multi_record_read_over_the_cap_absorbs_every_record_it_contributed`
-        // and `test_a_physically_disqualified_argmax_is_refused_rather_than_emitted`.
+        // `reads_over_cap` and `rejected_usurpation` are both 0 on this fixture, so adding them above is arithmetically inert.
         assert_eq!(
             s.reads_over_cap, 0,
             "no transcript reaches the cap of 200 here, so this fixture cannot \
@@ -2712,28 +1963,11 @@ mod tests {
         );
     }
 
-    /// THE CAP BRANCH ABSORBS EVERY RECORD THE REJECTED READ CONTRIBUTED.
-    ///
-    /// THE FIXTURE IS DELIBERATELY MULTI-RECORD, AND THAT IS THE WHOLE POINT.
-    /// The pre-existing cap fixture (`test_anchor_record_conservation`) is 205
-    /// reads of ONE record each, so `eligible_records == 1` everywhere and
-    /// `filtered_cap += 1` happened to be exact. A test built from
-    /// single-record reads cannot see the defect at all: it proves the READ
-    /// identity and silently misses the RECORD one. This fixture is three reads
-    /// of TWO records each, which makes `eligible_records - 1` equal to 1 and
-    /// the leak a whole record.
-    ///
-    /// THE FIXTURE IS ALSO ORDER-INDEPENDENT ON PURPOSE. The cap keeps the
-    /// first `max_reads_per_sample` reads in read-id-hash order, so with a cap
-    /// of 2 over 3 competing reads it is not knowable in advance WHICH read is
-    /// rejected. Every one of the three has `eligible_records == 2`, so the
-    /// assertion holds whichever read loses — and a fixture that named the
-    /// winner would have to encode a hash order in a test file, which is the
-    /// thing the hash rule exists to avoid depending on.
-    ///
-    /// `lowq` is here for a second, unrelated reason: it carries MAPQ 5 and
-    /// would have died at the retired gate, so the fixture also witnesses
-    /// `filtered_unique == 0` on an input where the gate USED to fire.
+    /// THE CAP BRANCH ABSORBS EVERY RECORD THE REJECTED READ CONTRIBUTED. The fixture is three reads
+    /// of TWO records each, so `eligible_records - 1` is 1 and a record leak is a whole record.
+    /// ORDER-INDEPENDENT ON PURPOSE: the cap keeps the first `max_reads_per_sample` reads in
+    /// read-id-hash order, so which of the three competing reads is rejected is not knowable in
+    /// advance. All three have `eligible_records == 2`, so the assertion holds whichever loses.
     #[test]
     fn test_a_multi_record_read_over_the_cap_absorbs_every_record_it_contributed() {
         let tsv = tx2gene_tsv("capleak", "tx0\tGA\ntx1\tGB\ntx2\tGC\n");
@@ -2742,11 +1976,8 @@ mod tests {
 
         let mut recs = Vec::new();
         for i in 0..3 {
-            // Two RECORDS, two TRANSCRIPTS, so the dedup cannot collapse them
-            // and `eligible_records` is genuinely 2. AS 100 on tx2 wins the
-            // argmax, AS 50 on tx0 loses; the gap is 50 and the pair is
-            // cross-gene, so the read reaches the cap check rather than being
-            // rejected earlier.
+            // Two RECORDS, two TRANSCRIPTS, so the dedup cannot collapse them and `eligible_records`
+            // is genuinely 2. The gap is 50 and the pair is cross-gene, so the read reaches the cap check.
             recs.push(synth_record(&format!("sat{i}"), 2, Some(100), 0, 60));
             recs.push(synth_record(&format!("sat{i}"), 0, Some(50), 0, 60));
         }
@@ -2759,7 +1990,6 @@ mod tests {
         let (anchors, s) = run_extract("capleak", recs, &map, p);
         let _ = std::fs::remove_file(&tsv);
 
-        // --- THE RECORD IDENTITY, FIRST -------------------------------------
         assert_record_ledger_closes(&s);
         assert_eq!(record_deficit(&s), 0);
 
@@ -2769,7 +1999,6 @@ mod tests {
             "three saturating reads plus the low-MAPQ read"
         );
 
-        // --- THE READ IDENTITY, WITH A NON-ZERO CAP TERM --------------------
         assert_eq!(s.reads_over_cap, 1, "the third read on tx2 is over the cap");
         assert_eq!(
             s.reads_seen,
@@ -2791,7 +2020,6 @@ mod tests {
         assert_eq!(s.passed, 3);
         assert_eq!(anchors.len(), 3);
 
-        // --- THE LEAK ITSELF, IN RECORDS ------------------------------------
         assert_eq!(
             s.filtered_cap, 1,
             "filtered_cap is READ-denominated: one rejected read"
@@ -2807,7 +2035,6 @@ mod tests {
              last term this is 2 and the record ledger is short by exactly 1."
         );
 
-        // --- THE MAPQ GATE IS GONE, WITNESSED WHERE IT USED TO FIRE ---------
         assert_eq!(
             s.filtered_unique, 0,
             "MAPQ 5 clears every filter now; the retired slot must stay at 0"
@@ -2828,10 +2055,8 @@ mod tests {
         assert_eq!(s.gene_veto_disabled, 0);
         assert_eq!(s.reads_no_eligible_candidate, 0);
 
-        // The anchors are the two cap winners on tx2 plus the low-MAPQ read on
-        // tx1. WHICH two sat reads won is hash order and is deliberately not
-        // asserted; the read_ids must still be distinct, or the per-read
-        // grouping itself is broken.
+        // The anchors are the two cap winners on tx2 plus the low-MAPQ read on tx1. WHICH two sat
+        // reads won is hash order and is deliberately not asserted.
         let mut ids: Vec<&str> = anchors.iter().map(|a| a.read_id.as_str()).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec!["lowq", "sat1", "sat2"]);
@@ -2840,15 +2065,10 @@ mod tests {
         assert_eq!(txs, vec!["tx1", "tx2", "tx2"]);
     }
 
-    /// AN EMPTY `tx_to_gene` DOES NOT SILENTLY BECOME "CROSS-GENE".
-    ///
-    /// With no map, `gene_id == transcript_id` for every candidate, so a naive
-    /// same-gene check compares each transcript with itself and can NEVER fire.
-    /// Every intra-gene multi-candidate read would then be filed as cross-gene —
-    /// and it would be filed so with total confidence, because the comparison
-    /// genuinely ran and genuinely said "different". This test pins the two
-    /// facts that make that state visible instead: `gene_veto_disabled` and
-    /// `same_gene_unknown` are non-zero, and `rejected_cross_gene` is zero.
+    /// AN EMPTY `tx_to_gene` DOES NOT SILENTLY BECOME "CROSS-GENE". With no map, `gene_id ==
+    /// transcript_id` for every candidate, so a naive same-gene check compares each transcript with
+    /// itself and can NEVER fire. `gene_veto_disabled` and `same_gene_unknown` are non-zero, and
+    /// `rejected_cross_gene` is zero.
     #[test]
     fn test_an_empty_tx_to_gene_emits_but_records_the_unknown_relation() {
         let (anchors, s) = run_extract(
@@ -2856,8 +2076,7 @@ mod tests {
             vec![
                 synth_record("r", 0, Some(100), 0, 60),
                 synth_record("r", 1, Some(90), 0, 60),
-                // A solo read is unaffected: with one candidate there is no
-                // pair to classify.
+                // A solo read is unaffected: with one candidate there is no pair to classify.
                 synth_record("solo", 2, Some(100), 0, 60),
             ],
             &TxToGene::new(),
@@ -2865,9 +2084,7 @@ mod tests {
         );
 
         assert_record_ledger_closes(&s);
-        // Universal Mode no longer refuses a read for having an unclassifiable
-        // rival. It applies the same score/gap criteria as the mapped case and
-        // counts the fact that the RELATION was unavailable.
+        // Universal Mode does not refuse a read for having an unclassifiable rival: it applies the same score/gap criteria as the mapped case and counts the fact that the RELATION was unavailable.
         assert_eq!(
             anchors.len(),
             2,
@@ -2891,20 +2108,13 @@ mod tests {
         );
         assert_eq!(s.filtered_eligible_not_anchor, 1);
 
-        // And the empty-map fallback for the EMITTED gene_id is unchanged:
-        // it is still `gene_id := transcript_id`, which is what the degenerate
-        // gene pool warning keys on.
+        // And the empty-map fallback for the EMITTED gene_id is unchanged: it is still `gene_id := transcript_id`, which is what the degenerate gene pool warning keys on.
         assert_eq!(anchors[0].gene_id, anchors[0].transcript_id);
     }
 
-    /// ...AND WITH NO MAP **AND** A GAP THAT IS NOT CLEAR, THE READ IS REJECTED
-    /// AND LANDS IN `rejected_gap` — the Unknown arm of the gap classification.
-    ///
-    /// This is what gives `rejected_gap` a producer at all. With a map supplied
-    /// the relation is always Same or Cross, so `rejected_gap` can only be
-    /// non-zero in Universal Mode, and a reader who sets `--gap-abs 20` against
-    /// a real map sees `gap=0` because none was possible, not because none was
-    /// needed.
+    /// ...AND WITH NO MAP **AND** A GAP THAT IS NOT CLEAR, THE READ IS REJECTED AND LANDS IN
+    /// `rejected_gap` — the Unknown arm of the gap classification. With a map supplied the relation is
+    /// always Same or Cross, so `rejected_gap` can only be non-zero in Universal Mode.
     #[test]
     fn test_an_empty_tx_to_gene_with_an_unmet_gap_is_rejected_as_rejected_gap() {
         let p = AnchorParams {
@@ -2931,14 +2141,9 @@ mod tests {
         assert_eq!(s.filtered_eligible_not_anchor, 2);
     }
 
-    /// A NON-EMPTY `tx_to_gene` THAT DOES NOT COVER THE BAM ERRORS OUT.
-    ///
-    /// The empty-map fallback (`gene_id := transcript_id`) is legitimate for a
-    /// novel single-transcript locus and stays. The non-empty case is a
-    /// different fact: the TSV and the BAM's `@SQ` header disagree, and the
-    /// silent fallback would then decide the same-gene veto on an invented
-    /// gene id — a veto that can never fire reads exactly like a veto that
-    /// correctly found nothing.
+    /// A NON-EMPTY `tx_to_gene` THAT DOES NOT COVER THE BAM ERRORS OUT. The empty-map fallback
+    /// (`gene_id := transcript_id`) is legitimate and stays; the non-empty case is a different fact:
+    /// the TSV and the BAM's `@SQ` header disagree.
     #[test]
     fn test_a_non_empty_gene_map_that_misses_a_transcript_is_an_error() {
         let tsv = tx2gene_tsv("partial", "tx0\tGA\ntx1\tGB\n");
@@ -2969,11 +2174,8 @@ mod tests {
         );
     }
 
-    /// THE `reads(...)` BLOCK APPEARS IN `report()` AND SAYS IT IS READS.
-    ///
-    /// `report()`'s prefix is pinned byte-for-byte by a downstream scraper's
-    /// regex, so the new material can only go at the end — and going at the
-    /// end is also what keeps the two denominations from being read as one.
+    /// THE `reads(...)` BLOCK APPEARS IN `report()` AND SAYS IT IS READS. `report()`'s prefix is
+    /// pinned byte-for-byte by a downstream scraper's regex, so new material can only go at the end.
     #[test]
     fn test_report_keeps_the_pinned_prefix_and_appends_the_new_buckets() {
         let agg = AnchorStats {
@@ -2991,7 +2193,6 @@ mod tests {
         };
         let line = agg.report();
 
-        // The pinned prefix, exactly as the regex expects it.
         assert!(
             line.starts_with("samples=1 total=100 filtered(unique=0 no_reflen=0 3p_anchor=0 coverage=0 polya=0 cap=0) passed=0 unaccounted=65 no_refid=0 no_position=0 no_read_id=0"),
             "the pinned prefix changed, which breaks ANCHOR_STATS_RE:\n{line}"
@@ -3001,12 +2202,9 @@ mod tests {
             "supplementary=13",
             "not_anchor=10",
             "reads(seen=27 anchors=7 tie=9",
-            // `over_cap` and `usurpation` belong INSIDE reads(...) and at its
-            // END: inserting either into `filtered(...)` would sit inside the
-            // region the regex pins, and putting one before `reads(` would
-            // make a read count readable as a record count. They are
-            // DISTINCTIVE (4 and 6), so a transposition between them is
-            // visible rather than absorbed into an unchanged sum.
+            // `over_cap` and `usurpation` belong INSIDE reads(...) and at its END: inserting either
+            // into `filtered(...)` would sit inside the region the regex pins. They are DISTINCTIVE
+            // (4 and 6), so a transposition between them is visible.
             "no_eligible=0 over_cap=4 usurpation=6)",
         ] {
             assert!(

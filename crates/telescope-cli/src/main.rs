@@ -1,9 +1,9 @@
 //! Telescope CLI entry point.
 //!
-//! Subcommands: `build-emission` (Module 1), `extract-evidence` (Module 2),
-//! `quant` (Modules 2 → 3), `summarize` (profile → sample summary),
-//! `build-anchors` (poly(A) anchor pool from BAMs), `resolve-evidence`
-//! (Module 0, cohort transcript evidence).
+//! Subcommands: `build-emission` (emission model), `extract-evidence`
+//! (single-molecule evidence), `quant` (evidence → joint MAP-EM),
+//! `summarize` (profile → sample summary), `build-anchors` (poly(A) anchor
+//! pool from BAMs), `resolve-evidence` (cohort transcript evidence).
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -22,7 +22,7 @@ use telescope_core::{anchor_builder, emission_model, evidence, resolver, summary
 #[command(
     name = "telescope",
     version,
-    about = "Terminal-resolved native poly(A) inference for ONT DRS"
+    about = "Telescope: Transcript-specific poly(A) tail length estimation and isoform quantification in direct RNA sequencing"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -32,7 +32,7 @@ struct Cli {
 /// The subcommands of the production `telescope` binary.
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Module 1: build `telescope.emission.parquet` from an anchor pool.
+    /// Estimate empirical Bayes isoform-specific poly(A) tail-length priors.
     ///
     /// `--anchor-pool` is the sole input; there is no alternative input mode.
     /// An external poly(A) initializer remains in
@@ -43,35 +43,36 @@ enum Cmd {
     /// `--cohort-min-reads` configure the 3-level fallback (Tx → Gene → Cohort)
     /// and carry no `requires` attribute, because `--anchor-pool` is the only
     /// input.
+    #[command(display_order = 2)]
     BuildEmission {
         /// Universal mode: path to `telescope.anchor_pool.parquet`
         /// (produced by `telescope build-anchors`).
-        #[arg(long)]
+        #[arg(long, help_heading = "INPUTS")]
         anchor_pool: PathBuf,
 
         /// Universal mode (optional): path to
-        /// `telescope.transcript_evidence.parquet` (Module 0
-        /// output). When provided, reads whose transcript_id has
-        /// `em_eligible == false` are dropped before emission
-        /// fitting.
-        #[arg(long)]
+        /// `telescope.transcript_evidence.parquet` (the
+        /// transcript-evidence resolver's output). When provided, reads whose
+        /// transcript_id has `em_eligible == false` are dropped before
+        /// emission fitting.
+        #[arg(long, help_heading = "INPUTS")]
         transcript_evidence: Option<PathBuf>,
 
         /// Output path for `telescope.emission.parquet`.
-        #[arg(long)]
+        #[arg(long, help_heading = "OUTPUTS")]
         output: PathBuf,
 
         /// Universal mode: L1 Tx-level minimum reads (default 10).
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, default_value_t = 10, help_heading = "OPTIONS")]
         tx_min_reads: usize,
 
         /// Universal mode: L2 Gene-level minimum reads (default 30).
-        #[arg(long, default_value_t = 30)]
+        #[arg(long, default_value_t = 30, help_heading = "OPTIONS")]
         gene_min_reads: usize,
 
         /// Universal mode: L3 Cohort-level minimum reads
         /// (informational; L3 is always applied when L1/L2 fail).
-        #[arg(long, default_value_t = 50)]
+        #[arg(long, default_value_t = 50, help_heading = "OPTIONS")]
         cohort_min_reads: usize,
 
         /// REFERENCE UNIVERSE (padding). Path to the alignment BAM whose `@SQ`
@@ -83,7 +84,7 @@ enum Cmd {
         /// the pool is emitted as a cohort-prior row carrying `n_cohort_flnc == 0`.
         ///
         /// Only the HEADER is read; no alignment record is touched.
-        #[arg(long)]
+        #[arg(long, help_heading = "INPUTS")]
         reference_bam: Option<PathBuf>,
 
         /// Optional `transcript_id<TAB>gene_id` TSV, used to give IMPUTED
@@ -93,7 +94,7 @@ enum Cmd {
         /// the same file — harmless numerically, since `gene_id` feeds no
         /// likelihood — but it is a join trap for a downstream reader, so it
         /// is worth passing when the mapping is on hand.
-        #[arg(long)]
+        #[arg(long, help_heading = "INPUTS")]
         tx_to_gene: Option<PathBuf>,
 
         /// Where to write the provenance sidecar JSON. Defaults to
@@ -101,18 +102,19 @@ enum Cmd {
         ///
         /// The parquet's 7 columns are frozen, so the record of WHERE the
         /// universe came from and WHICH rows were imputed cannot live in it.
-        #[arg(long)]
+        #[arg(long, help_heading = "OUTPUTS")]
         provenance_out: Option<PathBuf>,
     },
 
-    /// Module 2: extract single-molecule evidence from a transcriptome-aligned BAM.
+    /// Extract single-molecule evidence from a transcriptome-aligned BAM.
+    #[command(display_order = 6, hide = true)]
     ExtractEvidence {
         /// Path to the transcriptome-aligned BAM (carries Dorado `pt:i`).
-        #[arg(long)]
+        #[arg(long, help_heading = "INPUTS")]
         bam: PathBuf,
 
         /// 3' TES boundary slack in bp (default 35).
-        #[arg(long, default_value_t = 35)]
+        #[arg(long, default_value_t = 35, help_heading = "OPTIONS")]
         tes_slack: usize,
 
         // The FATAL message in `evidence.rs` quotes this spelling, so the flag
@@ -127,36 +129,39 @@ enum Cmd {
         poly_a_source: String,
 
         /// Write the record-level filter ledger here as JSON
-        /// (`telescope.filter_ledger/v1`).
+        /// (`telescope.filter_ledger`).
         ///
         /// OPT-IN, not a default sidecar: `--provenance-out` on
         /// `build-emission` writes by default, and two flags with opposite
         /// defaults invite a reader to assume both run. The path is explicit so
         /// the record-level and anchor-level ledgers cannot land in one file —
         /// they are different stages with different denominators.
-        #[arg(long)]
+        #[arg(long, help_heading = "OUTPUTS")]
         ledger: Option<PathBuf>,
     },
 
-    /// Modules 2 + 3: BAM -> evidence -> TEL-EM profile.
+    /// Run joint MAP-EM for isoform abundance quantification and single-molecule poly(A) deconvolution.
+    #[command(display_order = 3)]
     Quant(QuantArgs),
 
-    /// Module 4: profile -> differential statistics (usage and tail length).
+    /// Run multi-modal differential analysis (DEG, DET, APA, and DPL) across conditions.
     ///
     /// The statistics are NOT implemented in Rust: DEXSeq and limma are called
     /// in an R subprocess. This subcommand does the one step that cannot be
     /// delegated — the per-read to per-(transcript x sample) aggregation — and
     /// then runs the R engine on the result.
+    #[command(display_order = 5)]
     Diff(DiffArgs),
 
-    /// Profile Summary Engine: aggregate profile.parquet → sample_summary.parquet.
+    /// Aggregate cohort-level abundance and poly(A) tail sufficient statistics
+    #[command(display_order = 4)]
     Summarize {
         /// Path to `telescope.profile.parquet`.
-        #[arg(long)]
+        #[arg(long, help_heading = "INPUTS")]
         profile: PathBuf,
 
         /// Output `telescope.sample_summary.parquet`.
-        #[arg(long)]
+        #[arg(long, help_heading = "OUTPUTS")]
         output: PathBuf,
 
         /// Per-transcript provenance sidecar from `build-emission`
@@ -170,38 +175,39 @@ enum Cmd {
         /// `n_anchor` — which is what Tier 3 needs, because transcripts that
         /// are missing there must be filled with 0 rather than dropped by a
         /// join.
-        #[arg(long)]
+        #[arg(long, help_heading = "INPUTS")]
         provenance: Option<PathBuf>,
     },
 
-    /// Universal Mode: build the poly(A) anchor pool from BAMs.
+    /// Select high-confidence full-length anchor reads from transcriptome-aligned BAM
+    #[command(display_order = 1)]
     BuildAnchors {
         /// BAM files (one per sample). Pass multiple `--bam <path>` flags.
-        #[arg(long = "bam", required = true)]
+        #[arg(long = "bam", required = true, help_heading = "INPUTS")]
         bams: Vec<PathBuf>,
 
         /// Sample IDs parallel to `--bam` (one per BAM).
-        #[arg(long = "sample-id", required = true)]
+        #[arg(long = "sample-id", required = true, help_heading = "INPUTS")]
         sample_ids: Vec<String>,
 
         /// Output `telescope.anchor_pool.parquet`.
-        #[arg(long)]
+        #[arg(long, help_heading = "OUTPUTS")]
         output: PathBuf,
 
         /// Optional TSV with header `transcript_id\tgene_id` (for gene_id resolution).
-        #[arg(long)]
+        #[arg(long, help_heading = "INPUTS")]
         tx_to_gene: Option<PathBuf>,
 
         /// 3' TES boundary slack in bp (default 35).
-        #[arg(long, default_value_t = 35)]
+        #[arg(long, default_value_t = 35, help_heading = "OPTIONS")]
         tes_slack: usize,
 
         /// Minimum coverage ratio (alignment_length / ref_len) (default 0.80).
-        #[arg(long, default_value_t = 0.80)]
+        #[arg(long, default_value_t = 0.80, help_heading = "OPTIONS")]
         min_coverage: f64,
 
         /// Per-sample read cap per transcript (default 200).
-        #[arg(long, default_value_t = 200)]
+        #[arg(long, default_value_t = 200, help_heading = "OPTIONS")]
         max_reads_per_sample: usize,
 
         /// Absolute floor on the per-read `delta_AS_raw` gap (default 12).
@@ -217,7 +223,7 @@ enum Cmd {
         /// single candidate is measured against 0 and this floor applies to it
         /// too. A read whose best RAW alignment fails a physical filter is
         /// refused rather than attributed to its runner-up.
-        #[arg(long, default_value_t = 12.0)]
+        #[arg(long, default_value_t = 12.0, help_heading = "OPTIONS")]
         gap_abs: f64,
 
         /// Floor on the per-read `delta_AS_raw` gap as a fraction of `AS_1`.
@@ -226,63 +232,64 @@ enum Cmd {
         /// floors combine with `max`, so a relative floor of 0.0 is
         /// arithmetically inert beside a non-zero `--gap-abs` and means "the
         /// absolute floor is the only floor". Read it that way, never as "off".
-        #[arg(long, default_value_t = 0.0)]
+        #[arg(long, default_value_t = 0.0, help_heading = "OPTIONS")]
         gap_rel: f64,
 
         /// Write the anchor-level filter ledger here as JSON
-        /// (`telescope.filter_ledger/v1`).
+        /// (`telescope.filter_ledger`).
         ///
         /// This is the ONLY subcommand with an anchor-level ledger, because it
         /// is the only one that produces `AnchorStats`. The record-level ledger
         /// belongs to `extract-evidence` / `quant` / `resolve-evidence`; the
-        /// two are different populations (records entering Module 2 vs records
+        /// two are different populations (records entering evidence extraction vs records
         /// entering the anchor scan) and must go to different files.
-        #[arg(long)]
+        #[arg(long, help_heading = "OUTPUTS")]
         ledger: Option<PathBuf>,
     },
 
-    /// Module 0: Resolve cohort-level transcript evidence (Tier A/B/C,
+    /// Resolve cohort-level transcript evidence (Tier A/B/C,
     /// subsumption, EM/PAL eligibility) → `telescope.transcript_evidence.parquet`.
+    #[command(display_order = 7, hide = true)]
     ResolveEvidence {
         /// One or more transcriptome-aligned BAMs (cohort). All BAMs
         /// must share the same reference catalog (`@SQ` lines).
-        #[arg(long = "bam", required = true)]
+        #[arg(long = "bam", required = true, help_heading = "INPUTS")]
         bams: Vec<PathBuf>,
 
         /// Sample IDs parallel to `--bam` (one per BAM, used to namespace
         /// read IDs when pooling).
-        #[arg(long = "sample-id", required = true)]
+        #[arg(long = "sample-id", required = true, help_heading = "INPUTS")]
         sample_ids: Vec<String>,
 
         /// Optional TSV with header `transcript_id\tgene_id`. Missing
         /// mappings emit `gene_id="missing_gene_id"` plus a warning.
-        #[arg(long)]
+        #[arg(long, help_heading = "INPUTS")]
         tx_to_gene: Option<PathBuf>,
 
         /// Cohort size (must equal the number of `--bam` arguments).
-        #[arg(long)]
+        #[arg(long, help_heading = "OPTIONS")]
         cohort_size: usize,
 
         /// TES cluster radius in bp (default 50). Excluded from
         /// subsumption scan iff transcript IDs contain `AlterTes`/`_Alter`.
-        #[arg(long, default_value_t = 50)]
+        #[arg(long, default_value_t = 50, help_heading = "OPTIONS")]
         tes_cluster_radius: usize,
 
-        /// 3' TES boundary slack in bp passed to Module 2 (default 35).
-        #[arg(long, default_value_t = 35)]
+        /// 3' TES boundary slack in bp passed to evidence extraction (default 35).
+        #[arg(long, default_value_t = 35, help_heading = "OPTIONS")]
         tes_slack: usize,
 
         /// Output `telescope.transcript_evidence.parquet`.
-        #[arg(long)]
+        #[arg(long, help_heading = "OUTPUTS")]
         output: PathBuf,
 
         /// Write the record-level filter ledger here as JSON
-        /// (`telescope.filter_ledger/v1`). See `extract-evidence --ledger`.
+        /// (`telescope.filter_ledger`). See `extract-evidence --ledger`.
         ///
         /// For a cohort this is the field-wise SUM over the input BAMs, so
         /// `records_entered` is the union of the inputs and not any one
         /// sample's count.
-        #[arg(long)]
+        #[arg(long, help_heading = "OUTPUTS")]
         ledger: Option<PathBuf>,
     },
 }
@@ -301,7 +308,7 @@ fn main() -> Result<()> {
             gene_min_reads,
             cohort_min_reads,
         } => {
-            eprintln!("[telescope] Module 1: building emission model");
+            eprintln!("[telescope] building emission model");
             // Universal mode is the only mode; `--anchor-pool` is required.
             let fb = FallbackConfig {
                 tx_min_reads,
@@ -377,7 +384,7 @@ fn main() -> Result<()> {
                 universe.as_deref(),
                 tx2g.as_ref(),
             )
-            .context("Module 1 build_emission_from_anchors (Universal) failed")?;
+            .context("build_emission_from_anchors failed")?;
             // GUARD, PART 2 OF 2: the tier sidecar. `tiers` does not exist until
             // the call above returns, so this half cannot sit next to the first.
             // It is NOT defence-in-depth against a `.parquet` sidecar name — that
@@ -525,12 +532,12 @@ fn main() -> Result<()> {
             ledger,
         } => {
             let poly_a = evidence::parse_poly_a_source(&poly_a_source)?;
-            eprintln!("[telescope] Module 2: extracting single-molecule evidence");
+            eprintln!("[telescope] extracting single-molecule evidence");
             eprintln!("  bam:        {}", bam.display());
             eprintln!("  tes_slack:  {} bp", tes_slack);
             eprintln!("  polyA-src:  {}", poly_a_source);
             let graph = evidence::extract_evidence_with(&bam, tes_slack, &poly_a)
-                .context("Module 2 extract_evidence failed")?;
+                .context("extract_evidence failed")?;
             eprintln!("[telescope]  molecules:        {}", graph.molecules.len());
             eprintln!(
                 "[telescope]  transcripts:     {}",
@@ -566,7 +573,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::Diff(diff_args) => {
-            eprintln!("[telescope] Module 4: differential statistics");
+            eprintln!("[telescope] differential statistics");
             telescope::diff::run(&diff_args)?;
             Ok(())
         }
@@ -735,7 +742,7 @@ fn main() -> Result<()> {
                     bams.len()
                 );
             }
-            eprintln!("[telescope] Module 0: transcript evidence resolver");
+            eprintln!("[telescope] transcript evidence resolver");
             eprintln!("  cohort_size:         {}", cohort_size);
             eprintln!("  tes_cluster_radius:  {} bp", tes_cluster_radius);
             eprintln!("  tes_slack:           {} bp", tes_slack);

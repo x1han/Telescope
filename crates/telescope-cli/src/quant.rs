@@ -1,4 +1,4 @@
-//! The `quant` subcommand: Module 2 (evidence) -> Module 3 (TEL-EM).
+//! The `quant` subcommand: evidence extraction -> joint MAP-EM (TEL-EM).
 //!
 //! `QuantArgs` is a clap `Args` struct so both binaries declare the subcommand
 //! from ONE definition: a retyped flag list would silently be a different model
@@ -21,23 +21,23 @@ use crate::{
 #[derive(Args, Debug)]
 pub struct QuantArgs {
     /// Path to the transcriptome-aligned BAM.
-    #[arg(long)]
+    #[arg(long, help_heading = "INPUTS")]
     bam: PathBuf,
 
     /// Path to `telescope.emission.parquet` (from `build-emission`).
-    #[arg(long)]
+    #[arg(long, help_heading = "INPUTS")]
     emission: PathBuf,
 
     /// Sample identifier (e.g. `sample_01`). Used as `sample_id` column.
-    #[arg(long)]
+    #[arg(long, help_heading = "INPUTS")]
     sample_id: String,
 
     /// Output `telescope.profile.parquet`.
-    #[arg(long)]
+    #[arg(long, help_heading = "OUTPUTS")]
     output: PathBuf,
 
     /// 3' TES boundary slack in bp (default 35).
-    #[arg(long, default_value_t = 35)]
+    #[arg(long, default_value_t = 35, help_heading = "OPTIONS")]
     tes_slack: usize,
 
     // The FATAL message in `evidence.rs` quotes this spelling, so the flag and
@@ -47,25 +47,26 @@ pub struct QuantArgs {
         long = "polyA-source",
         alias = "polya-source",
         default_value = "bam_tag:pt",
-        help = POLY_A_SOURCE_HELP
+        help = POLY_A_SOURCE_HELP,
+        help_heading = "OPTIONS"
     )]
     poly_a_source: String,
 
     /// Write the record-level filter ledger here as JSON
-    /// (`telescope.filter_ledger/v1`). See `extract-evidence --ledger`.
+    /// (`telescope.filter_ledger`). See `extract-evidence --ledger`.
     ///
-    /// `quant` runs the same Module-2 filter chain as `extract-evidence`, so
+    /// `quant` runs the same filter chain as `extract-evidence`, so
     /// its ledger describes the same population; without this the only trace of
     /// the drop is a stderr block no later script can read back.
-    #[arg(long)]
+    #[arg(long, help_heading = "OUTPUTS")]
     ledger: Option<PathBuf>,
 
     /// EM log-likelihood convergence tolerance (per-molecule average LL).
-    #[arg(long, default_value_t = 1e-6)]
+    #[arg(long, default_value_t = 1e-6, help_heading = "OPTIONS")]
     tol: f64,
 
     /// Maximum EM iterations (safety cap).
-    #[arg(long, default_value_t = 1000)]
+    #[arg(long, default_value_t = 1000, help_heading = "OPTIONS")]
     max_iter: usize,
 
     /// Scale λ of the F-EM-4 alignment term `ln A_rk = (AS_rk − max_j AS_rj) / λ`
@@ -75,7 +76,7 @@ pub struct QuantArgs {
     /// knob — at λ = 1000 every evidence term compresses to ≤ 0.1 nat; at
     /// λ = 20 with the `ΔAS > 50` prune the term spans `[−2.5, 0]` nats, the
     /// range the 5' weight of 1.8 competes inside.
-    #[arg(long, default_value_t = ALN_WEIGHT_LAMBDA_DEFAULT)]
+    #[arg(long, default_value_t = ALN_WEIGHT_LAMBDA_DEFAULT, help_heading = "OPTIONS")]
     aln_weight_lambda: f64,
 
     /// Weight β of the 5'-anchoring term `ln_5p_k = β` when the read's
@@ -96,14 +97,14 @@ pub struct QuantArgs {
     /// the Test A / Test B ablation. Redrawing each read's 5' start (Test B)
     /// is a different intervention and is not the same as turning the weight
     /// to 0 — a redraw leaves the term active but decorrelated.
-    #[arg(long, default_value_t = FIVE_PRIME_WEIGHT_DEFAULT)]
+    #[arg(long, default_value_t = FIVE_PRIME_WEIGHT_DEFAULT, help_heading = "OPTIONS")]
     five_prime_weight: f64,
 
     /// 5' window in bp for `--five-prime-weight`: the bonus fires iff
     /// `g_k <=` this value (default: 20). INCLUSIVE. The comparison is on
     /// the 1-based start `s_k` minus one, which is why 20 and 21 are
     /// different answers and the boundary is tested.
-    #[arg(long, default_value_t = FIVE_PRIME_WINDOW_DEFAULT)]
+    #[arg(long, default_value_t = FIVE_PRIME_WINDOW_DEFAULT, help_heading = "OPTIONS")]
     five_prime_window: u32,
 
     /// Scale on the poly(A) mixture term. 1.0 is the shipped model.
@@ -114,7 +115,7 @@ pub struct QuantArgs {
     /// too the likelihood is `ln alpha_k + ln a_rk` — abundance prior PLUS
     /// alignment. The prior cannot be dropped from outside either, because
     /// `alpha` is re-estimated by the M-step.
-    #[arg(long, default_value_t = POLY_A_WEIGHT_DEFAULT)]
+    #[arg(long, default_value_t = POLY_A_WEIGHT_DEFAULT, help_heading = "OPTIONS")]
     poly_a_weight: f64,
 
     /// Drop candidates whose `AS:i` is more than this far below the read's
@@ -125,7 +126,7 @@ pub struct QuantArgs {
     /// Trap: at the shipped λ the alignment term is too weak to delete
     /// candidates on its own, so the deletion responsibility sits here. Use a
     /// very large value to switch the prune off.
-    #[arg(long, default_value_t = PRUNE_MAX_DELTA_AS_DEFAULT)]
+    #[arg(long, default_value_t = PRUNE_MAX_DELTA_AS_DEFAULT, help_heading = "OPTIONS")]
     prune_max_delta_as: i32,
 
     /// Output-stage posterior truncation threshold (default: 0.01). A
@@ -137,15 +138,15 @@ pub struct QuantArgs {
     /// scored on the same support; any ablation whose arms differ in row
     /// count must be re-run at `--min-weight 0` before its delta is quoted.
     /// 0.0 is legal; values >= 1.0 are rejected.
-    #[arg(long, default_value_t = 0.01)]
+    #[arg(long, default_value_t = 0.01, help_heading = "OPTIONS")]
     min_weight: f64,
 
     /// Optional TSV with header `bam_id\toriginal_id` for ID translation.
-    #[arg(long)]
+    #[arg(long, help_heading = "INPUTS")]
     tx_id_mapping: Option<PathBuf>,
 
     /// Print EM per-iter trace (log-L + mean entropy) to stderr.
-    #[arg(long)]
+    #[arg(long, help_heading = "OPTIONS")]
     debug: bool,
 
     /// Also write a per-READ posterior summary
@@ -161,7 +162,7 @@ pub struct QuantArgs {
     /// nameable transcript. `top_weight` is the raw E-step weight and is
     /// deliberately NOT the profile's `posterior_weight` (post-truncation and
     /// renormalised).
-    #[arg(long)]
+    #[arg(long, help_heading = "OUTPUTS")]
     read_assignments: Option<PathBuf>,
 
     /// Also write the `(mu, sigma2)` the FINAL E-step consumed
@@ -183,7 +184,7 @@ pub struct QuantArgs {
     /// which fails if `n_cohort_flnc` is ever added.
     ///
     /// The published profile and read-assignments schemas are unchanged.
-    #[arg(long)]
+    #[arg(long, help_heading = "OUTPUTS")]
     dump_emission_params: Option<PathBuf>,
 }
 
@@ -324,7 +325,7 @@ pub fn run_quant(args: QuantArgs, sigma2_dof_offset: Option<f64>) -> Result<()> 
     eprintln!("[telescope]  extract evidence…");
     eprintln!("[telescope]  polyA-src:  {}", poly_a_source);
     let mut graph = evidence::extract_evidence_with(&bam, tes_slack, &poly_a)
-        .context("Module 2 extract_evidence failed")?;
+        .context("extract_evidence failed")?;
     // Apply optional id mapping to transcript names (BAM @SQ → emission parquet keys).
     if let Some(ref map) = id_mapping {
         for name in &mut graph.transcript_names {
@@ -433,7 +434,7 @@ pub fn run_quant(args: QuantArgs, sigma2_dof_offset: Option<f64>) -> Result<()> 
         },
         sigma2_dof_offset.unwrap_or(em::SIGMA2_DOF_OFFSET),
     )
-    .context("Module 3 solve_and_write_profile failed")?;
+    .context("solve_and_write_profile failed")?;
     if let Some(path) = dump_emission_params {
         let rows = std::mem::take(&mut params_sink);
         anyhow::ensure!(

@@ -148,7 +148,7 @@ fn run_pipeline(beta: f64, tag: &str) -> (f64, usize) {
         &[("tx0", "gene0", mu, 0.04), ("tx1", "gene1", mu, 0.04)],
     );
 
-    // Module 2. No id mapping: this fixture's BAM and emission already share a
+    // Evidence extraction. No id mapping: this fixture's BAM and emission already share a
     // key space, which is the case `solve_and_write_profile` refuses if it
     // is not.
     let graph = extract_evidence(&bam, 35).expect("extract_evidence");
@@ -163,7 +163,7 @@ fn run_pipeline(beta: f64, tag: &str) -> (f64, usize) {
          deterministic w=1 branch and never reaches the E-step at all"
     );
 
-    // Module 3.
+    // The joint MAP-EM solver.
     solve_and_write_profile(
         graph, &emission, "TEST", &profile, 1e-6, 1, LAMBDA, beta, POLY_A_ON, WINDOW, PRUNE,
         MIN_WEIGHT, None, None, None,

@@ -1,4 +1,4 @@
-//! End-to-end: does `--ledger` actually put a `telescope.filter_ledger/v1`
+//! End-to-end: does `--ledger` actually put a `telescope.filter_ledger`
 //! document on disk, with the numbers in it?
 //!
 //! WHY THIS EXISTS ALONGSIDE `ledger_json.rs`'S UNIT TESTS. The unit tests
@@ -21,7 +21,7 @@ use telescope_core::evidence::test_support::{
     synth_record_with_flags, synth_record_with_gap, write_synthetic_bam, SamFlags as Flags,
 };
 
-const SCHEMA: &str = "telescope.filter_ledger/v1";
+const SCHEMA: &str = "telescope.filter_ledger";
 
 /// The twelve anchor-level filter buckets. Every one is read back out of the
 /// artifact and summed, so dropping a key from the `format!` cannot survive.
@@ -496,8 +496,8 @@ fn build_anchors_reports_a_retired_unique_bucket_of_zero() {
         "`unique` is a RETIRED compat slot: the MAPQ < 20 gate was removed \
          because it discarded every secondary candidate and left every \
          surviving read with one candidate, which made strict argmax, the gap \
-         floor and the same-gene veto dead code. The key stays in the frozen v1 \
-         schema; the value must stay 0.\n{json}"
+         floor and the same-gene veto dead code. The key stays in the frozen \
+         ledger schema; the value must stay 0.\n{json}"
     );
     assert_eq!(
         int_field(&json, "passed"),
