@@ -210,13 +210,24 @@ cat("  transcripts after min-counts filter:",
 
 # A gene with ONE transcript has no usage to test. DEXSeq's contrast is
 # WITHIN a gene, so a single-transcript gene carries no usage variation, and
-# its design matrix is rank-deficient -- DESeq2's checkFullRank refuses it and
-# the whole run dies. Such genes are dropped, and the count is reported so the
-# drop is never silent.
+# its design matrix is rank-deficient. Such genes are dropped, and the count
+# is reported so the drop is never silent.
 #
 # This is not a corner case: in a transcriptome whose gene and transcript ids
 # coincide (tx_1 as both), a large share of the genes are singletons.
-tx_per_gene <- counts_long %>% dplyr::count(gene_id, name = "n_tx")
+#
+# COUNT TRANSCRIPTS, NOT ROWS. counts_long holds one row per (gene,
+# transcript, sample), so dplyr::count(gene_id) counts ROWS -- one transcript
+# seen in ten samples counts as ten. Used that way the filter below dropped
+# only the genes with a single (transcript x sample) observation and let every
+# real single-transcript gene through. They did not kill the run (DEXSeq
+# builds its DESeqDataSet with ignoreRank = TRUE, so a rank-deficient design
+# yields NA for that exon instead of aborting); they came back as NA p-value
+# and NA padj rows. Measured on the ten-sample cohort: 5,845 single-transcript
+# genes, 116 dropped, 5,729 NA rows.
+tx_per_gene <- counts_long %>%
+  dplyr::distinct(gene_id, transcript_id) %>%
+  dplyr::count(gene_id, name = "n_tx")
 genes_keep  <- tx_per_gene %>% dplyr::filter(n_tx >= 2) %>% dplyr::pull(gene_id)
 n_singleton_genes <- nrow(tx_per_gene) - length(genes_keep)
 if (n_singleton_genes > 0) {
@@ -224,6 +235,17 @@ if (n_singleton_genes > 0) {
       "single-transcript genes (no within-gene usage contrast)\n")
   counts_long <- counts_long %>% dplyr::filter(gene_id %in% genes_keep)
   counts_by_tx <- counts_by_tx %>% dplyr::filter(gene_id %in% genes_keep)
+}
+# FAIL CLOSED. Every gene that survived must still carry two transcripts.
+# Without this check the filter above can silently become a no-op, and the
+# surviving single-transcript genes return from DEXSeq as NA p-values that
+# look like a result.
+tx_after <- counts_long %>%
+  dplyr::distinct(gene_id, transcript_id) %>%
+  dplyr::count(gene_id, name = "n_tx")
+if (nrow(tx_after) > 0 && min(tx_after$n_tx) < 2) {
+  stop("ERROR: ", sum(tx_after$n_tx < 2),
+       " gene(s) with a single transcript survived the singleton filter.")
 }
 cat("  transcripts entering DEXSeq:",
     dplyr::n_distinct(counts_long$transcript_id), "in",
@@ -260,8 +282,17 @@ system.time({
   dxd <- estimateSizeFactors(dxd)
   # estimateDispersions can fail on tiny synthetic fixtures where
   # gene-wise dispersions don't span enough orders of magnitude for
-  # parametric curve fitting. Fall back to per-gene estimates in that
-  # case (still valid for moderate n; same code path as DESeq2).
+  # parametric curve fitting.
+  #
+  # THE GENE-WISE FALLBACK BELOW IS NOT A WORKING FALLBACK, and this comment
+  # used to claim it was ("same code path as DESeq2"). The estimator it calls
+  # is DESeq2's, and DESeq2's gene-wise step checks the full rank of
+  # `~ sample + exon + condition:exon` -- a design that is rank-deficient for
+  # EVERY gene (rank = ncol - 1, measured for 2-4 exons and 4-6 samples), so
+  # the fallback aborts with "the model matrix is not full rank" instead of
+  # producing gene-wise dispersions. DEXSeq's own dispersion path is
+  # exon-aware and does not have that problem; this branch is simply
+  # unreachable on real data, where the parametric fit succeeds.
   disp_ok <- tryCatch({
     dxd <- estimateDispersions(dxd, quiet = TRUE)
     TRUE
