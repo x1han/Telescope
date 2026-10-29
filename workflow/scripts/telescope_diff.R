@@ -3,7 +3,7 @@
 #
 # ROLE OF THIS FILE. The shipped Telescope CLI implements Module 4 as the
 # `telescope diff` subcommand. This R script is the REFERENCE implementation
-# of the same frozen specification (spec v0.1.9 F5 / v0.2.3 F4): it is the
+# of the same frozen specification: it is the
 # independent second implementation that the Rust port is checked against.
 #
 #   - It is kept here, beside the code it validates, so that the two cannot
@@ -15,17 +15,17 @@
 #     the Rust implementation deliberately shares no code path with them, which
 #     is what makes the comparison meaningful.
 #
-# Two-track design (spec v0.1.9 F5):
+# Two-track design:
 #   Track A (ΔPAU, usage): DEXSeq on (gene × transcript × sample) counts.
 #   Track B (ΔPAL, length): WLS / LMM dual-engine on
 #                            (transcript × sample) aggregated log2(polyA length).
 #
-# P1 critical: pseudoreplication-safe aggregation.
+# Pseudoreplication-safe aggregation.
 #   Track B MUST aggregate to one observation per (transcript × sample)
 #   BEFORE fitting. Per-read fitting inflates effective n by ~1e6× and
 #   p-values become meaningless.
 #
-# WLS / LMM dual engine (spec F5.2):
+# WLS / LMM dual engine:
 #   - When `#observations > #samples` (technical replicates, batch blocks,
 #     or any within-sample structure exist): use lmerTest::lmer with
 #     `(1 | sample_id)` random intercept + `weights = weight_sum`.
@@ -90,7 +90,7 @@ option_list <- list(
   make_option("--min-weight", type = "double", default = 10,
               help = "Min sum(posterior_weight) per (transcript x sample) [default %default]"),
   make_option("--min-counts", type = "double", default = 20,
-              help = "Min total counts per transcript for Track A (DEXSeq dispersion stability; spec v0.1.9 default = 20) [default %default]"),
+              help = "Min total counts per transcript for Track A (DEXSeq dispersion stability; default = 20) [default %default]"),
   make_option("--min-samples", type = "integer", default = 2,
               help = "Min number of samples per transcript for Track B [default %default]")
 )
@@ -313,7 +313,7 @@ cat("[telescope_diff]  wrote telescope_differential_PAU.tsv (",
 # Track B: ΔPAL (length) via lmerTest weighted LMM
 # =====================================================================
 cat("\n[telescope_diff] Track B: ΔPAL via lmerTest weighted LMM\n")
-cat("  P1: aggregating to (transcript × sample) BEFORE LMM to avoid pseudoreplication.\n")
+cat("  aggregating to (transcript × sample) BEFORE LMM to avoid pseudoreplication.\n")
 
 # Aggregate per-read rows to one observation per (transcript × sample).
 agg <- if (is.null(profiles_df)) {

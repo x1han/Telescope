@@ -7,7 +7,7 @@
 //! - Ambiguous reads (`candidate_count > 1`) enter the EM loop, whose
 //!   responsibility is `w_rk ∝ π_k · A_rk · F_rk · N(y_r; μ_k, σ_k²)`, with
 //!   `ln A_rk = (AS_rk − max_j AS_rj) / λ`, `ln_5p_k = β if g_k ≤ window`, and
-//!   a `ΔAS > 50` prune. See `solve_and_write_profile` for the parameters.
+//!   a `ΔAS` prune. See `solve_and_write_profile` for the parameters.
 //!
 //! Main items: `load_emission_parameters`, `solve_and_write_profile`,
 //! `write_read_assignments_parquet`, `write_emission_params_parquet`,
@@ -75,10 +75,8 @@ pub struct TranscriptParam {
     /// Mixing proportion π_k (initialized at iter 0, updated each M-step).
     pub alpha: f64,
     /// The M-step's W for this transcript: the E-step weight sum, pre-truncation
-    /// and pre-renormalisation.
-    ///
-    /// NOT recoverable from `alpha`: `alpha` is W divided by the total molecule
-    /// count, and the divisor is recorded nowhere.
+    /// and pre-renormalisation. NOT recoverable from `alpha` (that is W divided by
+    /// the total molecule count, and the divisor is recorded nowhere).
     ///
     /// Stamped after the EM loop from the FINAL E-step's weights, so it is one
     /// iteration behind the M-step's own `sigma2`.
@@ -202,23 +200,18 @@ pub fn load_emission_parameters<P: AsRef<Path>>(
 
 /// Run TEL-EM and write `telescope.profile.parquet`.
 ///
-/// `aln_weight_lambda` scales the alignment term `ln A_rk = (AS_rk − max_j
-/// AS_rj) / λ`; it must be > 0 and only matters for `candidate_count > 1`.
-/// `output_em_trace`, if `Some`, receives `(iter_index, log_likelihood,
-/// mean_entropy)` per EM iteration.
-///
 /// Evidence terms, in the form that must not be re-derived:
-///     `g_k` = `s_k − 1`, the 1-BASED start of the read's BEST alignment to
+///     `g_k` = `s_k - 1`, the 1-BASED start of the read's BEST alignment to
 ///     candidate k, in candidate k's OWN cDNA coordinates (never a genomic span).
 ///     `ln_5p_k` = `five_prime_weight` if `g_k <= five_prime_window` else 0.0.
-///     prune: drop candidates with `ΔAS_k > prune_max_delta_as`, against the
+///     prune: drop candidates with `Delta-AS_k > prune_max_delta_as`, against the
 ///     read's best AS.
-///     `w_k ∝ π_k · exp(ln_a_k + ln_5p_k)`.
+///     `w_k` is proportional to `pi_k * exp(ln_a_k + ln_5p_k)`.
 ///
-/// This is the shipped entry point, at the default `SIGMA2_DOF_OFFSET` (2.0,
-/// Model A); the production binary cannot reach any other `c`.
-///
-/// The argument list is many adjacent positional scalars — do not reorder it.
+/// `aln_weight_lambda` scales the alignment term and must be > 0;
+/// `output_em_trace` receives `(iter_index, log_likelihood, mean_entropy)` per EM
+/// iteration. The argument list is many adjacent positional scalars -- do not
+/// reorder it.
 #[allow(clippy::too_many_arguments)]
 pub fn solve_and_write_profile<P: AsRef<Path>>(
     graph: FlatEvidenceGraph,
@@ -257,15 +250,13 @@ pub fn solve_and_write_profile<P: AsRef<Path>>(
     )
 }
 
-/// `solve_and_write_profile` with the σ² regularisation degrees-of-freedom
-/// offset `c` supplied by the caller (same arguments, in the same order, plus
-/// this one).
+/// `solve_and_write_profile` with the σ² regularisation degrees-of-freedom offset
+/// `c` supplied by the caller (same arguments, in the same order, plus this one).
 ///
-/// `c` is the trailing `+ c` of the σ² denominator; the numerator stays Model
-/// A's for every `c`, so raising `c` only sharpens the Gaussian. `c = 3` is
-/// NOT Model B — read `SIGMA2_DOF_OFFSET`.
-///
-/// Not reachable from the production `telescope` binary.
+/// `c` is the trailing `+ c` of the σ² denominator; the numerator stays Model A's
+/// for every `c`, so raising `c` only sharpens the Gaussian. `c = 3` is NOT Model
+/// B -- read `SIGMA2_DOF_OFFSET`. Not reachable from the production `telescope`
+/// binary.
 #[allow(clippy::too_many_arguments)]
 pub fn solve_and_write_profile_with_dof_offset<P: AsRef<Path>>(
     graph: FlatEvidenceGraph,
@@ -331,8 +322,7 @@ fn solve_and_write_profile_impl<P: AsRef<Path>>(
     //
     // At 0.0 the score is still `ln alpha_k + ln A_rk + ln_5p_k`: the abundance
     // prior survives at any weight, so that arm is NOT "alignment-only", and it
-    // cannot be neutralised from outside because the M-step re-estimates
-    // `alpha`.
+    // cannot be neutralised from outside because the M-step re-estimates `alpha`.
     poly_a_weight: f64,
     five_prime_window: u32,
     prune_max_delta_as: i32,
@@ -350,13 +340,13 @@ fn solve_and_write_profile_impl<P: AsRef<Path>>(
     // `solve_and_write_profile_with_dof_offset` (which validates it first).
     sigma2_dof_offset: f64,
 ) -> Result<TelEmStats> {
-    // API-LEVEL DEFENCE: the CLI forces `poly_a_weight = 0` when the graph has
-    // no poly(A), but a library caller never goes through the CLI. Pairing a
-    // placeholder graph with a positive weight feeds a constant emission into
-    // the E-step and silently distorts every posterior.
+    // API-LEVEL DEFENCE: the CLI forces `poly_a_weight = 0` when the graph has no
+    // poly(A), but a library caller never goes through the CLI. Pairing a
+    // placeholder graph with a positive weight feeds a constant emission into the
+    // E-step and silently distorts every posterior.
     //
-    // The check is on the graph's provenance flag, not on `log_pal` values: a
-    // real BAM can legitimately contain reads whose `pt:i` is absent.
+    // The check is on the graph's provenance flag, not on `log_pal` values: a real
+    // BAM can legitimately contain reads whose `pt:i` is absent.
     if poly_a_weight > 0.0 && graph.poly_a_is_placeholder {
         anyhow::bail!(
             "FATAL: poly_a_weight = {poly_a_weight} on a graph built with \
@@ -446,10 +436,10 @@ fn solve_and_write_profile_impl<P: AsRef<Path>>(
     }
     let n_matched = params.iter().filter(|p| p.is_some()).count();
 
-    // ID-SPACE GUARD. `graph.transcript_names` comes from the BAM @SQ header;
-    // the emission parquet is keyed by whatever `build-emission` was handed, and
-    // the two can be DIFFERENT SPACES. A zero overlap makes every `params[i]`
-    // `None`, so every read takes the ghost-drop path and the run still exits 0.
+    // ID-SPACE GUARD. `graph.transcript_names` comes from the BAM @SQ header; the
+    // emission parquet is keyed by whatever `build-emission` was handed, and the
+    // two can be DIFFERENT SPACES. A zero overlap makes every `params[i]` `None`,
+    // so every read takes the ghost-drop path and the run still exits 0.
     //
     // Zero overlap is never a legitimate configuration, so refuse it; partial
     // overlap is legitimate and is NOT checked here.
@@ -531,13 +521,9 @@ fn solve_and_write_profile_impl<P: AsRef<Path>>(
 
     // The `(mu, sigma2)` the LAST E-step actually consumed.
     //
-    // "Did poly(A) have any say on this read?" is a property of the evidence
-    // THE POSTERIOR WAS BUILT FROM. The M-step rewrites `p.mu` / `p.sigma2` but
-    // only under `poly_a_weight > 0.0`, so a poly(A) A/B would read DIFFERENT
-    // states at the output stage while having consumed the SAME state.
-    //
-    // ONE snapshot, TWO consumers — the telemetry and the sidecar — so both
-    // describe the same state by construction.
+    // The M-step rewrites `p.mu`/`p.sigma2` under `poly_a_weight > 0.0`, so the
+    // telemetry must read the PRE-M-step state. ONE snapshot, TWO consumers —
+    // the telemetry and the sidecar — so both describe the same state.
     let mut last_estep_params: Vec<Option<TranscriptParam>> = Vec::new();
 
     // "Did an M-step actually execute?" -- set where the M-step runs, NOT
@@ -548,10 +534,9 @@ fn solve_and_write_profile_impl<P: AsRef<Path>>(
     // The W the LAST M-step actually consumed, captured by moving ownership out
     // of the M-step block (a `Vec` move, not a clone).
     //
-    // `p.em_accum_weight` is stamped at the end of the run from a FRESH
-    // suffstats pass over the post-loop `final_weights`, while `p.sigma2` in
-    // the same row came from the M-step's OWN suffstats. The two are one
-    // E-step apart.
+    // `p.em_accum_weight` is stamped at the end of the run from a FRESH suffstats
+    // pass over the post-loop `final_weights`, while `p.sigma2` in the same row
+    // came from the M-step's OWN suffstats. The two are one E-step apart.
     let mut last_mstep_w: Vec<f64> = Vec::new();
 
     for iter in 0..max_iter {
@@ -564,7 +549,7 @@ fn solve_and_write_profile_impl<P: AsRef<Path>>(
                 let y = mol.log_pal as f64;
 
                 // Alignment-score reference point for this read. Taken over the
-                // FULL `0..candidate_count` range — before competence masking, and
+                // FULL `0..candidate_count` range -- before competence masking, and
                 // over candidates the `if let Some(ref p) = params[tx_id]` arm
                 // below skips entirely.
                 //
@@ -583,29 +568,27 @@ fn solve_and_write_profile_impl<P: AsRef<Path>>(
                     let tx_id = graph.candidate_pool[idx] as usize;
 
                     // ΔAS is a MAGNITUDE: the read's best score minus this
-                    // candidate's, so ΔAS >= 0. SIGN MATTERS: the prune
-                    // thresholds the magnitude, the log term negates it.
+                    // candidate's, so ΔAS >= 0. The prune thresholds the
+                    // magnitude, the log term negates it.
                     //
                     // `saturating_sub`, not `-`: this sits OUTSIDE the
                     // `if let Some(params)`, so it runs for candidates with no
-                    // emission row. A plain subtraction WRAPS under `--release`,
-                    // and a wrapped negative ΔAS satisfies
-                    // `delta_as > prune_max_delta_as` as FALSE.
+                    // emission row, and a plain subtraction WRAPS under
+                    // `--release` into a negative ΔAS that the prune ignores.
                     let delta_as = max_as.saturating_sub(graph.candidate_as[idx]);
 
                     // ΔAS prune: drop candidates whose alignment score is more
                     // than `prune_max_delta_as` below the read's best.
                     //
-                    // `-inf` rather than a bare `continue`, matching the
-                    // competence mask below: the two are observationally
-                    // IDENTICAL here because `weights` is built with
-                    // `filter(ll > -inf)`, and would DIVERGE if that filter were
-                    // removed.
+                    // `-inf` rather than a bare `continue`, matching the competence
+                    // mask below: the two are observationally IDENTICAL here
+                    // because `weights` is built with `filter(ll > -inf)`, and
+                    // would DIVERGE if that filter were removed.
                     //
                     // Placed OUTSIDE the `if let Some(params)` so the prune is a
-                    // property of the alignment evidence alone. It cannot empty
-                    // a read: the argmax has `delta_as == 0` and the threshold
-                    // is validated `>= 0` above.
+                    // property of the alignment evidence alone. It cannot empty a
+                    // read: the argmax has `delta_as == 0` and the threshold is
+                    // validated `>= 0` above.
                     if delta_as > prune_max_delta_as {
                         raw.push((tx_id, f64::NEG_INFINITY));
                         continue;
@@ -625,9 +608,9 @@ fn solve_and_write_profile_impl<P: AsRef<Path>>(
                     // (read, candidate) exactly like `AS`, so it belongs in no
                     // accumulator and no M-step.
                     //
-                    // Unlike `ln_a`, `ln_5p` is a step function of one
-                    // coordinate: it can only reorder candidates, never delete
-                    // them — deletion is the prune's job.
+                    // Unlike `ln_a`, `ln_5p` is a step function of one coordinate:
+                    // it can only reorder candidates, never delete them --
+                    // deletion is the prune's job.
                     let ln_5p = if graph.candidate_5p_gap[idx] <= five_prime_window {
                         five_prime_weight
                     } else {
@@ -640,12 +623,11 @@ fn solve_and_write_profile_impl<P: AsRef<Path>>(
                             raw.push((tx_id, f64::NEG_INFINITY));
                         } else {
                             // `ln alpha` is the MIXTURE PRIOR, not part of the
-                            // poly(A) emission, so it is OUTSIDE the
-                            // poly_a_weight scale. At `poly_a_weight = 0` the
-                            // E-step would never read alpha, the M-step's
-                            // update would affect no posterior, and the "EM"
-                            // would degenerate into a one-shot static alignment
-                            // scorer with an inert M-step.
+                            // poly(A) emission, so it is OUTSIDE the poly_a_weight
+                            // scale. At `poly_a_weight = 0` the E-step would never
+                            // read alpha, the M-step's update would affect no
+                            // posterior, and the "EM" would degenerate into a
+                            // one-shot static alignment scorer with an inert M-step.
                             let ll = p.alpha.ln()
                                 + poly_a_weight
                                     * (-(p.sigma2.sqrt()).ln()
@@ -758,7 +740,7 @@ fn solve_and_write_profile_impl<P: AsRef<Path>>(
                 // a W column that empties itself would make the sidecar
                 // unreadable on exactly the configuration that most needs it.
                 //
-                // This is `p.em_accum_weight`, NOT the `accum_w` local above — the
+                // This is `p.em_accum_weight`, NOT the `accum_w` local above -- the
                 // field carries the SUM out of the loop, the local is read-only.
                 p.em_accum_weight = w_sum;
 
@@ -781,9 +763,9 @@ fn solve_and_write_profile_impl<P: AsRef<Path>>(
                     // the denominator, so which is larger is decided by W and by the mu shift.
                     // Do not claim an ordering.
                     //
-                    // The trailing `+ 2` in the denominator is `sigma2_dof_offset`, pinned to
-                    // `SIGMA2_DOF_OFFSET == 2.0`. At other `c` this derivation no longer holds,
-                    // which is why `c` is a knob and not a second estimator.
+                    // The trailing `+ 2` is `sigma2_dof_offset`, pinned to
+                    // `SIGMA2_DOF_OFFSET == 2.0`. At other `c` this derivation no longer
+                    // holds, which is why `c` is a knob and not a second estimator.
                     p.sigma2 = (sq_dev_new + 2.0 * beta_0 * p.sigma2_cohort)
                         / (w_sum + 2.0 * nu_0 + sigma2_dof_offset);
                     p.sigma2 = p.sigma2.max(INSTRUMENTAL_PAL_NOISE_FLOOR);
@@ -808,21 +790,20 @@ fn solve_and_write_profile_impl<P: AsRef<Path>>(
 
     // STAMP THE RUN'S ACTUAL W AND FINALISATION STATE INTO THE SNAPSHOT.
     //
-    // The M-step's own assignment is not enough: the snapshot the sidecar is
-    // written from is taken BEFORE the M-step runs, and on convergence the loop
-    // breaks before the M-step too.
+    // The snapshot the sidecar is written from is taken BEFORE the M-step runs, and on
+    // convergence the loop breaks before the M-step too -- so the M-step's own
+    // assignment is not enough.
     //
     // `accumulate_mstep_suffstats` is a pure function of (`params` presence, the
-    // graph, the indices, `final_weights`), and `final_weights` is exactly what
-    // the profile writer consumes — so the sidecar's W describes the SAME
-    // weights that produced that profile.
+    // graph, the indices, `final_weights`), and `final_weights` is exactly what the
+    // profile writer consumes -- so the sidecar's W describes the SAME weights that
+    // produced that profile.
     //
-    // The convergence `break` fills `final_weights` before breaking, so W is
-    // stamped whether or not an M-step ran; `em_finalized` says which.
+    // The convergence `break` fills `final_weights` before breaking, so W is stamped
+    // whether or not an M-step ran; `em_finalized` says which.
     //
-    // `alpha` is stamped here too: `alpha == W / n_total_molecules` by
-    // definition, so stamping one and not the other leaves a row whose two
-    // columns disagree.
+    // `alpha` is stamped here too: `alpha == W / n_total_molecules` by definition, so
+    // stamping one and not the other leaves a row whose two columns disagree.
     let mut max_dw_phase_abs = 0.0_f64;
     let mut max_dw_phase_rel = 0.0_f64;
     {
@@ -990,10 +971,8 @@ fn solve_and_write_profile_impl<P: AsRef<Path>>(
     // `min_weight` is a CALLER-SUPPLIED parameter: at the shipped 0.01 a read whose
     // losing candidate sits below 0.01 loses that row and has its survivors
     // renormalised to 1.0, so the arm that shifts mass onto a candidate emits MORE
-    // rows than the arm that does not.
-    //
-    // Any ablation whose arms emit different row counts must be re-run at
-    // `min_weight = 0` before its delta is quoted.
+    // rows than the arm that does not. Any ablation whose arms emit different row
+    // counts must be re-run at `min_weight = 0` before its delta is quoted.
     for (i, weights) in final_weights.into_iter().enumerate() {
         let mol_idx = ambiguous_indices[i];
         let mol = &graph.molecules[mol_idx];
@@ -1042,11 +1021,11 @@ fn solve_and_write_profile_impl<P: AsRef<Path>>(
         if weights.is_empty() {
             n_dropped_no_competent_candidates += 1;
             // GHOST DECOMPOSITION. `weights.is_empty()` on its own conflates three
-            // unrelated causes — absent emission row, `is_polyA_competent == false`, and
-            // `alpha <= 0.0` — and cannot be attributed without a census. The census
-            // replays the E-step's own filter over the read's ORIGINAL candidate range,
-            // against `last_estep_params` for the same reason the telemetry above uses
-            // it: `final_weights` came from the pre-M-step model.
+            // unrelated causes -- absent emission row, `is_polyA_competent == false`,
+            // and `alpha <= 0.0` -- and cannot be attributed without a census. The
+            // census replays the E-step's own filter over the read's ORIGINAL
+            // candidate range, against `last_estep_params` for the same reason the
+            // telemetry above uses it: `final_weights` came from the pre-M-step model.
             //
             // `n_dropped_no_competent_candidates` stays the TOTAL, so the three cause
             // counters are a partial decomposition of it.
@@ -1069,14 +1048,15 @@ fn solve_and_write_profile_impl<P: AsRef<Path>>(
                 // Split the degenerate reads by WHY they are flat.
                 //
                 // `weights` carries the GLOBAL transcript id of every surviving candidate,
-                // and `params` is indexed by that same global id — so the imputed flag is
-                // one lookup, with no second pass and no change to the hot path's arithmetic.
+                // and `params` is indexed by that same global id -- so the imputed flag
+                // is one lookup, with no second pass and no change to the hot path's
+                // arithmetic.
                 //
-                // This deliberately does NOT also split on "ΔAS == 0 among the survivors":
-                // `raw` is NOT index-aligned with the candidate list (a candidate with no
-                // emission row pushes NOTHING), so the survivors cannot be mapped back to
-                // `graph.candidate_as` positions without duplicating the E-step's survival
-                // predicate.
+                // This deliberately does NOT also split on "ΔAS == 0 among the
+                // survivors": `raw` is NOT index-aligned with the candidate list (a
+                // candidate with no emission row pushes NOTHING), so the survivors
+                // cannot be mapped back to `graph.candidate_as` positions without
+                // duplicating the E-step's survival predicate.
                 let mut all_imputed = true;
                 for &(tx_idx, w) in &weights {
                     if w <= 0.0 {
@@ -1103,13 +1083,12 @@ fn solve_and_write_profile_impl<P: AsRef<Path>>(
         //
         //     top_tx_id == Some(..)  IMPLIES  that read has a profile row.
         //
-        // Three shapes, and the middle one is the only silent one: a GHOST read has no
-        // profile row (and is recorded with `top_tx_id: None`, because "could not
-        // assign it" and "never in this run" are different facts); a `min_weight`-culled
-        // read HAS a real argmax and IS published under it at weight 1.0, counted as
-        // `reads_retained_by_argmax` so a forced assignment is never mistaken for an
-        // earned one; and a read with a surviving candidate is recorded with a real
-        // `top_tx_id`.
+        // Three shapes: a GHOST read has no profile row (recorded with
+        // `top_tx_id: None`, because "could not assign it" and "never in this run"
+        // are different facts); a `min_weight`-culled read HAS a real argmax and IS
+        // published under it at weight 1.0, counted as `reads_retained_by_argmax` so
+        // a forced assignment is never mistaken for an earned one; and a read with a
+        // surviving candidate is recorded with a real `top_tx_id`.
         //
         // The argmax is computed ONCE, here, and unconditionally: the output stage
         // below needs the same answer, and a second copy of this fold would be a
@@ -1140,15 +1119,15 @@ fn solve_and_write_profile_impl<P: AsRef<Path>>(
                 // `None` only on the ghost path: the fold never ran, so there is no candidate
                 // to name.
                 //
-                // The `params` lookup below cannot fail for a tx that is in `weights` — the
-                // E-step only pushes a tx for which `params[tx_id]` is `Some`. So the
-                // `get`/`and_then` is defensive plumbing, NOT the reason the
+                // The `params` lookup below cannot fail for a tx that is in `weights` --
+                // the E-step only pushes a tx for which `params[tx_id]` is `Some`. So
+                // the `get`/`and_then` is defensive plumbing, NOT the reason the
                 // `top_tx_id == Some(..) => profile row` implication holds.
                 //
-                // That implication rests on a separate precondition: the E-step pushes `-inf`
-                // for any candidate with `!p.is_competent || p.alpha <= 0.0`, so `weights` can
-                // contain competent candidates ONLY. Neither the fold nor this lookup
-                // re-checks competence.
+                // That implication rests on a separate precondition: the E-step pushes
+                // `-inf` for any candidate with `!p.is_competent || p.alpha <= 0.0`, so
+                // `weights` can contain competent candidates ONLY. Neither the fold
+                // nor this lookup re-checks competence.
                 top_tx_id: top.and_then(|tx| {
                     params
                         .get(tx)
@@ -1166,7 +1145,7 @@ fn solve_and_write_profile_impl<P: AsRef<Path>>(
 
         // Renormalize the retained weights so each read's emitted posterior weights
         // sum to 1.0. The denominator is taken over the rows actually emitted, i.e.
-        // `{w >= min_weight}` — the truncation above discards real probability mass.
+        // `{w >= min_weight}` -- the truncation above discards real probability mass.
         // This is a *pure output-stage* correction: the M-step consumed the
         // untruncated `final_weights` before this point.
         //
@@ -1178,14 +1157,14 @@ fn solve_and_write_profile_impl<P: AsRef<Path>>(
         // THE COUPLED PREDICATE. This filter and the `w < min_weight` test in the
         // emit loop below are two spellings of ONE decision, and they must agree: if
         // this returned 0 while the loop still emitted the argmax, `w_norm` would be
-        // `w / 0.0` and a NaN would be written into `posterior_weight` — and nothing
+        // `w / 0.0` and a NaN would be written into `posterior_weight` -- and nothing
         // in the suite would go red, because a NaN compares false against every
         // expectation.
         //
         // When `min_weight` culls EVERY live candidate, the read would otherwise
         // vanish from both tables. So the argmax is retained on its own and
-        // `retained_sum` collapses to its weight, which makes its `w_norm` exactly
-        // 1.0. `reads_retained_by_argmax` counts exactly those reads.
+        // `retained_sum` collapses to its weight, making its `w_norm` exactly 1.0.
+        // `reads_retained_by_argmax` counts exactly those reads.
         let retained_sum: f64 = {
             let s: f64 = weights
                 .iter()
@@ -1214,8 +1193,8 @@ fn solve_and_write_profile_impl<P: AsRef<Path>>(
                 // so `w < 0.0` is never true. A test pins that.
                 //
                 // The argmax is the ONE exception: it is culled from the prune count because
-                // it is NOT culled — it is emitted, one line below. Counting a candidate as
-                // pruned while also emitting a row for it would double-count it against
+                // it is NOT culled -- it is emitted, one line below. Counting a candidate
+                // as pruned while also emitting a row for it would double-count it against
                 // `terminal_sum()`.
                 ledger.pruned_min_weight += 1;
                 continue;
@@ -1259,22 +1238,21 @@ fn solve_and_write_profile_impl<P: AsRef<Path>>(
         Field::new("transcript_id", DataType::Utf8, false),
         Field::new("polyA_length", DataType::Int32, false),
         Field::new("posterior_weight", DataType::Float64, false),
-        // The two columns below are OBSERVATIONAL ONLY — nothing in TEL-EM reads them
+        // The two columns below are OBSERVATIONAL ONLY -- nothing in TEL-EM reads them
         // back, and they do not participate in A_rk, the `min_weight` cutoff, or the
         // renormalization. Both are per READ properties repeated identically on every
         // row of that read.
         //
-        // CAVEAT — THE EMITTED DISTRIBUTION IS SURVIVAL-BIASED. Both columns ride on
-        // rows that survive TWO independent filters: the E-step's `ΔAS >
+        // CAVEAT -- THE EMITTED DISTRIBUTION IS SURVIVAL-BIASED. Both columns ride on
+        // rows that survive TWO independent filters: the E-step's `Delta-AS >
         // prune_max_delta_as` prune, and the `min_weight` cutoff. Reads with decisive
         // evidence are therefore over-represented relative to genuinely contested
         // reads. Any analysis of these columns MUST group by `read_id` and report
         // the read-level coverage rate alongside the distribution.
         //
         // The molecule's ORIGINAL candidate count, captured before BOTH filters drop
-        // rows. It differs from the number of emitted rows whenever either fired, and
-        // it is NOT the count the E-step normalised over (the E-step saw
-        // `candidate_count − n_pruned`).
+        // rows. It is NOT the count the E-step normalised over (the E-step saw
+        // `candidate_count - n_pruned`).
         Field::new("n_candidates_before_cutoff", DataType::UInt16, false),
         // Second-largest / largest `AS:i` over the read's full candidate range.
         // 0.0 when the read has no second candidate or when no candidate carries
@@ -1308,20 +1286,19 @@ fn solve_and_write_profile_impl<P: AsRef<Path>>(
     // THE CANDIDATE CONSERVATION TRIPWIRE.
     //
     // Deliberately AFTER the parquet is closed: the profile is the expensive
-    // artefact, and deleting it because an instrumentation counter disagreed
-    // would destroy the evidence needed to find out why.
-    //
-    // Deliberately HERE and not in the CLI: `solve_and_write_profile` is a public
-    // entry point and every test calls it directly, so an invariant that only the
-    // binary checks is one the test suite never exercises.
+    // artefact, and deleting it because an instrumentation counter disagreed would
+    // destroy the evidence needed to find out why. Deliberately HERE and not in the
+    // CLI: `solve_and_write_profile` is a public entry point and every test calls it
+    // directly, so an invariant only the binary checks is one the suite never
+    // exercises.
     //
     // A non-zero value means one of exactly two things: (a) the census and the
     // E-step have drifted apart, so a class of candidate reached no terminal
     // bucket; or (b) a candidate produced a non-finite posterior, so
     // `filter(ll > -inf)` dropped it while the census counted it live.
     //
-    // It does NOT mean candidates are being lost from the profile: `min_weight`
-    // is a caller-supplied cutoff and a candidate falling below it belongs in
+    // It does NOT mean candidates are being lost from the profile: `min_weight` is a
+    // caller-supplied cutoff and a candidate falling below it belongs in
     // `pruned_min_weight`.
     anyhow::ensure!(
         ledger.deficit() == 0,
@@ -1374,7 +1351,7 @@ fn solve_and_write_profile_impl<P: AsRef<Path>>(
         //
         // The `None`s left are exactly the reads with no profile row AND no reason to
         // be counted: transcripts absent from the emission parquet, and
-        // `min_weight`-culled reads. Ghosts are deliberately NOT in this list — they
+        // `min_weight`-culled reads. Ghosts are deliberately NOT in this list -- they
         // are recorded, because "unassignable" and "never seen" must not collapse
         // into the same absence when two runs are compared.
         *out = read_assign.into_iter().flatten().collect();
@@ -1414,32 +1391,26 @@ fn poly_a_length_from_log2(log_pal: f32) -> i32 {
 }
 
 /// DEGRADATION TELEMETRY. Returns `(n_with_emission, all_identical)` for the
-/// read's candidate set. `all_identical` is true iff every candidate that
-/// carries an emission row shares one identical `(mu, sigma2)` pair, so the
-/// poly(A) term cancels exactly in every pairwise odds ratio.
+/// read's candidate set. `all_identical` is true iff every candidate that carries
+/// an emission row shares one identical `(mu, sigma2)` pair, so the poly(A) term
+/// cancels exactly in every pairwise odds ratio.
 ///
 /// The comparison is EXACT `==`, NOT A TOLERANCE: the shared fits are
-/// bit-identical copies by construction, so `==` fires on exactly the rows the
-/// fallback produced. Do not loosen it — the metric would then over-report
-/// zero discriminative power, the expensive direction for a degradation
-/// headline.
+/// bit-identical copies by construction. Do not loosen it -- the metric would then
+/// over-report zero discriminative power.
 ///
-/// A candidate with NO emission row is skipped rather than treated as a
-/// mismatch: a ghost transcript has no `(mu, sigma2)` to disagree with, and it
-/// is already counted by `n_dropped_no_competent_candidates`. A read with no
-/// candidate that has an emission row at all returns `(0, false)`.
+/// A candidate with NO emission row is skipped rather than treated as a mismatch: a
+/// ghost transcript has no `(mu, sigma2)` to disagree with. A read with no
+/// candidate that has an emission row at all returns `(0, false)`; a read with
+/// exactly ONE such candidate returns `(1, true)`, which is what makes that
+/// vacuity visible.
 ///
-/// A read with exactly ONE candidate carrying an emission row returns
-/// `(1, true)`: nothing was compared, so the count is what makes that
-/// vacuity visible. `zero-power_all` keeps counting those reads;
-/// `zero-power_resolved` excludes them.
-///
-/// The read's FULL candidate range is used, not the post-prune /
-/// post-truncation set: the question is what evidence the read HAD.
+/// The read's FULL candidate range is used, not the post-prune / post-truncation
+/// set: the question is what evidence the read HAD.
 ///
 /// The loop never early-returns: an early return would undercount the present
-/// candidates on exactly the DISAGREEING reads — the ones where poly(A)
-/// actually did something.
+/// candidates on exactly the DISAGREEING reads -- the ones where poly(A) actually
+/// did something.
 fn polya_emission_count_and_identity(
     graph: &FlatEvidenceGraph,
     mol: &MoleculeEvidence,
@@ -1475,23 +1446,19 @@ const ZERO_POWER_MIN_EMISSION_CANDIDATES: usize = 2;
 /// Per-read observational statistic: `second_largest_AS / largest_AS` over the
 /// read's FULL candidate range, emitted on every row of that read.
 ///
-/// Three defined cases, all yielding `0.0`:
-/// - `candidate_count == 1` — there is no second candidate.
-/// - `largest_AS <= 0` — every candidate lacks an `AS:i` tag, so the ratio
-///   would be `0/0`; `0.0` means "no alignment evidence", not "a tie".
-/// - `second_AS < 0` — `AS` is a raw `i32` and a malformed BAM can carry a
-///   negative value, which would otherwise yield a negative "proportion".
+/// Three defined cases, all yielding `0.0`: `candidate_count == 1` (no second
+/// candidate); `largest_AS <= 0` (every candidate lacks an `AS:i` tag, so `0.0`
+/// means "no alignment evidence", not "a tie"); and `second_AS < 0` (`AS` is a raw
+/// `i32` and a malformed BAM can carry a negative value). The `0.0` SENTINEL is
+/// deliberately overloaded across those three, so a query of the form "fraction of
+/// reads with `max_as_ratio < 0.5`" silently pools all three.
 ///
-/// Otherwise `second_largest / largest`, in `[0, 1]`; the division is done in
-/// `f64` and cast down, because an `f32` division of two `i32`s would lose
-/// precision before the narrowing.
+/// Otherwise `second_largest / largest`, in `[0, 1]`; the division is done in `f64`
+/// and cast down, because an `f32` division of two `i32`s would lose precision
+/// before the narrowing.
 ///
-/// The `0.0` SENTINEL is deliberately overloaded across those three
-/// situations, so a query of the form "fraction of reads with
-/// `max_as_ratio < 0.5`" silently pools all three.
-///
-/// NOT USED BY THE SOLVER: no threshold reads it, and it is deliberately NOT
-/// fed into `A_rk`. It is emitted so the decision can be made on real data.
+/// NOT USED BY THE SOLVER: no threshold reads it, and it is deliberately NOT fed
+/// into `A_rk`. It is emitted so the decision can be made on real data.
 fn read_max_as_ratio(graph: &FlatEvidenceGraph, mol: &MoleculeEvidence) -> f32 {
     if mol.candidate_count < 2 {
         return 0.0;
@@ -1521,21 +1488,20 @@ fn read_max_as_ratio(graph: &FlatEvidenceGraph, mol: &MoleculeEvidence) -> f32 {
 
 /// Why a read's candidate set contains nothing that could carry posterior mass.
 ///
-/// The census is taken over the read's ORIGINAL candidate range, and each
-/// bucket is defined by the E-step's own decision procedure, in the E-step's
-/// own order: a read is a ghost exactly when the E-step's `max_ll` came out
-/// `-inf`.
+/// The census is taken over the read's ORIGINAL candidate range, and each bucket is
+/// defined by the E-step's own decision procedure, in the E-step's own order: a read
+/// is a ghost exactly when the E-step's `max_ll` came out `-inf`.
 ///
-/// The two ways a candidate can be absent from the E-step's `raw` vector are
-/// NOT the same and must not share a bucket:
-/// - **pruned** (`delta_as > prune_max_delta_as`) — the E-step pushes `-inf`,
-///   so the entry IS in `raw`;
-/// - **no emission row** — the `if let Some(ref p) = params[tx_id]` arm has no
+/// The two ways a candidate can be absent from the E-step's `raw` vector are NOT
+/// the same and must not share a bucket:
+/// - **pruned** (`delta_as > prune_max_delta_as`) -- the E-step pushes `-inf`, so
+///   the entry IS in `raw`;
+/// - **no emission row** -- the `if let Some(ref p) = params[tx_id]` arm has no
 ///   `else`, so the entry is never pushed at all.
 ///
 /// The prune is counted in its own bucket for the ledger's benefit and still
-/// excluded from cause attribution: the two questions are different — "would
-/// padding have saved this read?" and "where did this candidate go?".
+/// excluded from cause attribution: "would padding have saved this read?" and
+/// "where did this candidate go?" are different questions.
 struct CandidateAvailability {
     /// No emission row at all — the candidate never reached `raw`.
     n_missing: usize,
@@ -1603,8 +1569,8 @@ enum GhostCause {
 /// defined this way.
 ///
 /// `params` must be `last_estep_params`, NOT `params`: the census explains a
-/// `final_weights` produced from the pre-M-step model, and `alpha` is exactly
-/// the field the M-step rewrites.
+/// `final_weights` produced from the pre-M-step model, and `alpha` is exactly the
+/// field the M-step rewrites.
 fn candidate_availability(
     graph: &FlatEvidenceGraph,
     mol: &MoleculeEvidence,
@@ -1665,27 +1631,26 @@ fn candidate_availability(
 ///
 /// WHAT "TERMINAL FATE" MEANS, and the one trap in this struct. A candidate is
 /// counted exactly once, at the point where it stops moving. The E-step census
-/// splits the contested read's candidates four ways, and the survivor bucket
-/// is then split three ways at the output stage — so the survivors are counted
-/// there and NOT here. `live_candidates` is recorded because
+/// splits the contested read's candidates four ways, and the survivor bucket is
+/// then split three ways at the output stage -- so the survivors are counted there
+/// and NOT here. `live_candidates` is recorded because
 /// [`CandidateLedger::census_vs_estep_deficit`] needs it, but
 /// [`CandidateLedger::deficit`] deliberately does not sum it: adding an
 /// intermediate to the sum of its own descendants double-counts every live
 /// candidate.
 ///
 /// SCOPE. `total_candidates` counts every candidate of every molecule with
-/// `candidate_count >= 1`, including candidates on reads that emitted nothing
-/// at all. That is the point: a read that produced no row contributes to the
-/// left and to no row on the right, and the ledger's job is to make it
-/// visible.
+/// `candidate_count >= 1`, including candidates on reads that emitted nothing at
+/// all. That is the point: a read that produced no row contributes to the left
+/// and to no row on the right, and the ledger's job is to make it visible.
 ///
-/// The two molecule populations are counted separately because they cannot die
-/// the same way. A single-candidate molecule has `max_as` equal to its own
-/// `AS`, so `delta_as == 0` and the `ΔAS` prune can never fire on it; the
-/// unambiguous arm also applies no `alpha` mask, by design, since its
-/// posterior is the deterministic `w ≡ 1.0`. Its three buckets are therefore
-/// exhaustive among themselves and there is no `unambig_*_pruned` column
-/// because there is nothing to put in it.
+/// The two molecule populations are counted separately because they cannot die the
+/// same way. A single-candidate molecule has `max_as` equal to its own `AS`, so
+/// `delta_as == 0` and the `Delta-AS` prune can never fire on it; the unambiguous
+/// arm also applies no `alpha` mask, by design, since its posterior is the
+/// deterministic `w == 1.0`. Its three buckets are therefore exhaustive among
+/// themselves and there is no `unambig_*_pruned` column because there is nothing
+/// to put in it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CandidateLedger {
     /// Σ `MoleculeEvidence::candidate_count` over molecules with
@@ -1706,9 +1671,9 @@ pub struct CandidateLedger {
 
     /// Live candidates that were culled by `min_weight` AND not emitted.
     ///
-    /// The argmax of an all-culled read is culled-but-emitted, so it is NOT
-    /// counted here; see `reads_retained_by_argmax`. Counting both would
-    /// double-count that candidate against `terminal_sum()`.
+    /// The argmax of an all-culled read is culled-but-emitted, so it is NOT counted
+    /// here; see `reads_retained_by_argmax`. Counting both would double-count that
+    /// candidate against `terminal_sum()`.
     ///
     /// Not a constant: `min_weight` is a caller-supplied parameter, so this bucket
     /// moves when the flag moves. At `min_weight = 0.0` it is provably exactly 0.
@@ -1718,9 +1683,9 @@ pub struct CandidateLedger {
     /// Reads whose every live candidate fell below `min_weight`, and whose argmax
     /// was therefore retained and emitted with `posterior_weight = 1.0` anyway.
     ///
-    /// THIS COUNTS READS, NOT CANDIDATES, so it must NOT appear in
-    /// `terminal_sum()` -- it is a cross-cutting annotation of `rows_emitted`, not
-    /// a disjoint fate competing with it.
+    /// THIS COUNTS READS, NOT CANDIDATES, so it must NOT appear in `terminal_sum()`
+    /// -- it is a cross-cutting annotation of `rows_emitted`, not a disjoint fate
+    /// competing with it.
     ///
     /// It exists so the cost of the retention is measurable: a retained argmax is
     /// a low-confidence assignment published as a confident one.
@@ -1768,11 +1733,11 @@ impl CandidateLedger {
 
     /// `live_candidates` minus `live_candidates_entered`.
     ///
-    /// **This is NOT an independent check on `deficit()`.** It is algebraically
-    /// the same condition, and it is kept for a narrower reason than independence:
-    /// when it fires, it says *which* quantity disagreed. `deficit()` reports the
-    /// symptom; this names the cause. Deleting it would be defensible; calling it
-    /// a second identity is not.
+    /// **This is NOT an independent check on `deficit()`.** It is algebraically the
+    /// same condition, and it is kept for a narrower reason than independence: when
+    /// it fires, it says *which* quantity disagreed. `deficit()` reports the
+    /// symptom; this names the cause. Deleting it would be defensible; calling it a
+    /// second identity is not.
     pub fn census_vs_estep_deficit(&self) -> i64 {
         self.live_candidates as i64 - self.live_candidates_entered as i64
     }
@@ -1796,22 +1761,22 @@ fn posterior_entropy(weights: &[(usize, f64)]) -> f64 {
 /// - `top_tx_id` is the transcript NAME, not the pool index. The index is only
 ///   meaningful relative to one run's `transcript_names` order, and this table's
 ///   whole purpose is being joined against a SECOND run's table.
-/// - `n_candidates_before_cutoff` is `MoleculeEvidence::candidate_count`, i.e.
-///   the fan-out BEFORE the `ΔAS` prune, the `is_competent` filter and the
-///   `min_weight` truncation. It matches the `n_candidates_before_cutoff`
-///   column the profile parquet already emits.
-/// - `top_tx_id` is `None` for a GHOST read — no competent candidate, empty
+/// - `n_candidates_before_cutoff` is `MoleculeEvidence::candidate_count`, i.e. the
+///   fan-out BEFORE the `Delta-AS` prune, the `is_competent` filter and the
+///   `min_weight` truncation. It matches the `n_candidates_before_cutoff` column
+///   the profile parquet already emits.
+/// - `top_tx_id` is `None` for a GHOST read -- no competent candidate, empty
 ///   `weights`. An argmax over an empty vector would either panic or, worse,
-///   yield transcript 0. The ghost has no row in the profile either, so this
-///   table is deliberately NOT a subset of the profile's reads. It obeys the
-///   weaker one-directional invariant the cross-run join needs:
+///   yield transcript 0. The ghost has no row in the profile either, so this table
+///   is deliberately NOT a subset of the profile's reads. It obeys the weaker
+///   one-directional invariant the cross-run join needs:
 ///
 ///   ```text
 ///   top_tx_id == Some(..)  IMPLIES  that read has a profile row.
 ///   ```
 ///
-///   A `None` means "the solver looked and could not assign", which is not
-///   the same as "this read was absent from the run".
+///   A `None` means "the solver looked and could not assign", which is not the
+///   same as "this read was absent from the run".
 #[derive(Debug, Clone)]
 pub struct ReadAssignment {
     pub read_id: String,
@@ -1830,13 +1795,13 @@ pub struct ReadAssignment {
     pub entropy: f64,
 }
 
-/// Write the per-read posterior summary as Parquet, matching every other
-/// output this tool produces (profile, emission, anchors, summary are all
-/// Parquet; TSV appears in this codebase only as an INPUT format).
+/// Write the per-read posterior summary as Parquet, matching every other output
+/// this tool produces (profile, emission, anchors, summary are all Parquet; TSV
+/// appears in this codebase only as an INPUT format).
 ///
 /// `top_tx_id` is written as a nullable string rather than an index: the whole
-/// purpose of this table is to be joined against another run's table, and a
-/// pool index only means something relative to one run's `transcript_names`.
+/// purpose of this table is to be joined against another run's table, and a pool
+/// index only means something relative to one run's `transcript_names`.
 fn accumulate_mstep_suffstats(
     params: &[Option<TranscriptParam>],
     graph: &FlatEvidenceGraph,
@@ -1936,27 +1901,23 @@ pub fn write_read_assignments_parquet(
 
 /// Write the `(mu, sigma2)` the last E-step consumed, as a DIAGNOSTIC sidecar.
 ///
-/// The first five columns are named and typed to match the emission parquet, so
-/// the result loads back through `load_emission_parameters` unchanged and a
-/// converged fit can be re-measured without re-deriving it. `load_emission`
+/// The first five columns are named and typed to match the emission parquet, so the
+/// result loads back through `load_emission_parameters` unchanged. `load_emission`
 /// `column_by_name`s exactly those five and ignores the rest.
 ///
-/// The remaining columns exist so the file can be audited:
-/// - `mu_cohort` — the shrinkage prior, so a reader can see that re-loading
-///   this file RE-ANCHORS the prior: the loader sets `mu_cohort = mu_logPAL`
-///   AND `sigma2_cohort = sigma2_logPAL`, so BOTH priors move to the fitted
-///   values and τ₀=2 / 2β₀ are applied a second time.
-/// - `alpha` — the mixture weight the last E-step used.
-/// - `state` — which iterate this row holds.
-/// - `em_accum_weight` — the E-step weight sum W, in molecule weight units.
-/// - `mu_fitted`, `sigma2_fitted` — ALIASES of `mu_logPAL` / `sigma2_logPAL`,
-///   same values, same iteration, kept so a reader who wants "the fitted
-///   value" does not have to adopt the emission schema's name for it.
-/// - `em_finalized` — whether an M-step ran at all.
+/// The remaining columns exist so the file can be audited: `mu_cohort` (the
+/// shrinkage prior, so a reader can see that re-loading RE-ANCHORS the prior --
+/// the loader sets `mu_cohort = mu_logPAL` AND `sigma2_cohort = sigma2_logPAL`,
+/// so BOTH priors move to the fitted values and tau_0 = 2 / 2*beta_0 are applied
+/// a second time); `alpha` (the mixture weight the last E-step used); `state`
+/// (which iterate this row holds); `em_accum_weight` (the E-step weight sum W, in
+/// molecule weight units); `mu_fitted` / `sigma2_fitted` (ALIASES of
+/// `mu_logPAL` / `sigma2_logPAL`, same values, same iteration); and `em_finalized`
+/// (whether an M-step ran at all).
 ///
 /// `em_accum_weight` and `alpha` are the two sides of `alpha == W /
-/// n_total_molecules`, so they agree whenever `em_finalized` is TRUE. When it
-/// is FALSE — convergence on the first iteration — `alpha` is the Laplace
+/// n_total_molecules`, so they agree whenever `em_finalized` is TRUE. When it is
+/// FALSE -- convergence on the first iteration -- `alpha` is the Laplace
 /// initialisation instead, so the flag is NOT recoverable from the numeric
 /// columns. Filter on `em_finalized` before treating a row as a fit.
 pub fn write_emission_params_parquet(
@@ -2087,7 +2048,7 @@ pub struct TelEmStats {
     /// READ-LEVEL, ghost population. Denominator
     /// `n_dropped_no_competent_candidates`. Contested reads with no posterior
     /// whose entire candidate range was present and competent but had
-    /// `alpha <= 0.0` — the abundance prior the M-step drove to zero.
+    /// `alpha <= 0.0` -- the abundance prior the M-step drove to zero.
     ///
     /// A genuinely distinct cause from the other two: `is_competent` is
     /// M-step-invariant while `alpha` is exactly the field the M-step rewrites. A
@@ -2106,7 +2067,7 @@ pub struct TelEmStats {
     /// loss.
     pub n_dropped_output_row_competence: u64,
     /// READ-LEVEL, ghost population. Contested reads (>= 2 candidates) with NO
-    /// posterior at all — `weights.is_empty()`. This is the TOTAL for the
+    /// posterior at all -- `weights.is_empty()`. This is the TOTAL for the
     /// decomposition above.
     ///
     /// The NAME is misleading in two ways: it fires for several causes, not one,
@@ -2147,26 +2108,26 @@ pub struct TelEmStats {
     /// `n_entropy_degenerate` EXACTLY. Three counters that partition a fourth is
     /// only useful if the partition is checked.
     pub n_degenerate_with_anchored: u64,
-    /// DEGRADATION TELEMETRY. Contested reads (≥ 2 candidates) whose candidate set
+    /// DEGRADATION TELEMETRY. Contested reads (>= 2 candidates) whose candidate set
     /// carries ZERO poly(A) discriminative power: every candidate that has an
     /// emission row shares one identical `(mu, sigma2)` pair, so the poly(A) term
     /// cancels EXACTLY in every pairwise odds ratio.
     ///
     /// Read `n_polya_zero_power / n_ambiguous` for the fraction. The denominator is
-    /// deliberately `n_ambiguous` and not `n_total`: a single-candidate read has
-    /// no pairwise odds ratio at all.
+    /// deliberately `n_ambiguous` and not `n_total`: a single-candidate read has no
+    /// pairwise odds ratio at all.
     ///
-    /// ⚠️ NOT A VALIDITY METRIC, AND NOT PRINTED. This counter FIRES when a
-    /// read's candidates all share one identical `(mu, sigma2)` — it counts the
-    /// reads the M-step did NOT personalise. A low value means non-degenerate, not
-    /// discriminative. Its only consumers are the zero-power unit tests, which
-    /// pin it as a tripwire for parameters collapsing numerically into one
-    /// identical float.
+    /// ⚠️ NOT A VALIDITY METRIC, AND NOT PRINTED. This counter FIRES when a read's
+    /// candidates all share one identical `(mu, sigma2)` -- it counts the reads the
+    /// M-step did NOT personalise. A low value means non-degenerate, not
+    /// discriminative. Its only consumers are the zero-power unit tests, which pin
+    /// it as a tripwire for parameters collapsing numerically into one identical
+    /// float.
     ///
-    /// THE COMPARISON IS EXACT `==`, NOT A TOLERANCE, and the consequence is part
-    /// of this metric's definition: candidates that disagree by as little as one
-    /// ULP are treated as DISCRIMINATING, so the read is not counted here. The
-    /// number therefore UNDER-reports zero poly(A) power.
+    /// THE COMPARISON IS EXACT `==`, NOT A TOLERANCE, and the consequence is part of
+    /// this metric's definition: candidates that disagree by as little as one ULP
+    /// are treated as DISCRIMINATING, so the read is not counted here. The number
+    /// therefore UNDER-reports zero poly(A) power.
     pub n_polya_zero_power: u64,
     /// DEGRADATION TELEMETRY, second metric. Contested reads carrying at least
     /// `ZERO_POWER_MIN_EMISSION_CANDIDATES` emission rows in which all of them
@@ -2174,7 +2135,7 @@ pub struct TelEmStats {
     /// be satisfied by a read that had nothing to compare.
     ///
     /// Read `n_polya_zero_power_resolved / n_reads_multi_emission_candidate`. Do
-    /// NOT divide by `n_ambiguous` — that denominator contains the reads this
+    /// NOT divide by `n_ambiguous` -- that denominator contains the reads this
     /// metric deliberately excludes.
     ///
     /// Also not printed, for the same reason as `n_polya_zero_power`.
@@ -2202,16 +2163,16 @@ pub struct TelEmStats {
     pub n_reads_single_emission_candidate: u64,
     /// EM trace: per-iter `(iter_index, log_likelihood, mean_entropy)`.
     pub em_trace: Vec<(usize, f64, f64)>,
-    /// D2. Largest absolute disagreement, over all transcripts, between the W the
-    /// last M-step CONSUMED and the W the sidecar PUBLISHES as
-    /// `em_accum_weight`. Unit: molecules. Denominator: none — this is a max, not
-    /// a rate. `0.0` when no M-step ran.
+    /// Largest absolute disagreement, over all transcripts, between the W the last
+    /// M-step CONSUMED and the W the sidecar PUBLISHES as `em_accum_weight`. Unit:
+    /// molecules. Denominator: none -- this is a max, not a rate. `0.0` when no
+    /// M-step ran.
     ///
     /// Non-zero means the run's published W is one E-step behind the W that
     /// produced the published `sigma2`. It is a MEASUREMENT of a known
     /// one-iteration phase offset, not a defect.
     pub max_dw_phase_abs: f64,
-    /// D2. The same disagreement divided, per transcript, by the larger of the
+    /// The same disagreement divided, per transcript, by the larger of the
     /// two arms; `0.0` when no M-step ran or when a transcript is zero in both.
     /// Dimensionless. Denominator: `max(W_final, W_mstep)` per transcript, named
     /// here because a bare ratio against a moving denominator is unreadable.
@@ -2265,24 +2226,15 @@ mod tests {
 
     /// The "only naming site" invariant, pinned with a red proof.
     ///
-    /// `solve_and_write_profile`'s doc comment claims it is the ONLY place
-    /// `SIGMA2_DOF_OFFSET` is named, and the pin test above pins only the
-    /// constant's VALUE -- two different claims. Replacing the forwarder's
-    /// argument with a literal `2.0` leaves the const declared at 2.0, leaves the
-    /// declared-source checker green, and leaves this module green, while the
-    /// shipped path stops reading the declared source at all.
+    /// Counts naming sites of `SIGMA2_DOF_OFFSET` in PRODUCTION code and pins the
+    /// count at 2 -- the declaration and the one call. Zero means a literal crept
+    /// into the shipped path; three or more means a second path can supply its own
+    /// `c`.
     ///
-    /// So this counts naming sites in PRODUCTION code and pins the count at 2 --
-    /// the declaration, and the one call. Zero means a literal crept into the
-    /// shipped path; three or more means a second path can supply its own `c`.
-    ///
-    /// Two things make the count honest rather than decorative:
-    /// - Comments are stripped FIRST. Otherwise the constant's own doc comment
-    ///   satisfies the count and the assertion is a tautology.
-    /// - The split anchors on the module header, not on the bare attribute: the
-    ///   string `#[cfg(test)]` alone occurs more than once in this file, and
-    ///   `rfind` on the bare attribute can pick the later one, which lands inside
-    ///   this module and makes the slice swallow the pin test above.
+    /// Two things make the count honest rather than decorative: comments are
+    /// stripped FIRST (otherwise the constant's own doc comment satisfies the
+    /// count), and the split anchors on the module header rather than the bare
+    /// `#[cfg(test)]` attribute, which occurs more than once in this file.
     #[test]
     fn test_the_shipped_entry_point_is_the_only_naming_site_of_the_dof_offset() {
         let source = include_str!("em.rs");
@@ -2340,10 +2292,10 @@ mod tests {
     const FIVE_PRIME_WINDOW: u32 = 20;
     /// Frozen `ΔAS` prune threshold, mirrored from the CLI default.
     const PRUNE_MAX_DELTA_AS: i32 = 50;
-    /// The 5' term switched off. `ln_5p ≡ 0` exactly, so any test passing this
-    /// is provably independent of `candidate_5p_gap` — which is what keeps the
-    /// pre-existing A_rk and renormalisation tests unperturbed by this change
-    /// instead of accidentally also covering the new term.
+    /// The 5' term switched off. `ln_5p == 0` exactly, so any test passing this
+    /// is provably independent of `candidate_5p_gap` -- which is what keeps the
+    /// pre-existing A_rk and renormalisation tests unperturbed by this constant
+    /// instead of accidentally also covering the 5' term.
     const POLY_A_ON: f64 = 1.0;
     const FIVE_PRIME_OFF: f64 = 0.0;
     /// The `ΔAS` prune switched off. Legal (`i32::MAX` is a valid threshold);
@@ -2402,20 +2354,18 @@ mod tests {
 
     /// Joint log-posterior of MODEL B -- the NIG prior.
     ///
-    /// NOT A DESCRIPTION OF PRODUCTION: the M-step is Model A. It is retained as
-    /// an INDEPENDENT REFERENCE for the estimator production is not using, so the
-    /// test can measure the gap in the same units rather than assert that some
-    /// golden constant happens to match. If production ever goes back to Model B,
-    /// the gap goes to zero and the test goes red.
+    /// NOT A DESCRIPTION OF PRODUCTION: the M-step is Model A. Retained as an
+    /// INDEPENDENT REFERENCE so the test can measure the gap in the same units
+    /// rather than assert a golden constant matches. If production goes back to
+    /// Model B, the gap goes to zero and the test goes red.
     ///
     ///     Q = -(W/2) ln(2 pi v) - S(mu)/(2v) - (nu_0+1) ln v - beta_0/v
     ///         - 0.5 ln v - kappa_0 (mu - mu_cohort)^2 / (2v)
     ///
-    /// The `-0.5 ln v` is the normalising factor of the conditional prior
+    /// The `-0.5 ln v` is the normaliser of the conditional prior
     /// `mu | v ~ N(mu_cohort, v/kappa_0)`; it is what puts the `+1` into the
-    /// sigma^2 denominator. Written out longhand rather than reusing any helper
-    /// from the M-step, so a production change cannot silently follow this
-    /// function's mistakes.
+    /// sigma^2 denominator. Written longhand rather than reusing any M-step
+    /// helper, so a production change cannot follow this function's mistakes.
     fn nig_joint_logpost(
         mu: f64,
         v: f64,
@@ -2463,31 +2413,25 @@ mod tests {
 
     /// THE M-STEP IS MODEL A, AND THIS IS THE TEST THAT PROVES IT.
     ///
-    /// It asserts two things, and the second is the one that carries the dual
-    /// implementation:
+    /// It asserts two things, and the second carries the dual implementation:
     ///   (a) production is strictly below Model B's numeric argmax;
     ///   (b) production equals Model A's closed form, recomputed here from the
     ///       accumulators with no shared code.
     ///
-    /// WHY A NEW FIXTURE. Three properties are needed at once and no existing
-    /// helper provides them:
-    /// 1. **Exact, iteration-independent accumulators.** A molecule with
-    ///    `candidate_count == 1` is routed to `unambiguous_indices` and
-    ///    accumulates `accum_w += 1.0` unconditionally -- the likelihood never
-    ///    touches the weight. So (W, S1, S2) is exactly what the fixture says, on
-    ///    every iteration, for ever.
-    /// 2. **The M-step must actually execute.** `solve_and_write_profile` computes
-    ///    `delta_avg_ll` over AMBIGUOUS molecules only, so an all-unambiguous graph
-    ///    gives `n_ambig == 0`, `delta_avg_ll == 0.0` and breaks BEFORE the
-    ///    M-step. Hence the decoy molecule: it contributes `n_ambig = 1` and
-    ///    nothing else.
-    /// 3. **The defect must be visible.** The missing term is
+    /// WHY A NEW FIXTURE -- three properties at once, no existing helper has them:
+    /// 1. EXACT, iteration-independent accumulators. A `candidate_count == 1`
+    ///    molecule is routed to `unambiguous_indices` and accumulates
+    ///    `accum_w += 1.0` unconditionally, so (W, S1, S2) is exactly what the
+    ///    fixture says on every iteration.
+    /// 2. THE M-STEP MUST ACTUALLY EXECUTE. `delta_avg_ll` is computed over
+    ///    AMBIGUOUS molecules only, so an all-unambiguous graph gives
+    ///    `n_ambig == 0` and breaks BEFORE the M-step -- hence the decoy
+    ///    molecule, which contributes `n_ambig = 1` and nothing else.
+    /// 3. THE DEFECT MUST BE VISIBLE. The missing term is
     ///    `kappa_0 (mu_MAP - mu_cohort)^2`, and shrinkage drives `mu_MAP` TOWARD
-    ///    `mu_cohort` as W grows -- so a large-W, tightly-clustered fixture hides
-    ///    it. This fixture puts the defect five orders of magnitude above the
-    ///    tolerance.
+    ///    `mu_cohort` as W grows, so a large-W clustered fixture hides it.
     ///
-    /// The assertion is on the OBJECTIVE VALUE, not on the argmax's coordinates:
+    /// The assertion is on the OBJECTIVE VALUE, not the argmax's coordinates:
     /// golden-section maximisation of a log-posterior of magnitude ~3 stalls at
     /// ~2.5e-8 absolute in f64, so coordinate assertions would need a tolerance
     /// four orders looser than the defect-detection margin.
@@ -2626,7 +2570,7 @@ mod tests {
              Model B argmax (mu, sigma2) = ({mu_star:.17}, {v_star:.17})\n  \
              Q_B(production) - Q_B(argmax) = {:.3e}, which is not the expected \
              NEGATIVE gap.\n  \
-             Since 2026-10-12 the production M-step is Model A: numerator \
+             The production M-step is Model A: numerator \
              without the kappa_0*(mu-mu_cohort)^2 term, denominator +2 not +3. \
              If this fires, Model B is back.",
             q_prod - q_best
@@ -2637,16 +2581,15 @@ mod tests {
         //
         //     The two derivations share no code: this block recomputes mu from
         //     (S1, W, tau_0, mu_cohort) and sigma2 from (S(mu), W, nu_0, beta_0,
-        //     sigma2_cohort) by hand, while production ran the M-step over a synthetic
-        //     graph.
+        //     sigma2_cohort) by hand, while production ran the M-step over a
+        //     synthetic graph.
         //
-        //     NOTE ON WHAT MODEL A IS NOT. Model A is not the argmax of any joint
-        //     objective written down here, and this test deliberately does not claim
-        //     it is. Dropping the kappa_0 quadratic alone would leave the `-0.5 ln v`
-        //     normaliser and give denominator +3, not +2 -- so Model A drops both.
-        //     Whether that is the right prior is a MODELLING question, not a unit
-        //     test. What this test pins is narrower and checkable: production computes
-        //     Model A's closed form, and does not compute Model B's.
+        //     NOTE ON WHAT MODEL A IS NOT: Model A is not the argmax of any joint
+        //     objective written down here, and this test deliberately does not
+        //     claim it is. Dropping the kappa_0 quadratic ALONE would leave the
+        //     `-0.5 ln v` normaliser and give denominator +3, not +2 -- so Model A
+        //     drops both. Whether that is the right prior is a MODELLING
+        //     question, not a unit test.
         let mu_indep = (s1 + TAU_0 * MU_COHORT) / (w + TAU_0);
         let s_mu_indep = s2 - 2.0 * mu_indep * s1 + mu_indep * mu_indep * w;
         let sigma2_model_a =
@@ -2707,14 +2650,13 @@ mod tests {
     /// As `write_test_emission`, but each row also carries its
     /// `is_polyA_competent` flag. Needed because the E-step pushes an
     /// INCOMPETENT candidate as `-inf` and the output stage's `retained_sum`
-    /// denominator is documented as correct only while that keeps incompetent rows
-    /// out of `weights`. Nothing tested that coupling, so a future change to the
-    /// mask would silently break normalisation with every test still green.
+    /// denominator is correct only while that keeps incompetent rows out of
+    /// `weights`.
     ///
     /// `n_cohort_flnc` is written as a NON-ZERO constant for every row, so every
-    /// pre-existing test using this helper keeps its original meaning: no row is
-    /// imputed. It is written at all, rather than omitted, because the loader now
-    /// REQUIRES the column.
+    /// test using this helper keeps its original meaning: no row is imputed. It
+    /// is written at all, rather than omitted, because the loader REQUIRES the
+    /// column.
     fn write_test_emission_with_competence(path: &Path, rows: &[(&str, &str, f64, f64, bool)]) {
         let with_nobs: Vec<(&str, &str, f64, f64, bool, u32)> = rows
             .iter()
@@ -2787,8 +2729,8 @@ mod tests {
     ///     sigma2 -> INSTRUMENTAL_PAL_NOISE_FLOOR
     ///
     /// so every transcript would be dragged to the placeholder's value. The
-    /// emission parquet is written with mu = 7.0, which is far from both 0 and
-    /// the floor, so "unchanged" and "dragged" are trivially distinguishable.
+    /// emission parquet is written with mu = 7.0, far from both 0 and the floor,
+    /// so "unchanged" and "dragged" are trivially distinguishable.
     #[test]
     fn test_poly_a_weight_zero_freezes_mu_and_sigma2_instead_of_dragging_them() {
         let log_pal = (100.0_f32).log2();
@@ -2901,14 +2843,14 @@ mod tests {
 
     /// STEP 1 and STEP 2 of the M-step, asserted as VALUES at the one setting
     /// where they actually run. Tolerance 1e-12: this is a bit-for-bit closed
-    /// form, not a numeric estimate, so any tolerance wider than that is buying
-    /// tolerance for a bug.
+    /// form, not a numeric estimate, so any wider tolerance buys tolerance for a
+    /// bug.
     ///
     /// `max_iter = 2` AND NOT MORE: `output_emission_params` is fed from
     /// `last_estep_params`, snapshotted after the E-step consumed `params` and
-    /// before the M-step rewrites it, so the exported value is one M-step BEHIND
+    /// before the M-step rewrote it, so the exported value is one M-step BEHIND
     /// `params`. `max_iter = 2` makes the export M-step#1's output on EVERY exit
-    /// path; a larger value would mean re-deriving the whole iteration chain, and
+    /// path; a larger value would need the whole iteration chain re-derived, and
     /// the loop exits on `delta_avg_ll < tol`, so a fixed-point argument holds
     /// only to ~1e-6 and can never support a 1e-12 pin.
     ///
@@ -2925,8 +2867,8 @@ mod tests {
     ///             = (0.040588324521667830 + 1.0) / 4.5        = 0.23124184989370397
     ///
     /// `sq_dev` is a cancelling sum -- terms of order 22 and 48 collapsing to
-    /// 0.0406 -- and it still carries ~1e-15 relative accuracy, 4 orders inside
-    /// the 1e-12 budget. The result is far above INSTRUMENTAL_PAL_NOISE_FLOOR, so
+    /// 0.0406 -- and still carries ~1e-15 relative accuracy, 4 orders inside the
+    /// 1e-12 budget. The result is far above INSTRUMENTAL_PAL_NOISE_FLOOR, so
     /// the `.max()` clamp must NOT fire.
     ///
     /// The shrinkage prior `mu_cohort` is loaded once, from the emission
@@ -3022,7 +2964,7 @@ mod tests {
         //   sigma2 = 1.040588324521667829 / 4.5            = 0.23124184989370397
         //
         // READ THIS NUMBER OFF A RUN, NOT OFF PAPER. It was produced by the
-        // f32-widened `log2` path this crate actually uses, and recomputing it in f64
+        // f32-widened `log2` path this crate actually uses; recomputing it in f64
         // from the printed operands gives 0.23124184274217108 -- agreement to eight
         // digits, not to seventeen. The f32 widening is why these constants are
         // pinned here at all.
@@ -3226,21 +3168,19 @@ mod tests {
         emission
     }
 
-    /// The default must be the shipped Model A estimator, and this says it the
-    /// only way it can be checked without re-deriving anything: run the SAME
-    /// fixture through the parameterised entry point with `c = 2` explicitly, and
-    /// through the default entry point, and require the two to agree to the LAST
-    /// BIT on every observable.
+    /// The default must be the shipped Model A estimator: run the SAME fixture
+    /// through the parameterised entry point with `c = 2` explicitly and through
+    /// the default entry point, and require the two to agree to the LAST BIT on
+    /// every observable.
     ///
     /// EXACT `to_bits()` EQUALITY, NO TOLERANCE -- a `< 1e-15` bound here would
     /// still pass for every `c` within an ULP of 2, which is precisely the drift
     /// this parameter exists to make impossible.
     ///
-    /// The comparison is deliberately WIDER than σ² -- `mu`, `alpha`,
-    /// `em_accum_weight`, the ids, the flags, the per-iteration EM trace, the
-    /// per-read assignment, and the whole `TelEmStats` -- because a `c` that
-    /// reached anything but the denominator would show up in one of those first,
-    /// and a σ²-only test would report it as a σ² regression.
+    /// The comparison is deliberately WIDER than sigma^2 -- `mu`, `alpha`,
+    /// `em_accum_weight`, the ids, the flags, the EM trace, the per-read
+    /// assignment and the whole `TelEmStats` -- because a `c` that reached
+    /// anything but the denominator would show up in one of those first.
     #[test]
     fn test_default_sigma2_dof_offset_is_bit_identical_to_the_named_parameter() {
         let emission = dof_offset_emission("default");
@@ -3417,14 +3357,12 @@ mod tests {
     /// compute.
     ///
     /// * the value is compared BITWISE against `dof_offset_closed_form(3.0)`,
-    ///   computed in the test from the fixture's documented operands. Comparing
+    ///   computed in the test from the fixture's documented operands; comparing
     ///   only against sigma2(2) being smaller would be satisfied by any
-    ///   monotone-in-`c` implementation, including one that ignores `c` entirely.
-    /// * `c = 3` is NOT Model B, and this asserts that with a number rather than
-    ///   with prose: Model B also restores `tau_0 * (mu - mu_cohort)^2` in the
-    ///   NUMERATOR, while the `c` knob moves the denominator only. A later reader
-    ///   who describes a `c = 3` arm as "Model B" is contradicting this
-    ///   assertion.
+    ///   monotone-in-`c` implementation, including one that ignores `c`.
+    /// * `c = 3` is NOT Model B, asserted with a number rather than prose: Model B
+    ///   also restores `tau_0 * (mu - mu_cohort)^2` in the NUMERATOR, while the
+    ///   `c` knob moves the denominator only.
     ///
     /// FLOOR HEADROOM. The smallest value in the [1, 5] sweep is 0.13874 at
     /// `c = 5`, clear of clamping, but NOT the 10x margin the joint-MAP test
@@ -3498,8 +3436,8 @@ mod tests {
         );
     }
 
-    /// σ² is strictly decreasing in `c` over [1, 5], and every point equals the
-    /// closed form bit for bit.
+    /// sigma^2 is strictly decreasing in `c` over [1, 5], and every point equals
+    /// the closed form bit for bit.
     ///
     /// A NON-MONOTONE SWEEP IS A BUG, NOT A RESULT. The arithmetic says
     /// `sigma2 = N / (W + 2*nu_0 + c)` with `N` positive and `c`-independent,
@@ -3549,21 +3487,19 @@ mod tests {
         );
     }
 
-    /// A transcript that wins NO posterior mass still gets an M-step, and the σ²
-    /// it lands on is `2*beta_0*sigma2_cohort / (2*nu_0 + c)` -- NOT the prior.
-    ///
-    /// The M-step loop iterates EVERY graph transcript, so `w_sum == 0` is a state
-    /// the estimator genuinely visits rather than a hypothetical.
+    /// A transcript that wins NO posterior mass still gets an M-step, and the
+    /// sigma^2 it lands on is `2*beta_0*sigma2_cohort / (2*nu_0 + c)` -- NOT the
+    /// prior. The M-step loop iterates EVERY graph transcript, so `w_sum == 0` is
+    /// a state the estimator genuinely visits.
     ///
     /// WHAT THE FACTOR IS, and what it is not. The ratio to the prior is
     /// `2 / (2*nu_0 + c)`, so it TRACKS `c` -- 0.500x at the production value
-    /// c = 2. "With no evidence σ² is half the prior" is a statement about that
-    /// production value, NOT a hyperparameter-independent property.
+    /// `c = 2`. "With no evidence sigma^2 is half the prior" is a statement about
+    /// that production value, NOT a hyperparameter-independent property.
     ///
-    /// `c = 0` -- the value that would make the ratio exactly 1.000 and reduce the
-    /// M-step to a no-op at W = 0 -- is UNREACHABLE through the parameterised entry
-    /// point, whose guard is `is_finite() && > 0.0`. The shrinkage cannot be
-    /// switched off.
+    /// `c = 0` -- which would make the ratio exactly 1.000 and reduce the M-step to
+    /// a no-op at W = 0 -- is UNREACHABLE through the parameterised entry point,
+    /// whose guard is `is_finite() && > 0.0`. The shrinkage cannot be switched off.
     #[test]
     fn test_zero_weight_transcript_sigma2_is_two_beta0_prior_over_two_nu0_plus_c() {
         let log_pal = (100.0_f32).log2();
@@ -3726,7 +3662,7 @@ mod tests {
             prod.1.to_bits(),
             0.5f64.to_bits(),
             "at the production c = 2 the W = 0 sigma2 is exactly HALF the prior; \
-             got {:.17}. If this moved, R99 §3.4's table is stale.",
+             got {:.17}. If this moved, the closed form changed.",
             prod.1
         );
         // Strictly decreasing in c: the factor has no free parameter to break
@@ -3877,29 +3813,23 @@ mod tests {
 
     /// THE `em_accum_weight` COLUMN IS THE E-STEP'S W, IN MOLECULES, NOT A SHARE.
     ///
-    /// WHY THE FIXTURE HAS A SECOND MOLECULE. The obvious fixture is the
-    /// symmetric single-molecule one, and it is VACUOUS here: with one molecule in
-    /// the graph, `alpha` is W divided by 1, so W and the written alpha are the
-    /// same float and a column carrying the share instead of the sum cannot be
-    /// told apart. Two molecules make the two columns differ by exactly the factor
-    /// under test -- alpha 0.25 against W 0.5.
+    /// WHY THE FIXTURE HAS A SECOND MOLECULE: the obvious single-molecule fixture
+    /// is VACUOUS here -- with one molecule, `alpha` is W divided by 1, so W and
+    /// the written alpha are the same float and a column carrying the share
+    /// instead of the sum cannot be told apart. Two molecules make the columns
+    /// differ by exactly the factor under test -- alpha 0.25 against W 0.5.
     ///
-    /// WHY W IS EXACTLY 0.5, derivable rather than asserted:
+    /// WHY W IS EXACTLY 0.5, derivable rather than asserted: the molecule has two
+    /// candidates, both present in the emission parquet, with identical
+    /// `(mu_cohort, sigma2_cohort)`, identical alignment evidence and identical
+    /// 5' gaps. The Laplace init (eps = 0.01) gives each of them 0.01 + 1/2 =
+    /// 0.51, so `alpha` is identical for the pair; equal alpha, mu, sigma2 and
+    /// every other term make the two log-likelihoods bit-identical, hence
+    /// `log_z = ll + ln 2` and each posterior `exp(-ln 2)` = 0.5 exactly in f64.
+    /// W for each of the pair is therefore 0.5, and 1.0 for the solo molecule.
     ///
-    ///   molecule r0 has two candidates, both present in the emission parquet,
-    ///   with identical (mu_cohort, sigma2_cohort), identical alignment evidence
-    ///   and identical 5' gaps. The Laplace init (eps = 0.01) gives each of them
-    ///   0.01 + 1/2 = 0.51 and the solo transcript 0.01 + 1, so `alpha` comes out
-    ///   identical for the pair; equal alpha, equal mu, equal sigma2 and equal
-    ///   every other term make the two log-likelihoods bit-identical, hence
-    ///   `log_z = ll + ln 2` and each posterior `exp(ll - log_z) = exp(-ln 2)`,
-    ///   which is 0.5 exactly in f64.
-    ///
-    ///   W for each of the pair is therefore 0.5, and for the solo molecule it is
-    ///   1.0 (an unambiguous read contributes exactly its weight of 1).
-    ///
-    /// `max_iter = 2` for the reason the closed-form test uses it: the M-step must
-    /// have run for `alpha` to be a fit rather than the Laplace initialisation.
+    /// `max_iter = 2` so the M-step has run and `alpha` is a fit rather than the
+    /// Laplace initialisation.
     #[test]
     fn test_sidecar_em_accum_weight_is_the_estep_weight_sum_in_molecules() {
         const TOL: f64 = 1e-12;
@@ -4013,15 +3943,13 @@ mod tests {
         let _ = std::fs::remove_file(&sidecar);
     }
 
-    /// THE WRITER EMITS THE NEW COLUMNS, AND DROPS NOTHING ELSE.
+    /// THE WRITER EMITS THE EXTRA COLUMNS, AND DROPS NOTHING ELSE.
     ///
-    /// The three new columns are appended rather than inserted so existing
-    /// name-selecting readers keep working, the `None`-row omission is a
-    /// documented contract of this function and not of the solver, and both are
-    /// properties of the WRITER that no end-to-end solve can distinguish from the
-    /// solver's own behaviour. Driven directly with a hand-built vector so the
-    /// expected numbers are the ones written, not re-derived by the code under
-    /// test.
+    /// The columns are appended rather than inserted so existing name-selecting
+    /// readers keep working, and the `None`-row omission is a documented contract
+    /// of this function and not of the solver. Driven directly with a hand-built
+    /// vector so the expected numbers are the ones written, not re-derived by the
+    /// code under test.
     #[test]
     fn test_write_emission_params_parquet_emits_new_columns_and_omits_none_rows() {
         let sidecar = scratch("writer_sidecar.parquet");
@@ -4155,18 +4083,17 @@ mod tests {
 
     /// THE SIDECAR IS NOT A RE-LOADABLE MODEL.
     ///
-    /// The gap is one column. The writer emits five of the six columns
-    /// `load_emission_parameters` requires, but never `n_cohort_flnc`. The loader
-    /// reads that column as REQUIRED on purpose, which means the round trip dies
-    /// there instead of producing a plausible number.
+    /// The gap is one column: the writer emits five of the six columns
+    /// `load_emission_parameters` requires, but never `n_cohort_flnc`, which the
+    /// loader reads as REQUIRED on purpose -- so the round trip dies there
+    /// instead of producing a plausible number.
     ///
-    /// This test asserts the FAILURE, which is the whole point: the defect was a
-    /// *docstring* claiming a capability, and a docstring cannot be made to go
-    /// red. If someone ever adds `n_cohort_flnc` to the sidecar this test goes
-    /// red, and the message tells them that the prior-reanchoring hazard has to be
-    /// re-decided too -- because a successful load would silently re-anchor both
-    /// shrinkage priors to the already-fitted values and apply τ₀ and 2β₀ a
-    /// second time.
+    /// This test asserts the FAILURE, which is the whole point: a docstring
+    /// claiming a capability cannot be made to go red. If `n_cohort_flnc` is
+    /// ever added to the sidecar this test goes red, and the message says the
+    /// prior-reanchoring hazard has to be re-decided too -- a successful load
+    /// would silently re-anchor both shrinkage priors to the already-fitted
+    /// values and apply tau_0 and 2*beta_0 a second time.
     #[test]
     fn test_the_sidecar_cannot_be_reloaded_as_an_emission_model() {
         let sidecar = scratch("reload_probe_sidecar.parquet");
@@ -4203,21 +4130,21 @@ mod tests {
     }
 
     /// WEAK BY CONSTRUCTION, and labelled so. `alpha` is DEFINED as W divided by
-    /// the total molecule count, so this identity holds for ANY
-    /// proportionally-wrong W -- including W scaled by 1/1000. It is a consistency
-    /// check between two columns, NOT a proof that either carries the right value.
+    /// the total molecule count, so this identity holds for ANY proportionally-wrong
+    /// W -- including W scaled by 1/1000. It is a consistency check between two
+    /// columns, NOT a proof that either carries the right value.
     ///
-    /// What this one does add is the reading every downstream consumer will
-    /// actually perform, and one thing the value test structurally cannot see: it
-    /// is written down against a fixture with MORE THAN ONE ambiguous molecule, so
-    /// `alpha` and W are not both derived from a single read.
+    /// What it adds is the reading every downstream consumer will perform, and one
+    /// thing the value test structurally cannot see: it is written against a
+    /// fixture with MORE THAN ONE ambiguous molecule, so `alpha` and W are not
+    /// both derived from a single read.
     ///
     /// It cannot catch W landing inside the poly(A) guard: this fixture runs with
     /// the weight ON, where that guard is unconditionally true.
     ///
-    /// `max_iter` must be >= 2 for the same snapshot-lag reason throughout: with
-    /// one iteration the file carries the Laplace initialisation (alpha summing
-    /// to 1, W summing to 0) and this identity is not merely weak but FALSE.
+    /// `max_iter` must be >= 2 for the snapshot-lag reason throughout: with one
+    /// iteration the file carries the Laplace initialisation (alpha summing to 1,
+    /// W summing to 0) and this identity is not merely weak but FALSE.
     #[test]
     fn test_sidecar_accum_w_is_consistent_with_alpha_times_the_molecule_count() {
         const TOL: f64 = 1e-12;
@@ -4297,14 +4224,14 @@ mod tests {
         let _ = std::fs::remove_file(&sidecar);
     }
 
-    /// THE FIXTURE THAT MAKES THE C2 STAMPING NON-VACUOUS.
+    /// THE FIXTURE THAT MAKES THE STAMPING NON-VACUOUS.
     ///
     /// The identity test above pins `sum(em_accum_weight) == n_total_molecules *
     /// sum(alpha)` on a fixture that is ALREADY AT A FIXED POINT after one
     /// iteration. **At a fixed point the stale value equals the current value**,
-    /// so the identity above passes whether `alpha` is stamped from the final
-    /// E-step or from the previous one. A test that cannot tell those two apart
-    /// is not testing the claim it is written to support.
+    /// so that identity passes whether `alpha` is stamped from the final E-step
+    /// or from the previous one -- a test that cannot tell those apart is not
+    /// testing the claim it is written to support.
     ///
     /// So this fixture is built to MOVE. r0's two candidates carry mu 5.0 and 8.0,
     /// straddling the read's own log2(PAL), so neither is the better explanation
@@ -4314,7 +4241,7 @@ mod tests {
     /// WHICH RUNS, AND WHY 1 IS IN THE LIST. The stamping block runs on every
     /// exit path, so `max_iter = 1` stamps from the FIRST E-step and
     /// `max_iter = 2` stamps from the SECOND -- exactly the pair the staleness
-    /// mutation disagrees about.
+    /// check disagrees about.
     ///
     /// The first assertion is the load-bearing one, and it is a property of the
     /// FIXTURE rather than of the stamping: it proves W really moves here.
@@ -4483,7 +4410,7 @@ mod tests {
     /// contributes NOTHING to W -- it has no parameter to be scored against --
     /// while still counting in `n_total_molecules`. So `sum(alpha)` falls below 1
     /// and `sum(em_accum_weight)` falls below the molecule count, and neither
-    /// quantity is wrong. This is asserted here because the conservation is now
+    /// quantity is wrong. This is asserted here because the conservation is
     /// visible in a FILE, and a reader of that file will check it.
     #[test]
     fn test_sidecar_em_accum_weight_drops_molecules_whose_candidates_are_all_missing() {
@@ -4720,13 +4647,10 @@ mod tests {
     ///     assumed: the fixture has exactly two candidates and the test requires
     ///     exactly two profile rows, so both survive.
     ///   - the profile is written from `final_weights`, the same vector the
-    ///     recompute consumes, but by a different function, a different file and a
-    ///     different builder.
+    ///     recompute consumes, but by a different function, file and builder.
     ///
-    /// THE VACUITY GUARD. A fixture whose EM has already converged by iteration 1
-    /// would make the previous iteration's W equal the final one and pass whatever
-    /// the column carried. So the same fixture is also solved at `max_iter = 1`,
-    /// and the two sidecars are required to DISAGREE.
+    /// THE VACUITY GUARD: the same fixture is also solved at `max_iter = 1`, and
+    /// the two sidecars are required to DISAGREE.
     #[test]
     fn test_em_accum_weight_tracks_the_final_estep_not_the_m_step_before_it() {
         const TOL: f64 = 1e-12;
@@ -4855,9 +4779,8 @@ mod tests {
     /// iteration the loop runs E-step, then M-step over those same
     /// `final_weights`, then exits; the stamp block then recomputes `final_w`
     /// from that identical vector. Both arms are the same numbers and the metric
-    /// MUST be bit-zero. That is the falsifiable half: a `max_dw_*` that is
-    /// non-zero here would mean the two vectors are not what the comment says they
-    /// are.
+    /// MUST be bit-zero -- a non-zero `max_dw_*` here would mean the two vectors
+    /// are not what the comment says they are.
     #[test]
     fn test_dw_phase_metrics_are_exactly_zero_when_there_is_no_phase_and_bounded_otherwise() {
         let solve = |tag: &str, max_iter: usize| {
@@ -4936,7 +4859,7 @@ mod tests {
     /// `beta_0` in the sigma^2 numerator, so anyone reading it as a single cohort
     /// constant overstates the prior on every tier-1/2 row.
     ///
-    /// This is the RED half. The falsifiable claim is not "the field equals
+    /// This is the RED half: the falsifiable claim is not "the field equals
     /// something" -- that is true by construction -- it is that three transcripts
     /// with three DIFFERENT emission variances come back with three DIFFERENT
     /// values rather than one shared number.
@@ -5328,12 +5251,11 @@ mod tests {
     /// 0.5/0.5, so BOTH fall below the cut. The argmax is then retained on its
     /// own and emitted, so the ledger must show THREE independent facts at once:
     ///
-    ///   * `pruned_min_weight == 1` -- the LOSER is culled and not emitted. It is
+    ///   * `pruned_min_weight == 1` -- the LOSER is culled and not emitted; it is
     ///     1, not 2, because the argmax is culled-but-emitted and counting both
     ///     would double-count it against `terminal_sum()`.
     ///   * `rows_emitted == 1` -- the read is on the books.
-    ///   * `reads_retained_by_argmax == 1` -- and that row was forced, so nothing
-    ///     downstream mistakes it for an earned one.
+    ///   * `reads_retained_by_argmax == 1` -- and that row was forced.
     ///
     /// The separation of the first two is the load-bearing assertion: it is what
     /// stops the retention from corrupting the conservation check.
@@ -5464,13 +5386,12 @@ mod tests {
     }
 
     /// `incompetent` is the one death cause the conservation law alone cannot
-    /// police, and this pins it end to end.
+    /// police, and this pins it end to end. The sum is preserved whichever of the
+    /// `incompetent` and `alpha_zero` increments is misplaced, so a total-only
+    /// assertion cannot see it.
     ///
-    /// The sum is preserved whichever of the `incompetent` and `alpha_zero`
-    /// increments is misplaced, so a total-only assertion cannot see it.
-    ///
-    /// WHY `alpha_zero` IS NOT PINNED HERE. It is **structurally unreachable
-    /// through the solver**: a transcript reaches `alpha == 0` only by winning no
+    /// WHY `alpha_zero` IS NOT PINNED HERE: it is **structurally unreachable
+    /// through the solver** -- a transcript reaches `alpha == 0` only by winning no
     /// posterior mass, and a transcript that wins no mass was already dead by
     /// competence or by having no emission row.
     ///
@@ -5478,8 +5399,7 @@ mod tests {
     /// `test_candidate_availability_keeps_four_death_causes_apart` calling
     /// `candidate_availability` directly, and the AGGREGATION wiring is pinned
     /// from the `incompetent` side: transposing the two increments drives
-    /// `incompetent` to 0 and turns THIS test red even though `alpha_zero` is
-    /// unreachable either way.
+    /// `incompetent` to 0 and turns THIS test red.
     #[test]
     fn test_candidate_ledger_attributes_an_incompetent_candidate_end_to_end() {
         let emission = local_scratch("ledger_cause_emission.parquet");
@@ -5713,20 +5633,21 @@ mod tests {
 
     /// Regression test for the A_rk term: it must reach the posterior.
     ///
-    /// Both candidates carry IDENTICAL emission parameters and identical π at
-    /// initialization, so `π_k · N(y; μ_k, σ_k²)` is exactly equal for the two
-    /// and A_rk is the only term able to separate them. ΔAS = 200 at λ = 100 is
-    /// a 2.0-nat gap → posterior 0.8808 / 0.1192.
+    /// Both candidates carry IDENTICAL emission parameters and identical pi at
+    /// initialization, so `pi_k * N(y; mu_k, sigma_k^2)` is exactly equal for the
+    /// two and A_rk is the only term able to separate them. Delta-AS = 200 at
+    /// lambda = 100 is a 2.0-nat gap -> posterior 0.8808 / 0.1192.
     ///
-    /// Mutation target: dropping `+ ln_a` from the E-step flattens both candidates
-    /// to 0.5 and this test goes red.
+    /// Dropping `+ ln_a` from the E-step flattens both candidates to 0.5 and
+    /// this test goes red.
     ///
-    /// `max_iter = 1` runs exactly one E-step from the symmetric-π initialization,
-    /// so the M-step feedback cannot be mistaken for the A_rk effect.
+    /// `max_iter = 1` runs exactly one E-step from the symmetric-pi
+    /// initialization, so the M-step feedback cannot be mistaken for the A_rk
+    /// effect.
     ///
-    /// Both new terms are explicitly disabled: `PRUNE_OFF` because this
-    /// fixture's `ΔAS = 200` IS the quantity the `ΔAS > 50` prune thresholds on,
-    /// and `FIVE_PRIME_OFF` so the 0.880797 pin below remains a pure A_rk
+    /// Both extra terms are explicitly disabled: `PRUNE_OFF` because this
+    /// fixture's `Delta-AS = 200` IS the quantity the `Delta-AS > 50` prune
+    /// thresholds on, and `FIVE_PRIME_OFF` so the 0.880797 pin stays a pure A_rk
     /// measurement.
     #[test]
     fn test_a_rk_breaks_weight_tie_by_alignment_score() {
@@ -5833,14 +5754,14 @@ mod tests {
     /// truncation.
     ///
     /// tx1's emission term is 5 nats worse than tx0's, landing it at
-    /// `e⁻⁵/(1+e⁻⁵) = 0.0067` -- below `MIN_WEIGHT`, so it is truncated away and
+    /// `e^-5/(1+e^-5) = 0.0067` -- below `MIN_WEIGHT`, so it is truncated away and
     /// 0.0067 of probability mass is destroyed. The rows actually emitted must
     /// still sum to exactly 1.0.
     ///
-    /// Mutation target: summing the denominator over ALL weights instead of the
-    /// retained ones leaves the surviving row at 0.9933 and this test goes red.
-    /// Equal AS on both candidates keeps A_rk ≡ 1, so the split is produced by the
-    /// emission term alone and this test stays independent of λ.
+    /// Summing the denominator over ALL weights instead of the retained ones leaves
+    /// the surviving row at 0.9933 and this test goes red. Equal AS on both
+    /// candidates keeps A_rk == 1, so the split is produced by the emission term
+    /// alone and this test stays independent of lambda.
     #[test]
     fn test_emitted_weights_renormalize_after_min_weight_truncation() {
         let log_pal = (100.0_f32).log2();
@@ -6002,8 +5923,8 @@ mod tests {
     /// candidates, the posterior must reduce to the abundance prior.** This is a
     /// property of the E-step, not of any flag, so it must hold in EVERY arm.
     ///
-    /// Why it is a separate test from the `poly_a_weight` regression below: that
-    /// one pins one flag at one setting and would still pass if a future edit
+    /// It is a separate test from the `poly_a_weight` regression because that one
+    /// pins one flag at one setting and would still pass if a future edit
     /// swallowed `ln alpha` inside some *other* weight's bracket. The shared
     /// failure mode is not "a parameter is set wrong", it is "the mixture prior
     /// stopped being a mixture prior", and that can happen through any of the
@@ -6012,8 +5933,8 @@ mod tests {
     /// The sweep is exact rather than approximate because the fixture makes each
     /// evidence term a CONSTANT across the two candidates, and a constant cancels
     /// in the softmax for any scale factor:
-    ///   - `AS` equal      -> `ln_a = -ΔAS/λ = 0` for every `λ`
-    ///   - `g_k = 0` equal -> `ln_5p = five_prime_weight` for both
+    ///   - `AS` equal          -> `ln_a = -Delta-AS/lambda = 0` for every `lambda`
+    ///   - `g_k = 0` equal     -> `ln_5p = five_prime_weight` for both
     ///   - `mu`, `sigma2` equal -> the Gaussian is one constant times
     ///     `poly_a_weight`
     ///
@@ -6107,18 +6028,17 @@ mod tests {
     /// OBSERVABLE even though nothing downstream can see the scale.
     ///
     /// `alpha` is a mixture weight vector, and `p.alpha = w_sum / n_total_molecules`
-    /// is what makes it one: every molecule contributes total weight 1 (an
-    /// unambiguous read contributes exactly 1.0; an ambiguous read's posteriors sum
-    /// to 1 by construction of the log-sum-exp), so `sum_k w_sum_k ==
-    /// n_total_molecules` and the updated `alpha` sums to 1 across transcripts.
+    /// is what makes it one: every molecule contributes total weight 1, so
+    /// `sum_k w_sum_k == n_total_molecules` and the updated `alpha` sums to 1
+    /// across transcripts.
     ///
-    /// A UNIFORM rescale of the alpha vector is invisible to a softmax -- `ln c` is
-    /// common to every candidate -- so no test that only reads posteriors can see
-    /// the denominator at all, at any scale. That is a real property of the model,
-    /// not a gap in the test, and it is why the assertion reads `alpha` itself.
-    /// What duplication adds is that it compares NON-uniform rescalings: `N ->
-    /// N-5` rescales every component identically, whereas `N -> 2N` is a genuine
-    /// change of normaliser.
+    /// A UNIFORM rescale of the alpha vector is invisible to a softmax -- `ln c`
+    /// is common to every candidate -- so no test that only reads posteriors can
+    /// see the denominator at all, at any scale. That is a real property of the
+    /// model, not a gap in the test, and it is why the assertion reads `alpha`
+    /// itself. What duplication adds is that it compares NON-uniform rescalings:
+    /// `N -> N-5` rescales every component identically, whereas `N -> 2N` is a
+    /// genuine change of normaliser.
     #[test]
     fn test_m_step_alpha_is_normalised_by_the_total_molecule_count() {
         let log_pal = (100.0_f32).log2();
@@ -6261,14 +6181,13 @@ mod tests {
 
     /// The abundance estimate is a PER-MOLECULE quantity: the M-step divides each
     /// transcript's accumulated weight by the TOTAL molecule count, so
-    /// `alpha_k = W_k / N`. Both the numerator and the denominator therefore
-    /// double when every read is duplicated, and
+    /// `alpha_k = W_k / N`. Both numerator and denominator double when every read
+    /// is duplicated, and
     ///
     ///     alpha_k(2x) = 2 W_k / 2 N = alpha_k(x)
     ///
     /// The solution must not depend on how many molecules the run happened to
-    /// contain. This is a statement about the ESTIMATOR, not about any particular
-    /// divisor.
+    /// contain. This is a statement about the ESTIMATOR, not about any divisor.
     ///
     /// The tightness, and what limits it. The one-shot quotient is EXACTLY
     /// invariant, but `alpha` is a FIXED POINT of EM, not a one-shot value: `W_k`
@@ -6284,9 +6203,8 @@ mod tests {
     /// defect.
     ///
     /// `mu` and `sigma2` are deliberately NOT asserted here: they are not
-    /// duplication-invariant. The prior term `tau_0 * mu_cohort` does not scale
-    /// with the data, so the shrinkage moves by order 1e-3 here. Asserting them
-    /// would force a tolerance four orders looser than the one this defect needs.
+    /// duplication-invariant, because the prior term `tau_0 * mu_cohort` does not
+    /// scale with the data, so the shrinkage moves by order 1e-3 here.
     #[test]
     fn test_alpha_is_invariant_to_duplicating_every_molecule() {
         let log_pal = (100.0_f32).log2();
@@ -6424,15 +6342,15 @@ mod tests {
     /// The abundance prior `ln alpha` is the MIXTURE prior, not part of the
     /// poly(A) emission, so it must survive `poly_a_weight = 0`.
     ///
-    /// The parameter was originally written as `poly_a_weight * (alpha.ln() - ...)`,
-    /// which looks like a harmless grouping. It is not: at weight 0 the E-step
-    /// never reads alpha, so the M-step's abundance update cannot influence any
-    /// posterior, and the "EM" silently degenerates into a one-shot static
-    /// alignment scorer. The number it prints is still a plausible profile, which
-    /// is exactly why it would have survived review.
+    /// Writing it as `poly_a_weight * (alpha.ln() - ...)` looks like a harmless
+    /// grouping. It is not: at weight 0 the E-step never reads alpha, so the
+    /// M-step's abundance update cannot influence any posterior, and the "EM"
+    /// silently degenerates into a one-shot static alignment scorer. The number
+    /// it prints is still a plausible profile, which is exactly why it would
+    /// survive review.
     ///
-    /// Fixture: unambiguous reads set the prior (tx0 gets 30, tx1 gets 3), then
-    /// ONE ambiguous read with EQUAL `AS` to both, 5' off, poly(A) off. With no
+    /// Fixture: unambiguous reads set the prior (tx0 gets 30, tx1 gets 3), then ONE
+    /// ambiguous read with EQUAL `AS` to both, 5' off, poly(A) off. With no
     /// evidence of its own, that read must follow the prior. If alpha is scaled
     /// away the two candidates are exactly tied and it splits 50/50.
     ///
@@ -6492,8 +6410,8 @@ mod tests {
     /// this arm is not, and cannot be made, an alignment-only baseline.
     ///
     /// This cannot be faked from the outside. The obvious data trick -- pin `mu`
-    /// and `sigma2` to the same value for every transcript so the Gaussian term
-    /// is a constant that cancels in the softmax -- does NOT work, because the
+    /// and `sigma2` to the same value for every transcript so the Gaussian term is
+    /// a constant that cancels in the softmax -- does NOT work, because the
     /// `ln alpha_k` term is re-estimated by the M-step and would still carry the
     /// abundance prior into every candidate's log-likelihood. Hence a parameter.
     ///
@@ -6651,9 +6569,7 @@ mod tests {
     /// `weights`, but the emit loop then drops rows that are `!p.is_competent` or
     /// missing from `params`. That is only sound because the E-step pushes
     /// incompetent candidates as `-inf` and `filter(ll > -inf)` removes them from
-    /// `weights` before the denominator is ever taken. Nothing TESTED it, so a
-    /// future change to the competence mask would make every read's emitted
-    /// weights sum to less than 1.0 with the suite still green.
+    /// `weights` before the denominator is ever taken.
     ///
     /// The fixture puts the 5-nat handicap on the **COMPETENT** transcript, so the
     /// INCOMPETENT one is the candidate the likelihood likes most. That direction
@@ -6753,28 +6669,26 @@ mod tests {
     /// is SPLIT, so the denominator is pinned by the per-row values as well as by
     /// the sum, and all three exclusion routes are in the same read:
     ///
-    /// | candidate | route out                                    | weight |
-    /// |-----------|----------------------------------------------|--------|
-    /// | `tx0`     | retained                                    | 0.80   |
-    /// | `tx1`     | retained                                    | 0.15   |
-    /// | `tx2`     | `w = 0.005 < min_weight` -> TRUNCATED        | 0.005  |
-    /// | `tx3`     | `is_polyA_competent = false` -> E-step `-inf`| 1.00   |
+    /// | candidate | route out                                     | weight |
+    /// |-----------|-----------------------------------------------|--------|
+    /// | `tx0`     | retained                                     | 0.80   |
+    /// | `tx1`     | retained                                     | 0.15   |
+    /// | `tx2`     | `w = 0.005 < min_weight` -> TRUNCATED         | 0.005  |
+    /// | `tx3`     | `is_polyA_competent = false` -> E-step `-inf` | 1.00   |
     /// | `tx4`     | no emission row -> E-step `if let Some` skip | 1.00   |
     ///
-    /// The handicaps are `mu` offsets sized so `(y - mu)^2 / (2σ²)` differs by
-    /// exactly `ln(0.80/0.15)` and `ln(0.80/0.005)` nats. All five candidates
+    /// The handicaps are `mu` offsets sized so `(y - mu)^2 / (2 sigma^2)` differs
+    /// by exactly `ln(0.80/0.15)` and `ln(0.80/0.005)` nats. All five candidates
     /// carry EQUAL `AS`, so `ln_a = 0` for all and the split is the emission term
     /// alone. `max_iter = 1` freezes the posterior to the E-step that ran on the
     /// initial (uniform) prior, so the expected values below are exact.
     ///
-    /// Mutation targets, both confirmed to turn this red:
-    ///   * the denominator summing over ALL weights (`*w >= 0.0`) leaves the two
-    ///     survivors at 0.8377 / 0.1571 and the read summing to 0.9948;
-    ///   * the E-step's competence mask bypassed lets `tx3` -- the FAVOURED
-    ///     candidate, by construction -- take ~0.98 of the mass into
-    ///     `retained_sum` and into a row, dropping `tx0` to ~0.0067. The sum
-    ///     stays 1.0 under that mutation, which is why the per-row values are
-    ///     asserted and not just the sum.
+    /// Both mutations are load-bearing: summing the denominator over ALL weights
+    /// leaves the two survivors at 0.8377 / 0.1571 and the read summing to
+    /// 0.9948; bypassing the E-step's competence mask lets `tx3` -- the FAVOURED
+    /// candidate, by construction -- take ~0.98 of the mass, dropping `tx0` to
+    /// ~0.0067 while the SUM stays 1.0, which is why the per-row values are
+    /// asserted and not just the sum.
     #[test]
     fn test_retained_sum_covers_exactly_the_rows_emitted_when_all_three_exclusions_fire() {
         let log_pal = (100.0_f32).log2();
@@ -6956,16 +6870,15 @@ mod tests {
     ///
     /// The test above only ever retains one row, so its emitted weight is
     /// `w / w_max = 1.0` by construction and the interesting arithmetic --
-    /// dividing **several** surviving rows by a `retained_sum < 1` -- is never
-    /// exercised. Three candidates split the posterior in the ratio
-    /// 0.80 : 0.15 : 0.005. The third is below `MIN_WEIGHT` (0.01) and is
-    /// truncated, so 0.005 of probability mass is destroyed and the denominator
-    /// drops to the retained 0.80 + 0.15. The emitted rows must therefore be
-    /// ≈ 0.8421 / 0.1579 -- not 0.80 / 0.15 -- and sum to 1.0.
+    /// dividing SEVERAL surviving rows by a `retained_sum < 1` -- is never
+    /// exercised. Three candidates split the posterior 0.80 : 0.15 : 0.005; the
+    /// third is below `MIN_WEIGHT` (0.01) and is truncated, so 0.005 of mass is
+    /// destroyed and the denominator drops to 0.80 + 0.15. The emitted rows must
+    /// therefore be ~ 0.8421 / 0.1579 -- not 0.80 / 0.15 -- and sum to 1.0.
     ///
-    /// Mutation target: summing the denominator over ALL weights instead of the
-    /// retained ones leaves the emitted rows at 0.8377 / 0.1571, summing to
-    /// ≈ 0.9948, and this test goes red.
+    /// Summing the denominator over ALL weights instead of the retained ones leaves
+    /// the emitted rows at 0.8377 / 0.1571, summing to ~ 0.9948, and this test
+    /// goes red.
     #[test]
     fn test_emitted_weights_renormalize_across_multiple_retained_rows() {
         let log_pal = (100.0_f32).log2();
@@ -7053,11 +6966,10 @@ mod tests {
     /// bad parameter becomes NaN posterior weights, and it is NaN-safe, which
     /// `!(x > 0.0)` is not.
     ///
-    /// Mutation targets: `five_prime_weight < 0.0` → `<= 0.0` rejects the
-    /// documented off switch and makes the 5' ablation unrunnable; dropping
-    /// `.is_nan()` lets a NaN weight through every comparison and emits NaN
-    /// posteriors; dropping the `prune_max_delta_as < 0` check lets a negative
-    /// threshold drop each read's own argmax.
+    /// `five_prime_weight < 0.0` -> `<= 0.0` rejects the documented off switch;
+    /// dropping `.is_nan()` lets a NaN weight through every comparison and emits
+    /// NaN posteriors; dropping the `prune_max_delta_as < 0` check lets a
+    /// negative threshold drop each read's own argmax.
     #[test]
     fn test_parameter_validation_rejects_bad_values_and_accepts_the_off_switch() {
         let log_pal = (100.0_f32).log2();
@@ -7174,20 +7086,19 @@ mod tests {
 
     /// TEST A of the ablation gate: the 5' term must reach the posterior.
     ///
-    /// Two candidates with IDENTICAL `AS` (so `ln_a ≡ 0` and `A_rk` cannot
+    /// Two candidates with IDENTICAL `AS` (so `ln_a == 0` and `A_rk` cannot
     /// separate them) and identical emission parameters, differing only in the
     /// observed 5' gap: tx0 starts 5 bp from the transcript 5' end
     /// (`g_k = 5 <= 20`) and tx1 starts 500 bp in (`g_k = 500 > 20`). The
     /// 1.8-nat bonus must give tx0 `e^1.8 / (1 + e^1.8) = 0.858149`.
     ///
-    /// This isolates the term: holding AS and the emission fixed is the only way
-    /// `ln_5p` can be the explanation for the shift.
+    /// Holding AS and the emission fixed is the only way `ln_5p` can be the
+    /// explanation for the shift.
     ///
-    /// Mutation targets: dropping `+ ln_5p` from the E-step, computing the window
-    /// as `g_k < 20` (this fixture would still pass -- see
-    /// `test_five_prime_window_is_inclusive_at_20`), reading the gap from the
-    /// wrong pool index, or leaving `FIVE_PRIME_WEIGHT` at 0 all flatten the pair
-    /// to 0.5 / 0.5 and turn this red.
+    /// Dropping `+ ln_5p` from the E-step, reading the gap from the wrong pool
+    /// index, or leaving `FIVE_PRIME_WEIGHT` at 0 all flatten the pair to
+    /// 0.5 / 0.5 and turn this red. Computing the window as `g_k < 20` would
+    /// still pass here -- see `test_five_prime_window_is_inclusive_at_20`.
     #[test]
     fn test_five_prime_term_shifts_posterior_toward_the_anchored_candidate() {
         let rows = two_candidate_posteriors(
@@ -7225,12 +7136,12 @@ mod tests {
     /// This is a NO-LEAK test, not a liveness test: the redraw makes the two
     /// candidates identical, so a flat 0.5/0.5 is the correct answer under ANY
     /// implementation, including one with the term removed entirely. The tests
-    /// that actually prove the term is live are
+    /// that prove the term is live are
     /// `test_five_prime_term_shifts_posterior_toward_the_anchored_candidate` and
     /// `test_five_prime_window_is_inclusive_at_20`.
     ///
-    /// The acceptance criterion for the real ablation is a DIFFERENCE (Test A −
-    /// Test B ≥ 20 pp), never an absolute percentage, because the absolute value
+    /// The acceptance criterion for the real ablation is a DIFFERENCE (Test A -
+    /// Test B >= 20 pp), never an absolute percentage, because the absolute value
     /// is measured against a label that is not ground truth.
     ///
     /// Both redraw flavours must return the read to a flat 0.5 / 0.5:
@@ -7328,10 +7239,10 @@ mod tests {
         );
     }
 
-    /// Pins the posterior at the shipped λ default of 20.0, which until now no
-    /// test exercised at all: every pre-existing test passed λ = 100 explicitly.
+    /// Pins the posterior at the shipped λ default of 20.0, which no other
+    /// test exercises: every other test passes λ = 100 explicitly.
     ///
-    /// `ΔAS = 40` at λ = 20 is a 2.0-nat gap → 0.880797, the same value the A_rk
+    /// `ΔAS = 40` at λ = 20 is a 2.0-nat gap -> 0.880797, the same value the A_rk
     /// test reaches at `ΔAS = 200` / λ = 100. `ΔAS = 40` is under the prune
     /// threshold, so this pin is unaffected by pruning.
     ///
@@ -7360,24 +7271,21 @@ mod tests {
         );
     }
 
-    /// The `ΔAS > 50` prune is a hard drop of real posterior mass, so the two
-    /// things that can go wrong silently are (1) it fails to fire, and (2) it
+    /// The `Delta-AS > 50` prune is a hard drop of real posterior mass, so the
+    /// two things that can go wrong silently are (1) it fails to fire, and (2) it
     /// fires in a way that leaves the emitted weights summing to less than 1.
     ///
-    /// `ΔAS = 200` against a `PRUNE_OFF` run is the same fixture with the
-    /// mechanism toggled, so the only difference between the two is the prune
-    /// itself.
+    /// `Delta-AS = 200` against a `PRUNE_OFF` run is the same fixture with the
+    /// mechanism toggled, so the only difference between the two is the prune.
     ///
-    /// Mutation targets: inverting the comparison drops the argmax and empties
-    /// the read; writing the prune on the `ln_a` numerator (which is non-positive)
-    /// makes it never fire at all, and every assertion below then passes on the
-    /// `min_weight` cutoff instead -- see
-    /// `test_prune_boundary_is_strictly_greater_than`.
+    /// Inverting the comparison drops the argmax and empties the read; writing
+    /// the prune on the `ln_a` numerator (which is non-positive) makes it never
+    /// fire at all, and every assertion below then passes on the `min_weight`
+    /// cutoff instead -- see `test_prune_boundary_is_strictly_greater_than`.
     ///
-    /// Note one mutation that deliberately does NOT turn this red: replacing the
-    /// `-inf` push with a bare `continue`. The two are equivalent here because
-    /// `weights` is built with `filter(ll > -inf)`; see the comment at the prune
-    /// for why, and do not read this test as covering it.
+    /// One mutation deliberately does NOT turn this red: replacing the `-inf`
+    /// push with a bare `continue`. The two are equivalent here because `weights`
+    /// is built with `filter(ll > -inf)`; do not read this test as covering it.
     #[test]
     fn test_delta_as_prune_drops_the_candidate_and_keeps_weights_normalised() {
         let candidates: &[(&str, i32, u32)] = &[("tx0", 1000, 900), ("tx1", 800, 900)];
@@ -7430,7 +7338,7 @@ mod tests {
         //
         // The region where this matters is `50 < ΔAS < 4.595 × 20 = 91.9`: inside it
         // the prune is strictly stronger than the output cutoff, and it is the whole
-        // reason the prune exists now that λ = 20.
+        // reason the prune exists at the shipped lambda = 20.
         let keepable: &[(&str, i32, u32)] = &[("tx0", 1000, 900), ("tx1", 940, 900)];
         let pruned_60 = two_candidate_posteriors(
             "prune_60_on",
@@ -7555,17 +7463,17 @@ mod tests {
         // the same pair in the same order would make both resolve to tx0 and would
         // let an off-by-one join pass.
         let mut candidate_pool = vec![2, 0, 1, 1, 0];
-        // The `ΔAS` of each ambiguous read is STRICTLY POSITIVE and STRICTLY BELOW
-        // `PRUNE_MAX_DELTA_AS` (50): 30 for AMB_TX0 and 40 for AMB_TX1.
+        // The `Delta-AS` of each ambiguous read is STRICTLY POSITIVE and STRICTLY
+        // BELOW `PRUNE_MAX_DELTA_AS` (50): 30 for AMB_TX0 and 40 for AMB_TX1.
         //
         // Both bounds are load-bearing. If the upper one is violated the prune drops
         // the runner-up before the softmax ever sees it, so every ambiguous read
         // collapses to a ONE-element posterior with `top_weight == 1.0` and
         // `entropy == 0.0` -- and because those two numbers are forced by the
         // arithmetic of a one-element vector rather than measured, mutating either
-        // field to a constant left every test green. The two `ΔAS` values are also
-        // deliberately UNEQUAL, so the two reads' posteriors differ and a join that
-        // swapped them cannot pass by coincidence.
+        // field to a constant left every test green. The two `Delta-AS` values are
+        // also deliberately UNEQUAL, so the two reads' posteriors differ and a join
+        // that swapped them cannot pass by coincidence.
         candidate_pool.shrink_to_fit();
         let candidate_as = vec![1000, 900, 870, 900, 860];
         let n = candidate_pool.len();
@@ -7585,13 +7493,13 @@ mod tests {
     /// A two-molecule graph: `PLAIN` has one candidate, `CULLED` has two at
     /// EQUAL `AS` -- so its posterior is exactly 0.5 / 0.5.
     ///
-    /// The tie is exact and stays exact under the M-step, which is what makes this
-    /// fixture usable: `CULLED` splits its weight 50/50 between tx1 and tx2, so
-    /// the two receive identical emission-parameter updates and identical
-    /// abundances, and the only term left to separate them is the one that is
-    /// zero for both. Running at `min_weight = 0.9` therefore culls BOTH of
-    /// `CULLED`'s candidates -- and the output stage then retains the argmax and
-    /// publishes the read under it, at weight 1.0.
+    /// The tie is exact and stays exact under the M-step: `CULLED` splits its
+    /// weight 50/50 between tx1 and tx2, so the two receive identical
+    /// emission-parameter updates and identical abundances, and the only term left
+    /// to separate them is the one that is zero for both. Running at
+    /// `min_weight = 0.9` therefore culls BOTH of `CULLED`'s candidates -- and the
+    /// output stage then retains the argmax and publishes the read under it, at
+    /// weight 1.0.
     ///
     /// `PLAIN` is in the same graph so "CULLED's row was forced" is not
     /// vacuously true of a profile that is empty for unrelated reasons.
@@ -7634,8 +7542,8 @@ mod tests {
     /// `-inf`, and the read comes back with an EMPTY weight vector: a ghost
     /// drop, counted in `n_dropped_no_competent_candidates`.
     ///
-    /// `LIVE` sits beside it so the assertions that `GHOST` is absent from
-    /// both tables are not vacuously true of an empty graph.
+    /// `LIVE` sits beside it so the assertions that `GHOST` is absent from both
+    /// tables are not vacuously true of an empty graph.
     fn ghost_read_beside_a_live_one(log_pal: f32) -> FlatEvidenceGraph {
         let mut molecules = vec![
             MoleculeEvidence {
@@ -7676,24 +7584,21 @@ mod tests {
     ///
     /// Tie-break determinism. The argmax fold at the output stage uses strict
     /// `>`, so on an EXACT posterior tie the FIRST candidate in pool order wins.
-    /// That rule was unpinned, and a refactor could have changed which
-    /// transcript a tied read is assigned to without any test objecting.
     ///
     /// The tie here is EXACT, not approximate, and that is the point. All four
     /// evidence terms are identical between the two candidates:
-    ///   - `candidate_as` equal   => the alignment term is equal
+    ///   - `candidate_as` equal      => the alignment term is equal
     ///   - `candidate_5p_gap` equal (both 0, inside the window) => equal
     ///   - identical (mu, sigma2) in the emission table => the Gaussian is equal
     ///   - so the softmax inputs are equal in every component, hence the
     ///     posterior is bitwise equal and the fold must break the tie
     ///
-    /// `ΔAS = 0` is also below `PRUNE_MAX_DELTA_AS`, so neither candidate is
+    /// `Delta-AS = 0` is also below `PRUNE_MAX_DELTA_AS`, so neither candidate is
     /// pruned: a one-element posterior would make this test pass for the wrong
     /// reason.
     ///
-    /// MUTATION: `w > acc.1` -> `w >= acc.1` must turn THIS test red, because
-    /// `>=` lets the later equal element overwrite the earlier one and the winner
-    /// becomes `tx1`.
+    /// `w > acc.1` -> `w >= acc.1` must turn THIS test red, because `>=` lets the
+    /// later equal element overwrite the earlier one and the winner becomes `tx1`.
     #[test]
     fn test_tied_posterior_resolves_to_the_first_candidate_in_pool_order() {
         let log_pal = (100.0_f32).log2();
@@ -8031,21 +7936,19 @@ mod tests {
 
     /// `top_tx_id == Some(..)` must IMPLY that the read has a profile row.
     ///
-    /// It now holds for BOTH non-ghost paths. Previously the all-culled path
-    /// violated it: `read_assign[mol_idx]` was written in the ambiguous branch,
-    /// which runs BEFORE the emit loop's `min_weight` filter, so a read whose
-    /// every candidate fell below the cutoff carried a real `top_tx_id` while
+    /// It holds for BOTH non-ghost paths. The all-culled path is the one that can
+    /// break it: `read_assign[mol_idx]` is written in the ambiguous branch, which
+    /// runs BEFORE the emit loop's `min_weight` filter, so a read whose every
+    /// candidate fell below the cutoff would carry a real `top_tx_id` while
     /// emitting ZERO profile rows -- a numerator entry with no denominator, in a
-    /// table whose whole purpose is a cross-run join. That read is now retained
-    /// and emitted under its argmax instead, so the two tables agree.
+    /// table whose whole purpose is a cross-run join. Such a read is retained and
+    /// emitted under its argmax instead, so the two tables agree.
     ///
-    /// The assertion is the cross-run join's own invariant, stated on the data
-    /// rather than argued from the code. The converse is still not claimed, and the
-    /// ghost shape is the reason -- see
+    /// The converse is still not claimed, and the ghost shape is the reason -- see
     /// `test_ghost_read_is_recorded_as_unassignable_and_absent_from_the_profile`.
     ///
-    /// Mutation target: removing the `&& !(argmax_only && Some(tx_id) == top)`
-    /// exemption from the emit loop's `min_weight` test makes this red.
+    /// Removing the `&& !(argmax_only && Some(tx_id) == top)` exemption from the
+    /// emit loop's `min_weight` test makes this red.
     #[test]
     fn test_all_culled_read_is_published_under_its_argmax_and_joins() {
         let log_pal = (100.0_f32).log2();
@@ -8259,9 +8162,9 @@ mod tests {
     /// out of the profile, so the read ends up naming, as its top-1, a transcript
     /// it has no profile row for.
     ///
-    /// This is the per-TRANSCRIPT half of the invariant the per-read checks above
-    /// cover only from the outside: those ask "does the named read have some
-    /// profile row", which stays satisfied here because `GOOD` supplies one.
+    /// This is the per-TRANSCRIPT half of the invariant the per-read checks cover
+    /// only from the outside: those ask "does the named read have SOME profile
+    /// row", which stays satisfied here because `GOOD` supplies one.
     #[test]
     fn test_incompetent_but_present_transcript_is_never_a_reads_top1() {
         let log_pal = (100.0_f32).log2();
@@ -8485,11 +8388,12 @@ mod tests {
     }
 
     /// Direct unit test of the poly(A)-degradation predicate. The number it feeds,
-    /// `n_polya_zero_power / n_ambiguous`, was computed by this function with
-    /// nothing testing it: replacing the body with `false` left the whole suite
-    /// green. It is no longer printed by the CLI because it was being read as a
-    /// validity metric, but the predicate is still the tripwire that catches
-    /// parameters collapsing to one identical float.
+    /// `n_polya_zero_power / n_ambiguous`, is computed by this function, so the
+    /// predicate must be pinned by a test of its own.
+    ///
+    /// It is not printed by the CLI because it was being read as a validity
+    /// metric, but the predicate is still the tripwire that catches parameters
+    /// collapsing to one identical float.
     ///
     /// The cases that matter are the ones a plausible re-implementation gets
     /// wrong. A "do the mus match?" comparison alone would pass the headline
@@ -8552,15 +8456,14 @@ mod tests {
         }
 
         // 3b. A disagreement in the THIRD candidate must not be masked by the first
-        //     two agreeing -- the comparison is against the first candidate, not
+        //     two agreeing -- the comparison is against the FIRST candidate, not
         //     against the immediately preceding one.
         //
-        //     THE COUNT IS 3, NOT 2, AND THAT IS THE POINT. An earlier version of
-        //     this function returned `false` on the first disagreement, so a loop that
-        //     counted as it went would report 2 here. That undercount lands only on
-        //     DISAGREEING reads -- the ones where poly(A) did something -- which
-        //     would bias `emission coverage` downward while leaving the zero-power
-        //     headline untouched.
+        //     THE COUNT IS 3, NOT 2, AND THAT IS THE POINT. A loop that returned
+        //     early on the first disagreement would report 2 here. That undercount
+        //     lands only on DISAGREEING reads -- the ones where poly(A) did
+        //     something -- which would bias `emission coverage` downward while
+        //     leaving the zero-power headline untouched.
         {
             let (g, p) = zero_power_probe(&[Some((MU, S2)), Some((MU, S2)), Some((MU, S2 + 0.4))]);
             assert_eq!(
@@ -8652,13 +8555,13 @@ mod tests {
     /// E-STEP's `last_estep_params`, it lands in the struct, and unambiguous reads
     /// are excluded from it.
     ///
-    /// It previously read the POST-EM `params`. That was the stale-μ defect: on
+    /// The counter must read the E-STEP state, not the post-M-step `params`: on
     /// the `max_iter`-exhaustion path those are one M-step past the state that
-    /// produced the posterior. This fixture still passes either way -- `poly_a_weight
-    /// = 0` freezes `mu`/`sigma2`, and the predicate reads ONLY `mu`/`sigma2`, so
-    /// pre- and post-M-step are identical for the fields it looks at. That is
-    /// exactly why this test could never have caught the defect, and why the
-    /// positive arm in
+    /// produced the posterior. This fixture still passes either way --
+    /// `poly_a_weight = 0` freezes `mu`/`sigma2`, and the predicate reads ONLY
+    /// `mu`/`sigma2`, so pre- and post-M-step are identical for the fields it
+    /// looks at. That is exactly why this test cannot catch the defect, and why
+    /// the positive arm in
     /// `test_zero_power_telemetry_reads_the_e_step_state_not_the_post_m_step`
     /// exists: it runs at `poly_a_weight > 0`, where the M-step DOES move the
     /// fields the predicate reads.
@@ -8667,7 +8570,7 @@ mod tests {
         let log_pal = (100.0_f32).log2();
         let emission = scratch("zero_power_emission.parquet");
         let profile = scratch("zero_power_profile.parquet");
-        // tx0..tx3 all carry the SHARED fit (the L2 / L3 fallback shape);
+        // tx0..tx3 all carry the SHARED fit (the shared-cohort-fit shape);
         // tx4 splits on mu, tx5 splits on sigma2. Gene ids are irrelevant here
         // (the M-step is frozen) and are kept distinct so a reader does not
         // infer anything from them.
@@ -8781,12 +8684,12 @@ mod tests {
     /// THE VACUITY SPLIT, end to end, on a model that is NOT 100% covered.
     ///
     /// The unit test above pins the predicate and the test above it pins that the
-    /// counter reaches `TelEmStats`. Neither can see the difference the whole
-    /// change is about, because both fixtures give every candidate an emission
-    /// row. This one does not: `tx6` is deliberately absent from the emission
-    /// parquet, so reads can have fewer present candidates than they have
-    /// candidates -- which is the condition that makes `zero-power_all` report a
-    /// cancellation that never happened.
+    /// counter reaches `TelEmStats`. Neither can see the difference the split is
+    /// about, because both fixtures give every candidate an emission row. This one
+    /// does not: `tx6` is deliberately absent from the emission parquet, so reads
+    /// can have fewer present candidates than they have candidates -- the
+    /// condition that makes `zero-power_all` report a cancellation that never
+    /// happened.
     ///
     /// The fixture's whole job is one number pair:
     ///
@@ -8800,12 +8703,12 @@ mod tests {
     /// `zero-power_all` counts it anyway because that is what it has always done.
     ///
     /// What this pins that the census unit test cannot: that the CALL SITE routes
-    /// each cause to the field the CLI reads, and that a read which loses only
-    /// SOME of its candidates increments NOTHING. The second half is the
-    /// load-bearing half -- a solver that counted every read with any dead
-    /// candidate would produce plausible-looking numbers for every cause and
-    /// still be wrong, because the number the padding experiment turns on is
-    /// "reads that padding would rescue", not "reads with something wrong".
+    /// each cause to the field the CLI reads, and that a read which loses only SOME
+    /// of its candidates increments NOTHING. The second half is the load-bearing
+    /// half -- a solver that counted every read with any dead candidate would
+    /// produce plausible-looking numbers for every cause and still be wrong,
+    /// because the number the padding experiment turns on is "reads that padding
+    /// would rescue", not "reads with something wrong".
     ///
     /// `max_iter = 1` on purpose. `alpha` only reaches 0 through the M-step, and
     /// a transcript can only win no mass if it was already dead, so
@@ -8949,7 +8852,7 @@ mod tests {
         let emission = scratch("drop_taxonomy_emission.parquet");
         let profile = scratch("drop_taxonomy_profile.parquet");
         // tx4 and tx5 are INTENTIONALLY ABSENT: transcripts the emission model
-        // never fitted, the shape of the 37,081 missing rows.
+        // never fitted -- the shape of a transcript the model never saw.
         write_test_emission_with_competence(
             &emission,
             &[
@@ -9119,8 +9022,8 @@ mod tests {
         let emission = scratch("zero_power_split_emission.parquet");
         let profile = scratch("zero_power_split_profile.parquet");
         // tx6 is INTENTIONALLY ABSENT. It is a transcript in the graph that the
-        // emission model never fitted -- the shape of the 37,081 rows missing
-        // from the HC2 model, reduced to one transcript.
+        // emission model never fitted -- the shape of a transcript the model
+        // never saw, reduced to one transcript.
         write_test_emission(
             &emission,
             &[
@@ -9242,7 +9145,7 @@ mod tests {
         );
     }
 
-    /// The stale-μ defect, as a test.
+    /// The stale-mu defect, as a test.
     ///
     /// Two arms, ONE shared emission parquet, ONE shared graph, differing ONLY in
     /// `poly_a_weight`. Both arms' E-steps therefore consume the IDENTICAL
@@ -9251,22 +9154,22 @@ mod tests {
     /// the same count. The M-step cannot change that: it runs after the E-step
     /// that produced the posterior, and the telemetry is about the posterior.
     ///
-    /// Pre-fix this fails, and with a SIGN rather than merely "not equal": reading
-    /// post-M-step `params` lets the M-step's τ₀=2 shrinkage pull the tied fits
-    /// apart, so the ON arm counts STRICTLY FEWER than the OFF arm. An assertion
-    /// of the form `assert_ne!` would also have passed on a fixture that broke
-    /// for an unrelated reason.
+    /// The assertion is on a SIGN rather than merely on inequality: reading
+    /// post-M-step `params` lets the M-step's tau_0 = 2 shrinkage pull the tied
+    /// fits apart, so the ON arm counts STRICTLY FEWER than the OFF arm. An
+    /// `assert_ne!` would also have passed on a fixture that broke for an
+    /// unrelated reason.
     ///
-    /// `max_iter = 1` is REQUIRED: it is the `max_iter`-exhaustion exit path, the
-    /// one where the M-step runs last and leaves `params` a full M-step ahead of
-    /// the posterior. On a converged run the loop `break`s BEFORE the M-step and
-    /// this defect is invisible.
+    /// `max_iter = 1` is REQUIRED: it is the `max_iter`-exhaustion exit path,
+    /// the one where the M-step runs last and leaves `params` a full M-step ahead
+    /// of the posterior. On a converged run the loop `break`s BEFORE the M-step
+    /// and the defect is invisible.
     #[test]
     fn test_zero_power_telemetry_reads_the_e_step_state_not_the_post_m_step() {
         let log_pal = (100.0_f32).log2();
         let emission = scratch("estep_state_emission.parquet");
-        // tx0 and tx1 share ONE loaded fit — the L3-fallback shape, where two
-        // underpowered transcripts in a gene both take the same cohort value.
+        // tx0 and tx1 share ONE loaded fit -- the shared-cohort-fit shape, where
+        // two underpowered transcripts in a gene both take the same cohort value.
         // That shared fit is what makes the reads below zero-power.
         write_test_emission(
             &emission,
@@ -9366,12 +9269,11 @@ mod tests {
 
         // The SECOND consumer of the snapshot, pinned separately.
         //
-        // The assertion above went red when the TELEMETRY read `params`, but reverting
-        // the `output_emission_params` half of the same fix turned ZERO tests red --
-        // the pre-existing tests on that out-param all straddle the difference, so
-        // the suite could not tell the two states apart. That left the "one snapshot,
-        // two consumers ... by construction" comment an unbacked claim. This is the
-        // mutation that makes it true.
+        // The assertion above pins the TELEMETRY half of the snapshot contract;
+        // this pins the `output_emission_params` half. Both must read the params
+        // the LAST E-step CONSUMED, and the two states differ by one M-step, so
+        // the pre-existing tests on that out-param all straddle the difference
+        // and cannot tell the two states apart.
         let p0 = on_params[0].as_ref().expect("tx0 has an emission row");
         assert_eq!(
             (p0.mu, p0.sigma2),

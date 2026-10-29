@@ -493,8 +493,8 @@ fn build_anchors_reports_a_retired_unique_bucket_of_zero() {
     assert_eq!(
         int_field(&json, "unique"),
         0,
-        "`unique` is a RETIRED compat slot: the MAPQ < 20 gate was removed in \
-         R139 because it discarded every secondary on HC2 and left every \
+        "`unique` is a RETIRED compat slot: the MAPQ < 20 gate was removed \
+         because it discarded every secondary candidate and left every \
          surviving read with one candidate, which made strict argmax, the gap \
          floor and the same-gene veto dead code. The key stays in the frozen v1 \
          schema; the value must stay 0.\n{json}"
@@ -685,7 +685,7 @@ fn a_build_anchors_run_without_gap_abs_uses_the_ruled_default_of_twelve() {
     assert!(
         stderr.contains("gap_abs:    12 (active)"),
         "the SHIPPED default must be 12.0 and the banner must say `active`. \
-         A banner reading `gap_abs: 0 (OFF ...)` is the pre-R141 default and \
+         A banner reading `gap_abs: 0 (OFF ...)` is the disabled default and \
          every gap-based rejection on this data would silently disappear.\n\
          stderr:\n{stderr}"
     );

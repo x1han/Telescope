@@ -341,13 +341,17 @@ pub fn resolve_rscript(explicit: Option<&Path>) -> PathBuf {
 
 /// Locate the R engine: explicit path, then `$TELESCOPE_DIFF_R`, then the
 /// conda data directory, then the copy shipped beside the binary.
+///
+/// A path the caller NAMED is checked for existence here, so a typo is
+/// reported as "that file does not exist" rather than as "the engine ran and
+/// failed" — the two need different responses from the operator.
 pub fn resolve_r_script(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(p) = explicit {
-        return Ok(p.to_path_buf());
+        return check_engine_path(p);
     }
     if let Ok(v) = std::env::var("TELESCOPE_DIFF_R") {
         if !v.trim().is_empty() {
-            return Ok(PathBuf::from(v));
+            return check_engine_path(Path::new(&v));
         }
     }
     let mut candidates: Vec<PathBuf> = Vec::new();
@@ -377,6 +381,18 @@ pub fn resolve_r_script(explicit: Option<&Path>) -> Result<PathBuf> {
             .collect::<Vec<_>>()
             .join(", ")
     )
+}
+
+fn check_engine_path(p: &Path) -> Result<PathBuf> {
+    if !p.is_file() {
+        bail!(
+            "the R engine does not exist: {}. Point --r-script at the engine script \
+             (workflow/scripts/telescope_diff.R in this repository), or set \
+             TELESCOPE_DIFF_R.",
+            p.display()
+        );
+    }
+    Ok(p.to_path_buf())
 }
 
 /// Run the differential layer.
@@ -437,4 +453,147 @@ pub fn run(args: &DiffArgs) -> Result<()> {
         args.output_dir.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use arrow::array::{Float64Builder, Int32Builder, StringBuilder};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+
+    /// Build a profile parquet with the published schema and the given rows.
+    fn write_profile(path: &Path, rows: &[(&str, &str, &str, i32, f64)]) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("sample_id", DataType::Utf8, false),
+            Field::new("gene_id", DataType::Utf8, false),
+            Field::new("transcript_id", DataType::Utf8, false),
+            Field::new("polyA_length", DataType::Int32, false),
+            Field::new("posterior_weight", DataType::Float64, false),
+        ]));
+        let mut s = StringBuilder::new();
+        let mut g = StringBuilder::new();
+        let mut t = StringBuilder::new();
+        let mut p = Int32Builder::new();
+        let mut w = Float64Builder::new();
+        for (sample, gene, tx, pal, pw) in rows {
+            s.append_value(sample);
+            g.append_value(gene);
+            t.append_value(tx);
+            p.append_value(*pal);
+            w.append_value(*pw);
+        }
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(s.finish()),
+                Arc::new(g.finish()),
+                Arc::new(t.finish()),
+                Arc::new(p.finish()),
+                Arc::new(w.finish()),
+            ],
+        )
+        .expect("batch");
+        let file = File::create(path).expect("create");
+        let mut w = ArrowWriter::try_new(file, schema, None).expect("writer");
+        w.write(&batch).expect("write");
+        w.close().expect("close");
+    }
+
+    #[test]
+    fn aggregation_sums_the_posterior_mass_and_the_weighted_tail_length() {
+        let dir = std::env::temp_dir().join("telescope_diff_agg_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("S1.profile.parquet");
+        write_profile(
+            &path,
+            &[
+                ("S1", "G1", "T1", 100, 0.5),
+                ("S1", "G1", "T1", 200, 0.25),
+                ("S1", "G1", "T2", 50, 1.0),
+            ],
+        );
+        let rows = aggregate_profile(&path).expect("aggregate");
+        assert_eq!(rows.len(), 2);
+
+        // T1: mass 0.75. `weighted_log2pal_sum` is the NUMERATOR of the
+        // posterior-weighted mean log2 tail length, i.e. sum(w * log2(pal));
+        // the mean itself is that divided by the mass.
+        let t1 = rows.iter().find(|r| r.transcript_id == "T1").unwrap();
+        assert!((t1.weight_sum - 0.75).abs() < 1e-12);
+        let num = 0.5 * 100f64.log2() + 0.25 * 200f64.log2();
+        assert!((t1.weighted_log2pal_sum - num).abs() < 1e-12);
+        let mean = t1.weighted_log2pal_sum / t1.weight_sum;
+        assert!((mean - num / 0.75).abs() < 1e-12);
+
+        // T2: mass 1.0, so numerator and mean are both log2(50)
+        let t2 = rows.iter().find(|r| r.transcript_id == "T2").unwrap();
+        assert!((t2.weight_sum - 1.0).abs() < 1e-12);
+        assert!((t2.weighted_log2pal_sum - 50f64.log2()).abs() < 1e-12);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_zero_tail_length_is_floored_at_one_rather_than_producing_minus_infinity() {
+        let dir = std::env::temp_dir().join("telescope_diff_pal_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("S1.profile.parquet");
+        write_profile(&path, &[("S1", "G1", "T1", 0, 1.0)]);
+        let rows = aggregate_profile(&path).expect("aggregate");
+        assert_eq!(rows.len(), 1);
+        // log2(max(0, 1)) = 0
+        assert!(rows[0].weighted_log2pal_sum.is_finite());
+        assert!((rows[0].weighted_log2pal_sum - 0.0).abs() < 1e-12);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_aggregate_table_round_trips_the_floats_exactly() {
+        let dir = std::env::temp_dir().join("telescope_diff_tsv_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let rows = vec![AggRow {
+            sample_id: "S1".into(),
+            gene_id: "G1".into(),
+            transcript_id: "T1".into(),
+            weight_sum: 0.1 + 0.2,
+            weighted_log2pal_sum: 1.0 / 3.0,
+        }];
+        let path = dir.join("agg.tsv");
+        write_aggregate_tsv(&path, &rows).expect("write");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut lines = text.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "sample_id\tgene_id\ttranscript_id\tweight_sum\tweighted_log2pal_sum"
+        );
+        let f: Vec<&str> = lines.next().unwrap().split('\t').collect();
+        assert_eq!(&f[..3], &["S1", "G1", "T1"]);
+        // The shortest round-tripping form, so R reads back the same bits.
+        assert_eq!(f[3].parse::<f64>().unwrap(), 0.1 + 0.2);
+        assert_eq!(f[4].parse::<f64>().unwrap(), 1.0 / 3.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_named_engine_that_does_not_exist_is_reported_as_missing_not_as_a_failed_run() {
+        let err = resolve_r_script(Some(Path::new("/nonexistent/telescope_diff.R")))
+            .expect_err("must fail");
+        assert!(
+            err.to_string().contains("does not exist"),
+            "unhelpful error: {err}"
+        );
+    }
+
+    #[test]
+    fn the_engine_is_found_next_to_the_binary_or_in_the_conda_data_directory() {
+        // The candidates are searched in order and the first existing one wins.
+        // Whatever this machine has, the answer must be a file that exists.
+        if let Ok(p) = resolve_r_script(None) {
+            assert!(p.is_file(), "resolved to a missing file: {}", p.display());
+        }
+    }
 }

@@ -2352,7 +2352,7 @@ mod tests {
             s.ledger_deficit(),
             0,
             "THE BLINDNESS, ARITHMETICALLY: conservation holds while the record \
-             is gone. This is what the 2026-10-14 fixture returned before the \
+             is gone. This is what the fixture returned before the \
              increment moved: Ok, deficit 0, zero molecules. {s:?}"
         );
 
