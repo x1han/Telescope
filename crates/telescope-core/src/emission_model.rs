@@ -2640,7 +2640,8 @@ mod tests {
         assert_eq!(tiers.l1 + tiers.l2 + tiers.l3, 1);
         assert_eq!(tiers.l1 + tiers.l2 + tiers.l3 + tiers.n_imputed, rows.len());
 
-        // The W2 split. `n_imputed` stays the backwards-compatible TOTAL, and
+        // The split of `n_imputed` into its two detail counts.
+        // `n_imputed` stays the backwards-compatible TOTAL, and
         // the two detail fields partition it. Asserted as an identity rather
         // than trusted, because the split is computed from the same key set and
         // a mis-filtered `em_suppressed` lookup would make both halves add up

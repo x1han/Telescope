@@ -166,8 +166,9 @@ fn a_well_formed_universe_succeeds_and_prints_the_w2_split() {
     );
     assert!(
         stderr.contains("(padded: 0, suppressed: 0)"),
-        "W2: with no transcript evidence and nothing to pad, both detail counts \
-         are 0 and both must be PRINTED -- the split is the point of W2, and a \
+        "with no transcript evidence and nothing to pad, both detail counts \
+         are 0 and both must be PRINTED -- the split is the point of the two \
+         detail fields, and a \
          line that only appeared when the counts were non-zero would hide it. \
          stderr:\n{stderr}"
     );
@@ -216,8 +217,9 @@ fn a_well_formed_universe_still_succeeds() {
     );
     assert!(
         stderr.contains("(padded: 0, suppressed: 0)"),
-        "W2: with no transcript evidence and nothing to pad, both detail counts \
-         are 0 and both must be PRINTED -- the split is the point of W2, and a \
+        "with no transcript evidence and nothing to pad, both detail counts \
+         are 0 and both must be PRINTED -- the split is the point of the two \
+         detail fields, and a \
          line that only appears when the counts are non-zero would hide it. \
          stderr:\n{stderr}"
     );
