@@ -9,10 +9,10 @@
 //! per-read → per-(transcript × sample) aggregation.
 //!
 //! WHY THE AGGREGATION CANNOT BE DELEGATED. The profile parquet is per READ —
-//! one row per (read, candidate) pair, 15.1 M rows for a single sample of the
-//! Tongji cohort. R holds that as a data.frame in 3.8 GB, and both tracks need
-//! it only to add it up. The CLI streams the parquet, adds it up, and hands R
-//! a table with one row per (transcript × sample).
+//! one row per (read, candidate) pair, 15.1 M rows for a single sample of a
+//! ten-sample cohort. R holds that as a data.frame in 3.8 GB, and both tracks
+//! need it only to add it up. The CLI streams the parquet, adds it up, and hands
+//! R a table with one row per (transcript × sample).
 //!
 //! THE AGGREGATION IS ALSO THE PSEUDOREPLICATION FIX, not an optimisation.
 //! Fitting on per-read rows would inflate the effective n by ~10^6 and make

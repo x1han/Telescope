@@ -33,7 +33,7 @@
 #   - When `#observations > #samples` (technical replicates, batch blocks,
 #     or any within-sample structure exist): use lmerTest::lmer with
 #     `(1 | sample_id)` random intercept + `weights = weight_sum`.
-#   - When `#observations == #samples` (canonical Tongji case): random
+#   - When `#observations == #samples` (one observation per sample): random
 #     intercept is saturated; fall back to stats::lm with
 #     `weights = weight_sum`. Reported via the `model` column in output.
 #   - Both modes use weighted fitting so `weight_sum` (effective read
@@ -42,7 +42,7 @@
 # Required pre-filter for Track A:
 #   Transcripts with total count across all samples < MIN_COUNTS = 20
 #   are dropped before DEXSeq. Low-count universe destabilizes the
-#   negative-binomial dispersion fit. On real Tongji tissue data this
+#   negative-binomial dispersion fit. On real tissue data this
 #   trims ~80% near-zero transcripts out of ~180 k, leaving ~20 k.
 #
 # Implementation note (Bioconductor namespace collisions):

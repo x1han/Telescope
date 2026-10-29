@@ -28,7 +28,7 @@ pub struct QuantArgs {
     #[arg(long)]
     emission: PathBuf,
 
-    /// Sample identifier (e.g. `E10.5_Brain`). Used as `sample_id` column.
+    /// Sample identifier (e.g. `sample_01`). Used as `sample_id` column.
     #[arg(long)]
     sample_id: String,
 
