@@ -2,18 +2,22 @@
 # telescope_diff.R — Module 4: Differential Statistical Layer
 #
 # ROLE OF THIS FILE. The shipped Telescope CLI implements Module 4 as the
-# `telescope diff` subcommand. This R script is the REFERENCE implementation
-# of the same frozen specification: it is the
-# independent second implementation that the Rust port is checked against.
+# `telescope diff` subcommand. This R script is the ENGINE it runs: it is
+# what computes the statistics, and the Rust side only aggregates.
 #
-#   - It is kept here, beside the code it validates, so that the two cannot
+#   - It is kept here, beside the code that drives it, so that the two cannot
 #     drift apart silently.
 #   - `workflow/test_data/` holds the synthetic profiles, the design matrix,
 #     and the expected output for both tracks. That fixture is the acceptance
-#     test for the Rust `telescope diff` port.
+#     test for the engine and, through it, for the CLI.
 #   - The R dependencies (DEXSeq, lmerTest, limma) are Bioconductor packages;
-#     the Rust implementation deliberately shares no code path with them, which
-#     is what makes the comparison meaningful.
+#     the Rust side deliberately shares no code path with them, which is what
+#     makes the comparison meaningful.
+#
+#   - The engine is also the independent second implementation the Rust side
+#     is checked against: it can take a pre-aggregated table from the CLI, or
+#     read the per-read parquets and aggregate for itself. Both paths must
+#     agree (workflow/test_data/run_cli_agreement.sh).
 #
 # Two-track design:
 #   Track A (ΔPAU, usage): DEXSeq on (gene × transcript × sample) counts.

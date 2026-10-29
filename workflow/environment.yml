@@ -1,4 +1,4 @@
-# Conda environment for the R reference implementation of Module 4.
+# Conda environment for the R engine of Module 4.
 #
 #   mamba env create -f workflow/environment.yml
 #   mamba activate telescope-ref
@@ -6,12 +6,19 @@
 #
 # WHY THIS FILE EXISTS. The differential statistics in Module 4 are built on
 # Bioconductor packages (DEXSeq, limma, lmerTest). Those are not part of the
-# Rust binary, so the R reference implementation needs its own environment.
+# Rust binary, so the R engine needs its own environment.
 #
-# The shipped `telescope` binary does NOT need any of this -- it is pure Rust
-# with no C, no system libraries and no runtime package manager. This
-# environment is for the reference implementation and for anyone who wants to
-# reproduce the published numbers from the reference rather than from the CLI.
+# `telescope diff` NEEDS this environment: it aggregates in Rust and then
+# runs `workflow/scripts/telescope_diff.R` as a subprocess, so the interpreter
+# and the Bioconductor packages must be present. The Rust side of the binary
+# needs none of it -- it is pure Rust with no C, no system libraries and no
+# runtime package manager -- but the subcommand cannot compute any statistic
+# without the engine.
+#
+# The same engine is also the independent second implementation the Rust
+# side is checked against (`workflow/test_data/run_cli_agreement.sh`): the
+# CLI hands it a pre-aggregated table, and it can also read the per-read
+# parquets and aggregate for itself. Both paths must agree.
 #
 # VERSION PINNING. Every pin below is the exact build that produced the
 # expected outputs in `workflow/test_data/results/`. One of them was NOT
