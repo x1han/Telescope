@@ -177,9 +177,7 @@ pub fn resolve_transcript_evidence(
     // are explicitly bypassing the cohort-scope guard. Record the fact in
     // stderr rather than fail.
     if config.cohort_size == 0 {
-        eprintln!(
-            "[telescope][WARN] ResolverConfig.cohort_size == 0; F6.2 cohort scope guard bypassed"
-        );
+        eprintln!("[telescope][WARN] ResolverConfig.cohort_size == 0; cohort scope guard bypassed");
     }
 
     records

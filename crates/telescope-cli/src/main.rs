@@ -605,7 +605,7 @@ fn main() -> Result<()> {
                     sample_ids.len()
                 );
             }
-            eprintln!("[telescope] D1 Universal Mode: anchor pool builder");
+            eprintln!("[telescope] Universal Mode: anchor pool builder");
             eprintln!("  samples:    {}", bams.len());
             eprintln!("  tes_slack:  {} bp", tes_slack);
             eprintln!("  min_cov:    {}", min_coverage);

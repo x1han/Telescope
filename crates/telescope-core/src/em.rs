@@ -4925,7 +4925,7 @@ mod tests {
         let _ = std::fs::remove_file(&emission);
     }
 
-    /// D1, negative half. `sigma2_cohort` enters the M-step as a VARIANCE
+    /// The negative half. `sigma2_cohort` enters the M-step as a VARIANCE
     /// (`2.0 * beta_0 * p.sigma2_cohort`). A non-finite or non-positive value
     /// poisons `p.sigma2` for that transcript and, through the cohort fallback,
     /// for every transcript borrowing it -- silently, because the arithmetic still

@@ -265,7 +265,7 @@ pub fn run_quant(args: QuantArgs, sigma2_dof_offset: Option<f64>) -> Result<()> 
             prune_max_delta_as
         );
     }
-    eprintln!("[telescope] Quant (M2 → M3)");
+    eprintln!("[telescope] Quant");
     eprintln!("  bam:        {}", bam.display());
     eprintln!("  emission:   {}", emission.display());
     eprintln!("  sample_id:  {}", sample_id);
@@ -280,8 +280,8 @@ pub fn run_quant(args: QuantArgs, sigma2_dof_offset: Option<f64>) -> Result<()> 
     if aln_weight_lambda == ALN_WEIGHT_LAMBDA_DEFAULT {
         eprintln!(
             "  WARNING: --aln-weight-lambda is at its FROZEN default (20.0).\n\
-             \x20            It was set by the 5'-anchoring ablation, not by the \
-             earlier one-gene (PGAM1) calibration that produced λ=1000 — that \
+             \x20            It was set by the 5'-anchoring ablation, not by an \
+             earlier one-gene calibration that produced λ=1000 — that \
              value is superseded and compressed every evidence term to \
              <= 0.1 nat.\n\
              \x20            No value of λ is validated library-wide."
@@ -321,7 +321,7 @@ pub fn run_quant(args: QuantArgs, sigma2_dof_offset: Option<f64>) -> Result<()> 
         None
     };
 
-    eprintln!("[telescope]  M2: extract evidence…");
+    eprintln!("[telescope]  extract evidence…");
     eprintln!("[telescope]  polyA-src:  {}", poly_a_source);
     let mut graph = evidence::extract_evidence_with(&bam, tes_slack, &poly_a)
         .context("Module 2 extract_evidence failed")?;
@@ -358,7 +358,7 @@ pub fn run_quant(args: QuantArgs, sigma2_dof_offset: Option<f64>) -> Result<()> 
         }
     }
 
-    eprintln!("[telescope]  M3: TEL-EM…");
+    eprintln!("[telescope]  TEL-EM…");
     eprintln!(
         "[telescope]    A_rk ACTIVE on ambiguous reads: ln A_rk = (AS_rk − max_j AS_rj) / λ, λ = {}",
         aln_weight_lambda
@@ -386,7 +386,7 @@ pub fn run_quant(args: QuantArgs, sigma2_dof_offset: Option<f64>) -> Result<()> 
         eprintln!(
             "[telescope]    λ default {} comes from the 5'-anchoring ablation, which put the \
              alignment term in the same [−2.5, 0] nat range the 5' bonus competes in. \
-             The earlier one-gene (PGAM1) λ=1000 calibration is SUPERSEDED. No value of \
+             The earlier one-gene λ=1000 calibration is SUPERSEDED. No value of \
              λ is validated library-wide.",
             ALN_WEIGHT_LAMBDA_DEFAULT
         );
