@@ -6027,10 +6027,16 @@ mod tests {
     /// The M-step's `alpha` denominator is `n_total_molecules`, and that is
     /// OBSERVABLE even though nothing downstream can see the scale.
     ///
-    /// `alpha` is a mixture weight vector, and `p.alpha = w_sum / n_total_molecules`
-    /// is what makes it one: every molecule contributes total weight 1, so
+    /// `alpha` is a mixture weight vector, and the update is the transcript's
+    /// accumulated weight over the molecule count, which is what makes it one:
+    /// every molecule contributes total weight 1, so
     /// `sum_k w_sum_k == n_total_molecules` and the updated `alpha` sums to 1
     /// across transcripts.
+    ///
+    /// The update is written out in the source rather than quoted here: a
+    /// verbatim copy of the expression would make the mutation battery's
+    /// anchor for this line match twice, and the mutation would stop being
+    /// unambiguous about what it targets.
     ///
     /// A UNIFORM rescale of the alpha vector is invisible to a softmax -- `ln c`
     /// is common to every candidate -- so no test that only reads posteriors can
