@@ -454,12 +454,12 @@ fn solve_and_write_profile_impl<P: AsRef<Path>>(
             "ID-SPACE MISMATCH: none of the {num_transcripts} transcripts in the BAM are \
              present among the {n_emission} rows of the emission parquet (BAM id e.g. \
              {bam_sample:?}, emission id e.g. {em_sample:?}). Every read would be \
-             silently dropped and an EMPTY profile written. The retired AIDRS \
-             quant path was the one configuration that produced this: its BAM was \
-             keyed `AIDRS_tx_N` while the AIDRS polyA/assessment tables were keyed \
-             `ENST`/`ENSG_NovelTr`; it was bridged with `--tx-id-mapping <bam_id<TAB> \
-             original_id tsv>`. Universal Mode (`build-anchors`) needs no bridge, \
-             because its ids come from the BAM itself."
+             silently dropped and an EMPTY profile written. The configuration that \
+             produces this is a BAM keyed by one id space (e.g. `tx_1`, `tx_2`, ...) \
+             while the emission tables are keyed by another (`ENST`, `ENSG_NovelTr`); \
+             it was bridged with `--tx-id-mapping <bam_id<TAB>original_id tsv>`. \
+             Universal Mode (`build-anchors`) needs no bridge, because its ids come \
+             from the BAM itself."
         );
     }
 
@@ -6834,10 +6834,7 @@ mod tests {
         let emission = scratch("idspace_emission.parquet");
         let profile = scratch("idspace_profile.parquet");
         // Emission ids deliberately share no key with the graph's "tx0".
-        write_test_emission(
-            &emission,
-            &[("AIDRS_tx_999", "gene9", log_pal as f64, 0.04)],
-        );
+        write_test_emission(&emission, &[("TX_999", "gene9", log_pal as f64, 0.04)]);
         let graph = synth_graph(log_pal, &[("tx0", 900)]);
 
         let err = solve_and_write_profile(

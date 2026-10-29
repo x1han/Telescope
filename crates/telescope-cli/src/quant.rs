@@ -20,7 +20,7 @@ use crate::{
 /// Arguments for the `quant` subcommand, shared by both binaries.
 #[derive(Args, Debug)]
 pub struct QuantArgs {
-    /// Path to AIDRS-aligned transcriptome BAM.
+    /// Path to the transcriptome-aligned BAM.
     #[arg(long)]
     bam: PathBuf,
 

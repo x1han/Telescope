@@ -105,9 +105,9 @@ enum Cmd {
         provenance_out: Option<PathBuf>,
     },
 
-    /// Module 2: extract single-molecule evidence from AIDRS-aligned BAM.
+    /// Module 2: extract single-molecule evidence from a transcriptome-aligned BAM.
     ExtractEvidence {
-        /// Path to AIDRS-aligned transcriptome BAM (carries Dorado `pt:i`).
+        /// Path to the transcriptome-aligned BAM (carries Dorado `pt:i`).
         #[arg(long)]
         bam: PathBuf,
 
@@ -244,7 +244,7 @@ enum Cmd {
     /// Module 0: Resolve cohort-level transcript evidence (Tier A/B/C,
     /// subsumption, EM/PAL eligibility) → `telescope.transcript_evidence.parquet`.
     ResolveEvidence {
-        /// One or more AIDRS-aligned transcriptome BAMs (cohort). All BAMs
+        /// One or more transcriptome-aligned BAMs (cohort). All BAMs
         /// must share the same reference catalog (`@SQ` lines).
         #[arg(long = "bam", required = true)]
         bams: Vec<PathBuf>,

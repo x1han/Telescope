@@ -215,7 +215,7 @@ cat("  transcripts after min-counts filter:",
 # drop is never silent.
 #
 # This is not a corner case: in a transcriptome whose gene and transcript ids
-# coincide (AIDRS_tx_1 as both), a large share of the genes are singletons.
+# coincide (tx_1 as both), a large share of the genes are singletons.
 tx_per_gene <- counts_long %>% dplyr::count(gene_id, name = "n_tx")
 genes_keep  <- tx_per_gene %>% dplyr::filter(n_tx >= 2) %>% dplyr::pull(gene_id)
 n_singleton_genes <- nrow(tx_per_gene) - length(genes_keep)
