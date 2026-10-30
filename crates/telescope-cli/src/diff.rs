@@ -79,8 +79,12 @@ pub const MIN_WEIGHT_DEFAULT: f64 = 10.0;
 pub const MIN_COUNTS_DEFAULT: f64 = 20.0;
 
 /// Default minimum number of samples per transcript in the ΔPAL track.
-/// Same default as the R engine's `--min-samples`.
-pub const MIN_SAMPLES_DEFAULT: usize = 2;
+///
+/// Same default as the R engine's `--min-samples`. A group with a single
+/// admissible cell has no within-group variance at all, and a group with two
+/// has one degree of freedom; three is the smallest group size whose
+/// residual variance the test can carry.
+pub const MIN_SAMPLES_DEFAULT: usize = 3;
 
 /// Default name of the metadata column holding the sample id.
 pub const DEFAULT_SAMPLE_COLUMN: &str = "sample_id";
@@ -172,11 +176,11 @@ pub struct DiffArgs {
     #[arg(long, default_value = DEFAULT_LAPA, help_heading = "OPTIONS")]
     pub lapa_path: PathBuf,
 
-    /// Which modalities to compute: a comma-separated list of deg, det, apa
+    /// Which modalities to compute: a comma-separated list of deg, det, diu, apa
     /// and dpl.
     ///
-    /// The default is all four for the --metadata interface. The older
-    /// --profiles/--design interface defaults to deg,det,dpl, because it
+    /// The default is all five for the --metadata interface. The older
+    /// --profiles/--design interface defaults to deg,det,diu,dpl, because it
     /// declares no alignments and no annotation, so the APA track cannot be
     /// computed from it.
     #[arg(long, value_name = "MODALITIES", help_heading = "OPTIONS")]
@@ -186,11 +190,18 @@ pub struct DiffArgs {
     #[arg(long, default_value_t = MIN_WEIGHT_DEFAULT, help_heading = "OPTIONS")]
     pub min_weight: f64,
 
-    /// Minimum total count for a transcript in the usage track.
+    /// Minimum total count for a transcript in the usage track, and the
+    /// minimum number of poly(A) reads a gene must have in a sample for that
+    /// sample's poly(A) site usage to be usable (the APA track divides by
+    /// that total, so a small total is a share taken over a handful of reads).
     #[arg(long, default_value_t = MIN_COUNTS_DEFAULT, help_heading = "OPTIONS")]
     pub min_counts: f64,
 
-    /// Minimum number of samples per transcript in the tail-length track.
+    /// Minimum number of usable samples per group: for a transcript in the
+    /// tail-length track, and for a poly(A) site in the usage track.
+    ///
+    /// A group with a single usable cell has no within-group variance, so
+    /// what it contributes to a two-sample test is not a variance at all.
     #[arg(long, default_value_t = MIN_SAMPLES_DEFAULT, help_heading = "OPTIONS")]
     pub min_samples: usize,
 
@@ -225,14 +236,17 @@ pub struct DiffArgs {
     pub contrast: Option<String>,
 }
 
-/// The four modalities, in the order the tables are named.
+/// The five modalities, in the order the tables are named.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Modality {
     /// Gene-level differential expression (DESeq2, in the R engine).
     Deg,
-    /// Differential transcript usage (DEXSeq, in the R engine).
+    /// Transcript-level differential abundance (DESeq2, in the R engine).
     Det,
-    /// Alternative poly(A) (LAPA's own counts, tested with limma by the engine).
+    /// Differential isoform usage (DEXSeq, in the R engine).
+    Diu,
+    /// Alternative poly(A) site usage (LAPA's own usage column, tested with
+    /// limma by the engine).
     Apa,
     /// Differential poly(A) length (the audited limma model, in the engine).
     Dpl,
@@ -244,6 +258,7 @@ impl Modality {
         match self {
             Modality::Deg => "deg",
             Modality::Det => "det",
+            Modality::Diu => "diu",
             Modality::Apa => "apa",
             Modality::Dpl => "dpl",
         }
@@ -254,6 +269,7 @@ impl Modality {
         match self {
             Modality::Deg => "deg.tsv",
             Modality::Det => "det.tsv",
+            Modality::Diu => "diu.tsv",
             Modality::Apa => "apa.tsv",
             Modality::Dpl => "dpl.tsv",
         }
@@ -261,12 +277,18 @@ impl Modality {
 
     /// Every modality, in the order the contract names them.
     pub fn all() -> Vec<Modality> {
-        vec![Modality::Deg, Modality::Det, Modality::Apa, Modality::Dpl]
+        vec![
+            Modality::Deg,
+            Modality::Det,
+            Modality::Diu,
+            Modality::Apa,
+            Modality::Dpl,
+        ]
     }
 
     /// The modalities that only need the profiles and the design.
     pub fn profile_based() -> Vec<Modality> {
-        vec![Modality::Deg, Modality::Det, Modality::Dpl]
+        vec![Modality::Deg, Modality::Det, Modality::Diu, Modality::Dpl]
     }
 }
 
@@ -352,6 +374,13 @@ pub struct Plan {
     pub modalities: Vec<Modality>,
     /// The batch column, when the metadata declares a usable one.
     pub batch_column: Option<String>,
+    /// What the metadata's batch column turned out to be. The column's mere
+    /// presence and its usability are two different facts, and the run's
+    /// receipt has to tell them apart: "no batch column" and "a batch column
+    /// some sample leaves empty" are not the same statement.
+    pub batch_state: BatchState,
+    /// Where the batch column was declared.
+    pub batch_source: BatchSource,
     /// The R interpreter.
     pub rscript: PathBuf,
     /// The R engine. `None` when the run computes no statistic at all (the
@@ -372,6 +401,66 @@ pub struct Plan {
 /// The contract's wording, kept verbatim because it is what a reader of
 /// `run_manifest.json` and of every table's `model_parameters` is told.
 pub const NO_BATCH_NOTE: &str = "no batch column in the metadata";
+
+/// What the metadata's batch column turned out to be.
+///
+/// The column's presence and its usability are different facts. A column
+/// that some sample leaves empty cannot be a covariate — the design matrix
+/// would be rank-deficient — but saying "no batch column in the metadata"
+/// about it is false: the column is there. The receipt has to say which of
+/// the two it is.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum BatchState {
+    /// No batch column at all.
+    #[default]
+    NoColumn,
+    /// A batch column, but at least one sample leaves it empty, so it cannot
+    /// be a covariate.
+    ColumnWithMissingValues(String),
+    /// A batch column and every sample fills it in.
+    ColumnPresent(String),
+}
+
+/// Where the batch column was declared: the metadata file or the design file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchSource {
+    /// `--metadata` declares the samples and their conditions.
+    Metadata,
+    /// `--design` declares them (the older interface).
+    Design,
+}
+
+impl BatchSource {
+    fn as_str(&self) -> &'static str {
+        match self {
+            BatchSource::Metadata => "metadata",
+            BatchSource::Design => "design",
+        }
+    }
+}
+
+impl BatchState {
+    /// The note the run records.
+    pub fn note(&self, source: BatchSource) -> String {
+        match self {
+            BatchState::NoColumn => match source {
+                BatchSource::Metadata => NO_BATCH_NOTE.to_string(),
+                BatchSource::Design => "no batch column in the design".to_string(),
+            },
+            BatchState::ColumnWithMissingValues(c) => format!(
+                "the {src} has a batch column ({c}), but at least one sample leaves it \
+                 empty, so it was not fitted as a covariate",
+                src = source.as_str()
+            ),
+            BatchState::ColumnPresent(c) => format!(
+                "a batch column is in the {src}: {c} (whether the batch was fitted as a \
+                 covariate is decided by the engine, which reports it in \
+                 logs/telescope_diff.R.log and in the model_parameters column of every table)",
+                src = source.as_str()
+            ),
+        }
+    }
+}
 
 /// The two labels of the contrast, in the order the engine needs them.
 ///
@@ -435,16 +524,19 @@ pub fn resolve_modalities(spec: Option<&str>, metadata_interface: bool) -> Resul
         let m = match name {
             "deg" => Modality::Deg,
             "det" => Modality::Det,
+            "diu" => Modality::Diu,
             "apa" => Modality::Apa,
             "dpl" => Modality::Dpl,
-            other => bail!("unknown modality '{other}'. The modalities are deg, det, apa and dpl."),
+            other => {
+                bail!("unknown modality '{other}'. The modalities are deg, det, diu, apa and dpl.")
+            }
         };
         if !out.contains(&m) {
             out.push(m);
         }
     }
     if out.is_empty() {
-        bail!("--modalities names no modality. The modalities are deg, det, apa and dpl.");
+        bail!("--modalities names no modality. The modalities are deg, det, diu, apa and dpl.");
     }
     out.sort();
     Ok(out)
@@ -933,15 +1025,21 @@ fn aggregate_profile_impl(path: &Path, sample_id: Option<&str>) -> Result<Vec<Ag
             }
             let s = match (override_id, sample) {
                 (Some(id), _) => id,
-                (None, Some(arr)) if !arr.is_null(i) => {
-                    let v = arr.value(i);
-                    if declared_sample.is_none() {
-                        declared_sample = Some(v.to_string());
-                    }
-                    interner.intern(v)
-                }
+                (None, Some(arr)) if !arr.is_null(i) => interner.intern(arr.value(i)),
                 _ => stem_id,
             };
+            // The profile's OWN name for this sample, read whatever the
+            // metadata says. The override above decides which name the row is
+            // filed under; this records what the file says about itself, so
+            // the two can be compared. Reading it only in the no-override
+            // branch made the comparison unreachable: the override and the
+            // branch's condition are mutually exclusive, so the check below
+            // never ran on the shipped path.
+            if let Some(arr) = sample {
+                if !arr.is_null(i) && declared_sample.is_none() {
+                    declared_sample = Some(arr.value(i).to_string());
+                }
+            }
             let g = interner.intern(gene.value(i));
             let t = interner.intern(tx.value(i));
             let w = pw.value(i);
@@ -957,15 +1055,18 @@ fn aggregate_profile_impl(path: &Path, sample_id: Option<&str>) -> Result<Vec<Ag
         }
     }
 
-    // The metadata and the profile can disagree about the sample's name. The
-    // metadata wins, because the design comes from it, but the disagreement
-    // is worth a line: it usually means the wrong profile is in the row.
+    // The metadata and the profile can disagree about the sample's name. That
+    // is not a naming preference: one of the two is wrong, and filing the
+    // rows under the metadata's name publishes another sample's tail lengths
+    // under this sample's name. The run stops here.
     if let (Some(declared), Some(forced)) = (&declared_sample, sample_id) {
         if declared != forced {
-            eprintln!(
-                "[telescope]  WARN: {} declares the sample '{declared}' but the \
-                 metadata calls it '{forced}'. The metadata wins.",
-                path.display()
+            bail!(
+                "{} declares the sample '{}' but the metadata calls it '{}'. \
+                 Publishing it would file one sample's rows under another's name.",
+                path.display(),
+                declared,
+                forced
             );
         }
     }
@@ -1192,11 +1293,30 @@ fn check_engine_path(p: &Path) -> Result<PathBuf> {
     Ok(p.to_path_buf())
 }
 
-/// Find an executable: a path with a separator in it must exist, a bare name
-/// is looked up on PATH.
+/// Find an executable: a path with a separator in it must exist and carry the
+/// unix executable bit, a bare name is looked up on PATH.
+///
+/// The executable bit is checked here, in the preflight, because a file that
+/// is not executable is a precondition failure and the user can fix it before
+/// anything is computed. Discovering it later — when the tool is spawned and
+/// the spawn fails with `Permission denied` — costs the whole run.
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match path.metadata() {
+        Ok(md) => md.is_file() && md.permissions().mode() & 0o111 != 0,
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
 fn find_executable(name: &Path) -> Option<PathBuf> {
     if name.components().count() > 1 {
-        return if name.is_file() {
+        return if is_executable_file(name) {
             Some(name.to_path_buf())
         } else {
             None
@@ -1205,7 +1325,7 @@ fn find_executable(name: &Path) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
         let candidate = dir.join(name);
-        if candidate.is_file() {
+        if is_executable_file(&candidate) {
             return Some(candidate);
         }
     }
@@ -1272,7 +1392,7 @@ fn preflight(args: &DiffArgs) -> Result<Plan, PreflightFailure> {
         resolve_modalities(args.modalities.as_deref(), metadata_interface).map_err(|e| {
             PreflightFailure::new(
                 e.to_string(),
-                "name the modalities as a comma-separated list of deg, det, apa and dpl.",
+                "name the modalities as a comma-separated list of deg, det, diu, apa and dpl.",
             )
         })?
     };
@@ -1284,6 +1404,8 @@ fn preflight(args: &DiffArgs) -> Result<Plan, PreflightFailure> {
         force_sample_ids,
         design_is_written,
         batch_column,
+        batch_state,
+        batch_source,
         has_alignment_column,
     ) = if let Some(meta) = &args.metadata {
         let table = read_metadata(args, meta)?;
@@ -1295,6 +1417,14 @@ fn preflight(args: &DiffArgs) -> Result<Plan, PreflightFailure> {
                 .samples
                 .iter()
                 .all(|s| s.batch.as_deref().map(|b| !b.is_empty()).unwrap_or(false));
+        let batch_state = if !table.has_batch_column {
+            BatchState::NoColumn
+        } else if usable_batch {
+            BatchState::ColumnPresent(args.batch_column.clone())
+        } else {
+            BatchState::ColumnWithMissingValues(args.batch_column.clone())
+        };
+        let batch_source = BatchSource::Metadata;
         let batch_column = if usable_batch {
             Some(args.batch_column.clone())
         } else {
@@ -1308,6 +1438,8 @@ fn preflight(args: &DiffArgs) -> Result<Plan, PreflightFailure> {
             true,
             true,
             batch_column,
+            batch_state,
+            batch_source,
             has_alignment_column,
         )
     } else {
@@ -1378,12 +1510,35 @@ fn preflight(args: &DiffArgs) -> Result<Plan, PreflightFailure> {
                 alignment: None,
             });
         }
-        let batch_column = if batch_col.is_some() {
+        // The design's batch column, if it has one, is usable only when every
+        // row fills it in.
+        let batch_values: Vec<String> = batch_col
+            .map(|c| tsv.rows.iter().map(|r| tsv.value(r, c)).collect())
+            .unwrap_or_default();
+        let usable_batch = !batch_values.is_empty() && batch_values.iter().all(|v| !v.is_empty());
+        let batch_column = if usable_batch {
             Some("batch".to_string())
         } else {
             None
         };
-        (samples, profiles, false, false, batch_column, false)
+        let batch_state = if batch_values.is_empty() {
+            BatchState::NoColumn
+        } else if usable_batch {
+            BatchState::ColumnPresent("batch".to_string())
+        } else {
+            BatchState::ColumnWithMissingValues("batch".to_string())
+        };
+        let batch_source = BatchSource::Design;
+        (
+            samples,
+            profiles,
+            false,
+            false,
+            batch_column,
+            batch_state,
+            batch_source,
+            false,
+        )
     };
 
     // Every profile path exists.
@@ -1418,6 +1573,41 @@ fn preflight(args: &DiffArgs) -> Result<Plan, PreflightFailure> {
                 ));
             }
         }
+        // A sample that carries a third label has no place in a two-group
+        // contrast. This is checked HERE, before anything is computed: the
+        // engine rejects it later, after the whole aggregation has been done,
+        // and the failure then reads as a bug in the engine instead of a
+        // mistake in the metadata.
+        let unknown: Vec<&str> = labels
+            .iter()
+            .map(|l| l.as_str())
+            .filter(|l| *l != case.as_str() && *l != control.as_str())
+            .collect();
+        if !unknown.is_empty() {
+            return Err(PreflightFailure::new(
+                format!(
+                    "the metadata's condition column names labels that are neither the \
+                     case nor the control: {}.",
+                    unknown.join(", ")
+                ),
+                "remove those samples from the metadata, or run one contrast per pair.",
+            ));
+        }
+    }
+    // An empty condition cell is a hole in the design, not a third group.
+    if let Some(empty) = samples.iter().find(|s| {
+        s.condition
+            .as_deref()
+            .map(|c| c.trim().is_empty())
+            .unwrap_or(true)
+    }) {
+        return Err(PreflightFailure::new(
+            format!(
+                "the sample '{}' has no condition in the metadata's condition column.",
+                empty.sample_id
+            ),
+            "give every sample a condition, or remove the row.",
+        ));
     }
 
     // The R interpreter and the R engine. A run that only aggregates never
@@ -1545,6 +1735,8 @@ fn preflight(args: &DiffArgs) -> Result<Plan, PreflightFailure> {
         control_condition: contrast.as_ref().map(|c| c.1.clone()),
         modalities,
         batch_column,
+        batch_state,
+        batch_source,
         rscript,
         r_script,
         lapa,
@@ -1722,14 +1914,25 @@ fn run_lapa(
         );
     }
     for s in samples {
-        let bed = sample_dir.join(format!("{}.bed", sanitize(&s.sample_id)));
-        if !bed.is_file() {
+        // LAPA writes the file under the sample id it was given in the CSV,
+        // which is the raw id. The sanitised spelling is accepted as well,
+        // because the two differ only for a sample id that carries a
+        // character a file name may not hold, and LAPA's own naming has
+        // changed across releases.
+        let raw = sample_dir.join(format!("{}.bed", s.sample_id));
+        let safe = sample_dir.join(format!("{}.bed", sanitize(&s.sample_id)));
+        let bed = if raw.is_file() {
+            raw
+        } else if safe.is_file() {
+            safe
+        } else {
             bail!(
                 "LAPA wrote no cluster file for the sample '{}' (looked for {}).",
                 s.sample_id,
-                bed.display()
+                raw.display()
             );
-        }
+        };
+        let _ = bed;
     }
     Ok(canonical)
 }
@@ -2039,14 +2242,7 @@ fn write_manifest(
 /// whether the batch is confounded with the condition. The note says so
 /// instead of implying that the batch was used.
 fn batch_note(plan: &Plan) -> String {
-    match &plan.batch_column {
-        Some(c) => format!(
-            "a batch column is in the metadata: {c} (whether the batch was fitted as a \
-             covariate is decided by the engine, which reports it in \
-             logs/telescope_diff.R.log and in the model_parameters column of every table)"
-        ),
-        None => NO_BATCH_NOTE.to_string(),
-    }
+    plan.batch_state.note(plan.batch_source)
 }
 
 /// Write `software_versions.tsv`.
@@ -2070,14 +2266,39 @@ fn write_model_parameters(path: &Path, plan: &Plan, args: &DiffArgs) -> Result<(
                 rows.push((modality.clone(), "model_name".into(), "DESeq2".into()));
             }
             Modality::Det => {
+                rows.push((modality.clone(), "model_name".into(), "DESeq2".into()));
+                rows.push((
+                    modality.clone(),
+                    "modality".into(),
+                    "transcript-level abundance".into(),
+                ));
+            }
+            Modality::Diu => {
                 rows.push((modality.clone(), "model_name".into(), "DEXSeq".into()));
+                rows.push((
+                    modality.clone(),
+                    "modality".into(),
+                    "within-gene isoform usage".into(),
+                ));
             }
             Modality::Dpl => {
                 // The base fit is NOT limma: it is the unweighted two-sample
                 // t on the sample means (`equal_raw_t`). limma supplies the
-                // moderation arm (`equal_weight_eb`), and the per-row
-                // model_name of dpl.tsv says the same thing.
-                rows.push((modality.clone(), "model_name".into(), "equal_raw_t".into()));
+                // moderation arm (`equal_weight_eb`).
+                //
+                // The model name is NOT written here as a single value: the
+                // engine decides it, because only the engine knows whether
+                // the batch was fitted (a batch that is confounded with the
+                // condition is present but not fitted). The per-row
+                // model_name of dpl.tsv carries the name; this receipt points
+                // at it rather than guessing it.
+                rows.push((
+                    modality.clone(),
+                    "model_name".into(),
+                    "see the model_name column of dpl.tsv: equal_raw_t, or \
+                     batch_adjusted_raw_t when the engine fitted a batch"
+                        .into(),
+                ));
                 rows.push((
                     modality.clone(),
                     "moderated_arm".into(),
@@ -2456,12 +2677,31 @@ fn execute_inner(
     let versions = collect_versions(args, plan);
     write_software_versions(&result.join("software_versions.tsv"), &versions)?;
     write_model_parameters(&result.join("model_parameters.tsv"), plan, args)?;
+    // The design the engine used. When the run wrote it itself, the file
+    // lives in the work directory, which is removed when the run ends, so a
+    // receipt naming it names a path that no longer exists. The design is
+    // copied into the result directory and the receipt names that copy --
+    // relative to the result directory, which is what the reader of the
+    // result directory holds.
+    let manifest_design = if plan.design_is_written {
+        let copy = logs.join("design.tsv");
+        std::fs::copy(&design_path, &copy).with_context(|| {
+            format!(
+                "failed to copy the design {} into {}",
+                design_path.display(),
+                copy.display()
+            )
+        })?;
+        PathBuf::from("logs/design.tsv")
+    } else {
+        design_path.clone()
+    };
     let end = utc_timestamp();
     write_manifest(
         &result.join("run_manifest.json"),
         plan,
         args,
-        &design_path,
+        &manifest_design,
         start,
         &end,
         &versions,
@@ -2508,6 +2748,7 @@ fn engine_modality_flags(modalities: &[Modality]) -> Vec<String> {
     for (m, flag) in [
         (Modality::Deg, "--deg"),
         (Modality::Det, "--det"),
+        (Modality::Diu, "--diu"),
         (Modality::Dpl, "--dpl"),
     ] {
         flags.push(flag.to_string());
@@ -2569,6 +2810,44 @@ fn run_engine(
 }
 
 /// The versions of the tools that ran.
+/// The version of the installed LAPA.
+///
+/// LAPA is a Python package with a click-based command line, and it has no
+/// `--version` option: `lapa --version` fails with "No such option". The
+/// version is a property of the installed distribution, so it is read from the
+/// distribution metadata with the Python that owns LAPA -- the interpreter
+/// next to the `lapa` executable, which is the one that can import it.
+///
+/// When that cannot be done the receipt says so rather than guessing: an
+/// invented version number in `software_versions.tsv` is worse than an
+/// explicit "unknown".
+fn lapa_version(lapa: &Path) -> String {
+    let Some(dir) = lapa.parent() else {
+        return "unknown (the LAPA path has no parent directory)".to_string();
+    };
+    for name in ["python", "python3"] {
+        let py = dir.join(name);
+        if !py.is_file() {
+            continue;
+        }
+        let out = std::process::Command::new(&py)
+            .args([
+                "-c",
+                "import importlib.metadata as m; print(m.version('lapa'))",
+            ])
+            .output();
+        if let Ok(o) = out {
+            if o.status.success() {
+                let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if !v.is_empty() {
+                    return v;
+                }
+            }
+        }
+    }
+    "unknown (the LAPA distribution metadata could not be read)".to_string()
+}
+
 fn collect_versions(args: &DiffArgs, plan: &Plan) -> Vec<(String, String)> {
     let mut versions: Vec<(String, String)> = Vec::new();
     versions.push((
@@ -2579,7 +2858,7 @@ fn collect_versions(args: &DiffArgs, plan: &Plan) -> Vec<(String, String)> {
         versions.push(("R".to_string(), tool_version(&plan.rscript, &["--version"])));
     }
     if let Some(d) = &plan.lapa {
-        versions.push(("LAPA".to_string(), tool_version(d, &["--version"])));
+        versions.push(("LAPA".to_string(), lapa_version(d)));
     }
     let _ = args;
     versions
@@ -2921,18 +3200,27 @@ mod tests {
     #[test]
     fn the_modality_list_is_parsed_and_unknown_names_are_refused() {
         let all = resolve_modalities(None, true).expect("default");
-        assert_eq!(all.len(), 4);
+        assert_eq!(all.len(), 5);
         assert_eq!(all[0], Modality::Deg);
-        assert_eq!(all[3], Modality::Dpl);
-        // The older interface cannot reach the two tracks that need the
-        // alignments, so it computes the other three.
+        assert_eq!(all[1], Modality::Det);
+        assert_eq!(all[2], Modality::Diu);
+        assert_eq!(all[3], Modality::Apa);
+        assert_eq!(all[4], Modality::Dpl);
+        // The older interface cannot reach the track that needs the
+        // alignments, so it computes the other four.
         let legacy = resolve_modalities(None, false).expect("default");
-        assert_eq!(legacy, vec![Modality::Deg, Modality::Det, Modality::Dpl]);
+        assert_eq!(
+            legacy,
+            vec![Modality::Deg, Modality::Det, Modality::Diu, Modality::Dpl]
+        );
         let some = resolve_modalities(Some("dpl,deg"), true).expect("named");
         assert_eq!(some, vec![Modality::Deg, Modality::Dpl]);
         assert!(resolve_modalities(Some("deg,nonsense"), true).is_err());
-        // The DIU track is withdrawn: there is no alternative splicing here.
-        assert!(resolve_modalities(Some("diu"), true).is_err());
+        // The DIU track is the DEXSeq usage test and it is one of the five.
+        assert_eq!(
+            resolve_modalities(Some("diu"), true).expect("named"),
+            vec![Modality::Diu]
+        );
         assert!(resolve_modalities(Some(""), true).is_err());
     }
 
@@ -3019,22 +3307,22 @@ mod tests {
 
     /// The engine is told exactly which tables to write.
     ///
-    /// A run that asked for APA alone must still say "no deg, no det, no dpl":
-    /// the engine's flags are three-valued, and a run that names none of them
-    /// gets the engine's historical det+dpl behaviour.
+    /// A run that asked for APA alone must still say "no deg, no det, no diu,
+    /// no dpl": the engine's flags are three-valued, and a run that names
+    /// none of them gets every table the engine can write.
     #[test]
     fn the_engine_is_named_for_exactly_the_tables_the_run_asked_for() {
         assert_eq!(
             engine_modality_flags(&[Modality::Deg, Modality::Dpl]),
-            vec!["--deg", "--det", "false", "--dpl"]
+            vec!["--deg", "--det", "false", "--diu", "false", "--dpl"]
         );
         assert_eq!(
             engine_modality_flags(&[]),
-            vec!["--deg", "false", "--det", "false", "--dpl", "false"]
+            vec!["--deg", "false", "--det", "false", "--diu", "false", "--dpl", "false"]
         );
         assert_eq!(
-            engine_modality_flags(&[Modality::Deg, Modality::Det, Modality::Dpl]),
-            vec!["--deg", "--det", "--dpl"]
+            engine_modality_flags(&[Modality::Deg, Modality::Det, Modality::Diu, Modality::Dpl]),
+            vec!["--deg", "--det", "--diu", "--dpl"]
         );
     }
 
@@ -3137,6 +3425,162 @@ mod tests {
                 .contains("the R interpreter was not found"),
             "{}",
             failure.message()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `DiffArgs` for the metadata interface, with every default filled in.
+    fn metadata_args(dir: &Path, meta: &Path) -> DiffArgs {
+        DiffArgs {
+            metadata: Some(meta.to_path_buf()),
+            profiles: None,
+            design: None,
+            sample_column: DEFAULT_SAMPLE_COLUMN.into(),
+            profile_column: DEFAULT_PROFILE_COLUMN.into(),
+            condition_column: DEFAULT_CONDITION_COLUMN.into(),
+            batch_column: DEFAULT_BATCH_COLUMN.into(),
+            alignment_column: DEFAULT_ALIGNMENT_COLUMN.into(),
+            tx_to_gene: None,
+            gtf: None,
+            fasta: None,
+            chrom_sizes: None,
+            output_dir: dir.join("out"),
+            lapa_path: PathBuf::from(DEFAULT_LAPA),
+            modalities: None,
+            min_weight: MIN_WEIGHT_DEFAULT,
+            min_counts: MIN_COUNTS_DEFAULT,
+            min_samples: MIN_SAMPLES_DEFAULT,
+            rscript: None,
+            r_script: None,
+            aggregate_only: false,
+            case_condition: None,
+            control_condition: None,
+            contrast: None,
+        }
+    }
+
+    /// A metadata table with three samples and the given condition labels,
+    /// and the three profile files it points at.
+    fn write_metadata_with_conditions(dir: &Path, conditions: &[&str]) -> PathBuf {
+        let profiles = dir.join("profiles");
+        std::fs::create_dir_all(&profiles).expect("mkdir");
+        let mut text = String::from("sample_id\tprofile_path\tcondition\n");
+        for (i, condition) in conditions.iter().enumerate() {
+            let sample = format!("S{}", i + 1);
+            std::fs::write(profiles.join(format!("{sample}.parquet")), b"").expect("write");
+            text.push_str(&format!(
+                "{sample}\tprofiles/{sample}.parquet\t{condition}\n"
+            ));
+        }
+        let meta = dir.join("metadata.tsv");
+        std::fs::write(&meta, text).expect("write");
+        meta
+    }
+
+    /// A profile parquet that declares a sample name, and the metadata that
+    /// calls the same file something else, must not be published: the rows
+    /// would be filed under the metadata's name, which is not this sample's.
+    #[test]
+    fn a_profile_that_declares_another_sample_is_refused() {
+        let dir = tmp_dir("sampleid");
+        let path = dir.join("S1.profile.parquet");
+        write_profile(&path, &[("S2", "G1", "T1", 100, 1.0)]);
+        let err = aggregate_profile_impl(&path, Some("S1"))
+            .expect_err("a profile that declares another sample must be refused");
+        let text = format!("{err:#}");
+        assert!(text.contains("declares the sample 'S2'"), "{text}");
+        assert!(text.contains("the metadata calls it 'S1'"), "{text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The same profile with the same name on both sides is published.
+    #[test]
+    fn a_profile_that_declares_the_same_sample_is_accepted() {
+        let dir = tmp_dir("sampleid_ok");
+        let path = dir.join("S1.profile.parquet");
+        write_profile(&path, &[("S1", "G1", "T1", 100, 1.0)]);
+        let rows = aggregate_profile_impl(&path, Some("S1")).expect("aggregate");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].sample_id, "S1");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The batch note has to tell the three states apart: no column at all, a
+    /// column some sample leaves empty, and a column everyone fills in. The
+    /// first two used to share a wording, and the second one is not the
+    /// first one.
+    #[test]
+    fn the_batch_note_says_which_state_the_column_is_in() {
+        assert_eq!(
+            BatchState::NoColumn.note(BatchSource::Metadata),
+            NO_BATCH_NOTE
+        );
+        let holes = BatchState::ColumnWithMissingValues("batch".into()).note(BatchSource::Metadata);
+        assert!(
+            holes.contains("at least one sample leaves it empty"),
+            "a column with holes is not 'no batch column': {holes}"
+        );
+        assert!(!holes.contains(NO_BATCH_NOTE), "{holes}");
+        let present = BatchState::ColumnPresent("batch".into()).note(BatchSource::Metadata);
+        assert!(
+            present.contains("a batch column is in the metadata"),
+            "{present}"
+        );
+        assert!(
+            present.contains("decided by the engine"),
+            "the CLI cannot know whether the engine fitted the batch: {present}"
+        );
+    }
+
+    /// A third condition label has no place in a two-group contrast, and the
+    /// run has to say so BEFORE it aggregates anything.
+    #[test]
+    fn a_third_condition_label_is_refused_before_anything_is_computed() {
+        let dir = tmp_dir("preflight_third_label");
+        let meta = write_metadata_with_conditions(&dir, &["HC", "COPD", "OTHER"]);
+        let mut args = metadata_args(&dir, &meta);
+        args.case_condition = Some("COPD".into());
+        args.control_condition = Some("HC".into());
+        let failure = preflight(&args).expect_err("a third label must be refused");
+        let text = failure.message();
+        assert!(text.contains("neither the case nor the control"), "{text}");
+        assert!(text.contains("OTHER"), "{text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An empty condition cell is a hole in the design, not a third group.
+    #[test]
+    fn a_sample_with_no_condition_is_refused() {
+        let dir = tmp_dir("preflight_empty_condition");
+        let meta = write_metadata_with_conditions(&dir, &["HC", "COPD", ""]);
+        let mut args = metadata_args(&dir, &meta);
+        args.case_condition = Some("COPD".into());
+        args.control_condition = Some("HC".into());
+        let failure = preflight(&args).expect_err("an empty condition must be refused");
+        let text = failure.message();
+        assert!(text.contains("has no condition"), "{text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A file without the unix executable bit is not a tool. Finding that
+    /// out when the tool is spawned costs the whole run; finding it out in
+    /// the preflight costs nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_without_the_executable_bit_is_not_a_tool() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp_dir("execbit");
+        let path = dir.join("not_a_tool");
+        std::fs::write(&path, "#!/bin/sh\n").expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        assert!(
+            find_executable(&path).is_none(),
+            "a file without the executable bit must not be taken for a tool"
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert!(
+            find_executable(&path).is_some(),
+            "a file with the executable bit is a tool"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -181,10 +181,15 @@ fn a_well_formed_universe_succeeds_and_prints_the_w2_split() {
 /// parquet — so the failure would not be attributable to the duplication.
 #[test]
 fn a_well_formed_universe_still_succeeds() {
-    let pool_bam = anchor_bam("consv_ok");
-    let ok_bam = write_synthetic_bam_named("consv_ok_ref", &["tx0", "tx1"], Vec::new());
-    let pool = scratch("consv_ok_pool", "parquet");
-    let emission = scratch("consv_ok_emission", "parquet");
+    // Its OWN scratch names. The scratch path is keyed by the process id, and
+    // the tests of one binary share a process id, so two tests that use the
+    // same tag share the same files: one test's cleanup() then deletes the
+    // files the other one is still reading, and the failure looks like a
+    // broken guard instead of a collision.
+    let pool_bam = anchor_bam("consv_ok2");
+    let ok_bam = write_synthetic_bam_named("consv_ok2_ref", &["tx0", "tx1"], Vec::new());
+    let pool = scratch("consv_ok2_pool", "parquet");
+    let emission = scratch("consv_ok2_emission", "parquet");
     let _ = std::fs::remove_file(&pool);
     let _ = std::fs::remove_file(&emission);
     build_anchor_pool(&pool_bam, &pool);

@@ -31,8 +31,9 @@ channels:
   - bioconda
 dependencies:
   - r-base=4.3.3
-  # Bioconductor: DEXSeq is the usage track, DESeq2 the gene track, limma the
-  # variance moderation.
+  # Bioconductor: DEXSeq is the usage track (diu.tsv), DESeq2 the gene track
+  # (deg.tsv) and the transcript track (det.tsv), limma the variance
+  # moderation (dpl.tsv, apa.tsv).
   - bioconductor-dexseq=1.48.0
   - bioconductor-deseq2=1.42.0
   - bioconductor-limma=3.58.1

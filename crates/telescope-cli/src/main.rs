@@ -144,7 +144,7 @@ enum Cmd {
     #[command(display_order = 3)]
     Quant(QuantArgs),
 
-    /// Run multi-modal differential analysis (DEG, DET, APA, and DPL) across conditions.
+    /// Run multi-modal differential analysis (DEG, DET, DIU, APA, and DPL) across conditions.
     ///
     /// The statistics are NOT implemented in Rust: DEXSeq and limma are called
     /// in an R subprocess. This subcommand does the one step that cannot be

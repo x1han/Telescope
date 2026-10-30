@@ -115,8 +115,11 @@ option_list <- list(
               help = "Min posterior mass for a cell [default %default]"),
   make_option("--min-neff", type = "double", default = 2,
               help = "Min Kish effective sample size for a cell [default %default]"),
-  make_option("--min-samples", type = "integer", default = 2,
-              help = "Min admissible samples per condition for a transcript [default %default]"),
+  make_option("--min-samples", type = "integer", default = 3,
+              help = paste("Min admissible samples per condition for a transcript",
+                           "[default %default]. The default matches the engine's",
+                           "--min-samples, so the audited population IS the",
+                           "shipped population.")),
   make_option("--max-permutations", type = "integer", default = 2000,
               help = "Cap on the enumerated label permutations [default %default]"),
   make_option("--bootstrap", type = "integer", default = 400,
@@ -331,9 +334,11 @@ for (nm in names(model_specs)) {
     q_raw = q,
     df_post = f$df_post,
     model_parameters = paste0(
-      ifelse(is.na(f$s2_prior), "",
-             sprintf("limma eBayes: s2.prior=%.6g df.prior=%.6g",
-                     f$s2_prior, f$df.prior)),
+      # With trend = TRUE the prior is fitted per transcript, so it is
+      # SUMMARISED here: a per-row vector would not even fit the column.
+      ifelse(all(is.na(f$s2_prior)), "",
+             paste0("limma eBayes: s2.prior ", dpl_prior_summary(f$s2_prior),
+                    ", df.prior ", dpl_prior_summary(f$df_prior))),
       model_note(nm)),
     stringsAsFactors = FALSE
   )

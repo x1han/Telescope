@@ -15,13 +15,17 @@
 #     the Rust side deliberately shares no code path with them, which is what
 #     makes the comparison meaningful.
 #
-# FOUR TABLES.
-#   usage   (det.tsv) DEXSeq on (gene x transcript x sample) counts.
+# FIVE TABLES.
+#   gene    (deg.tsv) DESeq2 on the gene-level counts.
+#   transcript (det.tsv) DESeq2 on the transcript-level counts: a transcript's
+#                    OWN abundance.
+#   usage   (diu.tsv) DEXSeq on (gene x transcript x sample) counts: a
+#                    transcript's SHARE of its gene's output. That is a
+#                    different question from det.tsv, not the same one.
 #   length  (dpl.tsv) a two-sample t on (transcript x sample) log2(polyA
 #                    length), with limma's empirical Bayes moderation of the
 #                    same fit reported alongside it.
-#   gene    (deg.tsv) DESeq2 on the gene-level counts.
-#   poly(A) (apa.tsv) LAPA's per-sample site counts, tested with limma.
+#   poly(A) (apa.tsv) LAPA's per-sample site USAGE, tested with limma.
 #
 # THE EXTERNAL TOOL IS NOT RUN HERE. LAPA is run by the CLI, which hands its
 # output over (`--lapa-dir`). The engine never shells out to it: a statistic
@@ -92,7 +96,7 @@
 #                flags above.
 #   --lapa-dir     LAPA's output directory, turned into apa.tsv.
 #   --output-dir Where to write:
-#                  det.tsv, dpl.tsv, deg.tsv, apa.tsv,
+#                  deg.tsv, det.tsv, diu.tsv, dpl.tsv, apa.tsv,
 #                  sessionInfo.txt
 
 suppressPackageStartupMessages({
@@ -117,7 +121,7 @@ option_list <- list(
               help = "Min sum(posterior_weight) per (transcript x sample) [default %default]"),
   make_option("--min-counts", type = "double", default = 20,
               help = "Min total counts per transcript for the usage track (DEXSeq dispersion stability; default = 20) [default %default]"),
-  make_option("--min-samples", type = "integer", default = 2,
+  make_option("--min-samples", type = "integer", default = 3,
               help = "Min number of samples per transcript for the length track [default %default]"),
   make_option("--case-condition", type = "character",
               help = "The case condition label. The effect is reported as case minus control."),
@@ -128,7 +132,9 @@ option_list <- list(
   make_option("--deg", action = "store_true", default = NA,
               help = "Write deg.tsv (DESeq2 on the gene-level counts)"),
   make_option("--det", action = "store_true", default = NA,
-              help = "Write det.tsv (DEXSeq differential transcript usage)"),
+              help = "Write det.tsv (DESeq2 on the transcript-level counts)"),
+  make_option("--diu", action = "store_true", default = NA,
+              help = "Write diu.tsv (DEXSeq differential isoform usage)"),
   make_option("--dpl", action = "store_true", default = NA,
               help = "Write dpl.tsv (the audited limma length model)"),
   make_option("--lapa-dir", type = "character",
@@ -148,18 +154,25 @@ modality_flag <- function(x, when_absent) {
 }
 named_modality <- !is.null(opt$deg) && !is.na(opt$deg)
 if (!is.null(opt$det)) named_modality <- named_modality || !is.na(opt$det)
+if (!is.null(opt$diu)) named_modality <- named_modality || !is.na(opt$diu)
 if (!is.null(opt$dpl)) named_modality <- named_modality || !is.na(opt$dpl)
 if (named_modality) {
   want_deg <- modality_flag(opt$deg, FALSE)
   want_det <- modality_flag(opt$det, FALSE)
+  want_diu <- modality_flag(opt$diu, FALSE)
   want_dpl <- modality_flag(opt$dpl, FALSE)
 } else {
-  want_deg <- FALSE
+  # Nothing was named: every table this engine can write is written. The
+  # five modalities are the contract, and an unqualified invocation means
+  # "all of them".
+  want_deg <- TRUE
   want_det <- TRUE
+  want_diu <- TRUE
   want_dpl <- TRUE
 }
 cat("[telescope_diff] tables:",
-    paste(c(if (want_deg) "deg", if (want_det) "det", if (want_dpl) "dpl"),
+    paste(c(if (want_deg) "deg", if (want_det) "det", if (want_diu) "diu",
+            if (want_dpl) "dpl"),
           collapse = ", "), "\n")
 
 # The model layer is a separate file so that the audit and this engine run
@@ -319,7 +332,7 @@ contrast_note <- paste0("contrast: ", case_condition, " - ", control_condition,
 # Only the tracks that need them build them: aggregating the per-read
 # profiles is the expensive step of the engine, and the length track does
 # not use the counts.
-if (want_det || want_deg) {
+if (want_diu || want_det || want_deg) {
 counts_long <- if (is.null(profiles_df)) {
   # Pre-aggregated input: the count is the rounded posterior mass the
   # aggregator already summed.
@@ -341,6 +354,10 @@ counts_long <- if (is.null(profiles_df)) {
 # track's own thresholds (DEXSeq dispersion stability, single-transcript
 # genes) and must not remove transcripts from a gene's total.
 counts_for_genes <- counts_long
+# The transcript track needs the transcript counts before the usage track's
+# filters, for the same reason the gene track needs the gene counts before
+# them: a transcript's own abundance is not a usage track's business.
+counts_for_tx <- counts_long
 }
 
 # THE MODEL MATRIX DEXSeq FITS THE DISPERSIONS WITH. DEXSeq reduces the
@@ -359,10 +376,17 @@ rank_reduced_model_matrix <- function(dxd) {
 }
 
 # =====================================================================
-# Usage track: ΔPAU via DEXSeq  ->  det.tsv
+# Usage track: differential isoform usage via DEXSeq  ->  diu.tsv
 # =====================================================================
-if (want_det) {
-cat("\n[telescope_diff] usage track: ΔPAU via DEXSeq\n")
+#
+# THE TWO TRACKS THIS BLOCK SATISFIED BEFORE ARE TWO TRACKS. A transcript's
+# own ABUNDANCE (DESeq2 on the transcript counts) and the share a transcript
+# takes of its gene's output (DEXSeq) are different questions, and a gene
+# whose two isoforms trade places changes one without changing the other.
+# So: det.tsv is the DESeq2 transcript abundance test and diu.tsv is this
+# block's DEXSeq usage test.
+if (want_diu) {
+cat("\n[telescope_diff] usage track: differential isoform usage via DEXSeq\n")
 counts_by_tx <- counts_long %>%
   dplyr::group_by(gene_id, transcript_id) %>%
   dplyr::summarize(total = sum(count), .groups = "drop")
@@ -512,58 +536,312 @@ if (length(lfc_col) != 1) {
 }
 dexseq_lfc <- as.numeric(dxr[[lfc_col]])
 
-# The engine's own unnormalised mean ratio, under a name that says what it
-# is. It is NOT a DEXSeq effect estimate: it is the ratio of the two groups'
-# mean counts with a 0.5 pseudocount.
+# THE TWO GROUPS' SAMPLES, in the design DEXSeq was fitted with.
 case_samples    <- design_aligned$sample_id[design_aligned$condition == case_condition]
 control_samples <- design_aligned$sample_id[design_aligned$condition == control_condition]
-tx_mean_case    <- rowMeans(count_mat[, case_samples, drop = FALSE], na.rm = TRUE)
-tx_mean_control <- rowMeans(count_mat[, control_samples, drop = FALSE], na.rm = TRUE)
-log2_mean_ratio_by_tx <- log2((tx_mean_case + 0.5) / (tx_mean_control + 0.5))
 
-pau_out <- counts_by_tx_all
-pau_out$case_condition    <- case_condition
-pau_out$control_condition <- control_condition
-pau_out$pvalue         <- NA_real_
-pau_out$padj           <- NA_real_
-pau_out$log2FoldChange  <- NA_real_
-pau_out$log2_mean_ratio <- NA_real_
-idx <- match(paste(pau_out$gene_id, pau_out$transcript_id),
+# THE OBSERVED SHARE OF THE GENE'S OUTPUT. This is the quantity DEXSeq's
+# test is about -- how much of its gene's output a transcript takes -- so it
+# is computed the way DEXSeq computes it: from the size-factor normalised
+# counts, with the gene's total as the denominator. Averaged over the
+# samples of a group, it is the group's observed share.
+# DEXSeq's OWN LAYOUT. The assay has one row per transcript and, for each
+# sample, TWO columns: "this" (the transcript) and "others" (the rest of its
+# gene). The share of the gene's output is exactly `this / (this + others)`,
+# and it does not depend on the size factor: the same factor divides the
+# numerator and the denominator. So the share is computed from the counts
+# DEXSeq was fitted with.
+dex_cd <- colData(dxd)
+dex_counts <- counts(dxd)
+this_cols <- which(as.character(dex_cd$exon) == "this")
+other_cols <- which(as.character(dex_cd$exon) == "others")
+this_samps <- as.character(dex_cd$sample_id[this_cols])
+other_order <- match(this_samps, as.character(dex_cd$sample_id[other_cols]))
+this_mat <- dex_counts[, this_cols, drop = FALSE]
+others_mat <- dex_counts[, other_cols[other_order], drop = FALSE]
+gene_total <- this_mat + others_mat
+share_by_row <- this_mat / gene_total
+share_by_row[gene_total <= 0] <- NA_real_
+colnames(share_by_row) <- this_samps
+# The rows are the transcripts, in the order the results table has them.
+res_feature <- dxr$featureID
+res_gene <- dxr$groupID
+if (length(res_feature) != nrow(share_by_row)) {
+  stop("ERROR: the DEXSeq results table has ", length(res_feature),
+       " rows but the usage matrix has ", nrow(share_by_row),
+       "; the shares cannot be matched to the transcripts.")
+}
+# THE SHARE IS KEYED BY GENE **AND** TRANSCRIPT. A transcript id is not
+# guaranteed to be unique across genes, and keying by the transcript alone
+# would put the rows of two genes into one group and report the MEAN of two
+# genes' shares as one transcript's share. The length track already guards
+# the same case ("A TRANSCRIPT ID MAY IN PRINCIPLE BELONG TO TWO GENES").
+share_by_key <- split(seq_len(nrow(share_by_row)),
+                      paste(res_gene, res_feature, sep = "\r"))
+share_mean <- function(gene, tx, samples) {
+  i <- share_by_key[[paste(gene, tx, sep = "\r")]]
+  if (is.null(i)) return(NA_real_)
+  m <- share_by_row[i, , drop = FALSE]
+  cols <- match(samples, colnames(m))
+  if (anyNA(cols)) return(NA_real_)
+  v <- as.numeric(m[, cols, drop = FALSE])
+  v <- v[!is.na(v)]
+  if (length(v) == 0) return(NA_real_)
+  mean(v)
+}
+diu_out <- counts_by_tx_all
+diu_out$case_condition    <- case_condition
+diu_out$control_condition <- control_condition
+diu_out$pvalue        <- NA_real_
+diu_out$padj          <- NA_real_
+diu_out$log2FoldChange <- NA_real_
+diu_out$share_case    <- NA_real_
+diu_out$share_control <- NA_real_
+diu_out$delta_share   <- NA_real_
+diu_out$gene_padj     <- NA_real_
+idx <- match(paste(diu_out$gene_id, diu_out$transcript_id),
              paste(dxr$groupID, dxr$featureID))
 tested <- !is.na(idx)
-pau_out$pvalue[tested]         <- dxr$pvalue[idx[tested]]
-pau_out$padj[tested]           <- dxr$padj[idx[tested]]
-pau_out$log2FoldChange[tested] <- dexseq_lfc[idx[tested]]
-pau_out$log2_mean_ratio[tested] <- log2_mean_ratio_by_tx[idx[tested]]
-pau_out$n_case    <- sum(design$condition == case_condition)
-pau_out$n_control <- sum(design$condition == control_condition)
-pau_out$independent_filter_threshold <- filter_threshold
-pau_out$n_independent_filtered <- n_independent_filtered
+diu_out$pvalue[tested]         <- dxr$pvalue[idx[tested]]
+diu_out$padj[tested]           <- dxr$padj[idx[tested]]
+diu_out$log2FoldChange[tested] <- dexseq_lfc[idx[tested]]
+diu_out$share_case[tested] <- vapply(which(tested),
+                                     function(i) share_mean(diu_out$gene_id[i],
+                                                            diu_out$transcript_id[i],
+                                                            case_samples),
+                                     numeric(1))
+diu_out$share_control[tested] <- vapply(which(tested),
+                                        function(i) share_mean(diu_out$gene_id[i],
+                                                               diu_out$transcript_id[i],
+                                                               control_samples),
+                                        numeric(1))
+diu_out$delta_share[tested] <- diu_out$share_case[tested] - diu_out$share_control[tested]
+# THE GENE-LEVEL ADJUSTMENT. DEXSeq's own perGeneQValue: the smallest
+# p-value of a gene's transcripts, adjusted across genes. It answers a
+# different question from the transcript-level padj -- "does this GENE carry
+# a usage change" -- and the paper's usage figures use it.
+gene_q <- tryCatch(DEXSeq::perGeneQValue(dxr),
+                   error = function(e) {
+                     cat("  WARN: the per-gene q-values could not be computed (",
+                         conditionMessage(e), "); gene_padj is NA.\n")
+                     NULL
+                   })
+if (!is.null(gene_q)) {
+  diu_out$gene_padj <- unname(gene_q[match(diu_out$gene_id, names(gene_q))])
+}
+# THE SAMPLE COUNTS COME FROM THE DESIGN THAT WAS FITTED. The DEXSeq fit
+# uses `design_aligned`, which is shorter than `design` when a design sample
+# contributes no counts at all; counting from `design` would report more
+# samples per group than were fitted.
+diu_out$n_case    <- sum(design_aligned$condition == case_condition)
+diu_out$n_control <- sum(design_aligned$condition == control_condition)
+diu_out$independent_filter_threshold <- filter_threshold
+diu_out$n_independent_filtered <- n_independent_filtered
 # WHY A ROW HAS NO ADJUSTED P-VALUE. With the filtering off, the only
 # reasons left are a missing p-value and a feature that was never tested.
-pau_out$padj_na_reason <- ifelse(!tested, "not_tested",
-                          ifelse(is.na(pau_out$pvalue), "no_p_value", "none"))
+diu_out$padj_na_reason <- ifelse(!tested, "not_tested",
+                          ifelse(is.na(diu_out$pvalue), "no_p_value", "none"))
 # THE MODEL, RECORDED. The tool that produced the statistic, the contrast and
 # the batch handling (the audited note, never a guess). A transcript DEXSeq
 # never saw carries no model, the same way the length track's untestable rows
 # do.
-pau_out$model_name <- ifelse(tested, "dexseq", "not_tested")
-pau_out$model_parameters <- paste0(
-  "DEXSeq differential transcript usage on (gene x transcript x sample) counts; ",
-  "log2FoldChange is DEXSeq's own effect estimate, log2_mean_ratio is the ",
-  "engine's unnormalised mean ratio of the two groups' mean counts; ",
-  contrast_note, "; ", dpl_batch_note)
-pau_out <- pau_out[, c("gene_id", "transcript_id", "case_condition",
-                       "control_condition", "pvalue", "padj", "log2FoldChange",
-                       "log2_mean_ratio", "total", "n_case", "n_control",
+diu_out$model_name <- ifelse(tested, "dexseq", "not_tested")
+# THE MODEL, RECORDED. The design is stated as it was fitted. The design
+# `~ sample + exon + condition:exon` carries a per-sample intercept, so a
+# sample-level main effect is absorbed; it carries NO batch:exon interaction,
+# so a batch effect on the USAGE of a transcript is not adjusted for. Saying
+# "batch adjusted" here would be false, and the length track's note (which
+# belongs to the length track's model) is not this track's to carry.
+diu_out$model_parameters <- paste0(
+  "DEXSeq differential isoform usage on (gene x transcript x sample) counts; ",
+  "design ~ sample + exon + condition:exon (a per-sample intercept, so a ",
+  "sample-level main effect is absorbed; no batch:exon interaction term, so a ",
+  "batch effect on a transcript's share is NOT adjusted for); ",
+  "log2FoldChange is DEXSeq's own MODEL estimate: the log2 ratio of the ",
+  "transcript's usage between the two conditions; ",
+  "share_case and share_control are the OBSERVED mean shares of the gene's ",
+  "output (size-factor normalised counts) and delta_share is their ",
+  "difference, a difference of proportions on the [0,1] scale; ",
+  "the two are DIFFERENT ESTIMATORS of the same usage change -- DEXSeq's is ",
+  "a per-gene negative binomial GLM coefficient and the shares are unweighted ",
+  "means of the per-sample ratios -- so 2^log2FoldChange is not exactly ",
+  "share_case / share_control; ",
+  "the gene total behind a share is over the transcripts DEXSeq saw, i.e. ",
+  "after the usage track's minimum-count filter and the single-transcript-gene ",
+  "drop; ",
+  "gene_padj is DEXSeq::perGeneQValue, ONE q-value per GENE (the gene's ",
+  "smallest transcript p-value, adjusted across genes) broadcast to that ",
+  "gene's transcripts -- a different multiplicity from the transcript-level ",
+  "padj; ",
+  "independent filtering: not applied (the threshold is NA and nothing was ",
+  "filtered); ",
+  contrast_note, "; ", disp_note)
+diu_out <- diu_out[, c("gene_id", "transcript_id", "case_condition",
+                       "control_condition", "share_case", "share_control",
+                       "delta_share", "log2FoldChange", "pvalue", "padj",
+                       "gene_padj", "total", "n_case", "n_control",
                        "independent_filter_threshold", "n_independent_filtered",
                        "padj_na_reason", "model_name", "model_parameters")]
 
-write.table(pau_out,
+write.table(diu_out,
+            file = file.path(opt$`output-dir`, "diu.tsv"),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+cat("[telescope_diff]  wrote diu.tsv (",
+    nrow(diu_out), "transcripts)\n")
+}
+
+# =====================================================================
+# Transcript track: differential transcript abundance via DESeq2 -> det.tsv
+# =====================================================================
+#
+# A TRANSCRIPT'S OWN ABUNDANCE IS A DIFFERENT QUESTION FROM ITS SHARE OF ITS
+# GENE'S OUTPUT. The first is this block: does the transcript's own count
+# change between the two conditions? The second is the DEXSeq usage test in
+# diu.tsv: does the transcript take more or less of what its gene produces?
+# A gene can go up with every isoform's share unchanged, and an isoform can
+# take over its gene while the gene's total stays where it was.
+if (want_det) {
+cat("\n[telescope_diff] transcript track: differential transcript abundance via DESeq2\n")
+if (!requireNamespace("DESeq2", quietly = TRUE)) {
+  stop("ERROR: the transcript track needs DESeq2, which is not installed in this R ",
+       "library. Create the pinned environment: mamba env create -f workflow/environment.yml")
+}
+
+# THE TRANSCRIPT-LEVEL COUNTS, BEFORE THE USAGE TRACK'S FILTERS. The filters
+# are the usage track's thresholds (a minimum total count, single-transcript
+# genes) and have no business removing a transcript from its own abundance
+# test.
+tx_counts_long <- counts_for_tx %>%
+  dplyr::group_by(gene_id, transcript_id, sample_id) %>%
+  dplyr::summarize(count = sum(count), .groups = "drop")
+tx_ids_all <- sort(unique(tx_counts_long$transcript_id))
+# The gene each transcript belongs to, taken from the counts themselves.
+gene_of_tx <- tapply(tx_counts_long$gene_id, tx_counts_long$transcript_id,
+                     function(x) x[1])
+cat("  transcripts:", length(tx_ids_all), "\n")
+
+tx_mat <- matrix(0, nrow = length(tx_ids_all), ncol = nrow(design),
+                 dimnames = list(tx_ids_all, design$sample_id))
+rows_i <- match(tx_counts_long$transcript_id, tx_ids_all)
+cols_j <- match(tx_counts_long$sample_id, design$sample_id)
+tx_mat[cbind(rows_i, cols_j)] <- tx_counts_long$count
+tx_mat <- matrix(as.integer(tx_mat), nrow = nrow(tx_mat),
+                 dimnames = dimnames(tx_mat))
+if (any(tx_mat < 0)) {
+  stop("ERROR: the transcript-level counts contain a negative value.")
+}
+# A TRANSCRIPT ID MAY IN PRINCIPLE BELONG TO TWO GENES. DESeq2's row names
+# have to be unique, so the matrix is keyed by the pair; the reported table
+# still carries the transcript id on its own.
+tx_keys <- paste(tx_counts_long$gene_id, tx_counts_long$transcript_id, sep = "|")
+tx_key_by_id <- tapply(tx_keys, tx_counts_long$transcript_id, function(x) x[1])
+rownames(tx_mat) <- unname(tx_key_by_id[tx_ids_all])
+if (anyDuplicated(rownames(tx_mat))) {
+  stop("ERROR: two transcripts of the same gene share a transcript id; ",
+       "the transcript-level matrix cannot be keyed.")
+}
+
+# THE DESIGN. The same design the gene track uses: the reference level is
+# the control, and the batch term is present only when the batch is not
+# confounded with the condition.
+design_tx <- design[match(colnames(tx_mat), design$sample_id), , drop = FALSE]
+if (any(is.na(design_tx$sample_id))) {
+  stop("ERROR: design sample_ids do not match the transcript count matrix columns.")
+}
+rownames(design_tx) <- colnames(tx_mat)
+design_tx$condition <- factor(as.character(design_tx$condition),
+                              levels = c(control_condition, case_condition))
+if (dpl_spec$batch_used) {
+  design_tx$batch <- factor(as.character(design_tx$batch))
+  det_formula <- ~ condition + batch
+} else {
+  det_formula <- ~ condition
+}
+
+dds_tx <- DESeq2::DESeqDataSetFromMatrix(countData = tx_mat,
+                                          colData = design_tx,
+                                          design = det_formula)
+# THE SIZE FACTORS. A transcript that is absent in one sample has a zero in
+# the geometric mean, and DESeq2's default median-of-ratios needs at least
+# one row with no zero at all. When there is none, its own `poscounts`
+# estimator is the documented remedy and it is used here.
+tx_sf_note <- "median-of-ratios size factors"
+dds_tx <- tryCatch(DESeq2::estimateSizeFactors(dds_tx),
+                   error = function(e) {
+                     cat("  WARN: the transcript size factors could not be estimated (",
+                         conditionMessage(e),
+                         "); using DESeq2's poscounts estimator.\n")
+                     tx_sf_note <<- "poscounts size factors (the median-of-ratios estimator failed)"
+                     DESeq2::estimateSizeFactors(dds_tx, type = "poscounts")
+                   })
+
+tx_disp_note <- "parametric dispersion fit"
+dds_tx <- tryCatch({
+  dds_tx <- DESeq2::estimateDispersions(dds_tx, quiet = TRUE)
+  dds_tx
+}, error = function(e) {
+  cat("  WARN: the transcript dispersion trend could not be fitted (",
+      conditionMessage(e),
+      "); keeping DESeq2's gene-wise dispersion estimates.\n")
+  tx_disp_note <<- "gene-wise dispersion estimates (the dispersion trend could not be fitted)"
+  dds_fallback <- DESeq2::estimateDispersionsGeneEst(dds_tx, quiet = TRUE)
+  DESeq2::dispersions(dds_fallback) <- S4Vectors::mcols(dds_fallback)$dispGeneEst
+  dds_fallback
+})
+
+dds_tx <- DESeq2::nbinomWaldTest(dds_tx)
+dres_tx <- DESeq2::results(dds_tx, independentFiltering = FALSE,
+                           contrast = c("condition", case_condition, control_condition))
+dres_tx_df <- as.data.frame(dres_tx)
+
+det_out <- data.frame(
+  gene_id                = unname(gene_of_tx[tx_ids_all]),
+  transcript_id          = tx_ids_all,
+  case_condition         = rep(case_condition, length(tx_ids_all)),
+  control_condition      = rep(control_condition, length(tx_ids_all)),
+  baseMean               = NA_real_,
+  log2FoldChange         = NA_real_,
+  lfcSE                  = NA_real_,
+  stat                  = NA_real_,
+  pvalue                 = NA_real_,
+  padj                   = NA_real_,
+  n_case                 = rep(sum(design_tx$condition == case_condition), length(tx_ids_all)),
+  n_control              = rep(sum(design_tx$condition == control_condition), length(tx_ids_all)),
+  independent_filter_threshold = NA_real_,
+  n_independent_filtered = 0L,
+  stringsAsFactors = FALSE
+)
+# The results are keyed by the composite row name of the matrix, which is
+# the gene and the transcript together.
+det_keys <- unname(tx_key_by_id[tx_ids_all])
+det_idx <- match(det_keys, rownames(dres_tx_df))
+det_tested <- !is.na(det_idx)
+det_out$baseMean[det_tested]       <- dres_tx_df$baseMean[det_idx[det_tested]]
+det_out$log2FoldChange[det_tested] <- dres_tx_df$log2FoldChange[det_idx[det_tested]]
+det_out$lfcSE[det_tested]          <- dres_tx_df$lfcSE[det_idx[det_tested]]
+det_out$stat[det_tested]           <- dres_tx_df$stat[det_idx[det_tested]]
+det_out$pvalue[det_tested]         <- dres_tx_df$pvalue[det_idx[det_tested]]
+det_out$padj[det_tested]           <- dres_tx_df$padj[det_idx[det_tested]]
+det_out$padj_na_reason <- ifelse(!det_tested, "not_tested",
+                          ifelse(is.na(det_out$pvalue), "no_p_value", "none"))
+det_out$model_name <- "deseq2_wald"
+det_out$model_parameters <- paste0(
+  "DESeq2 on the transcript-level counts (the transcript's own abundance, ",
+  "not its share of its gene's output -- that is the DEXSeq usage test in ",
+  "diu.tsv); negative binomial Wald test; results(independentFiltering = FALSE); ",
+  "the counts are the Rust aggregator's posterior mass rounded to integers, ",
+  "not molecule counts; the matrix is the UNFILTERED one, i.e. before the ",
+  "usage track's minimum-count filter and the single-transcript-gene drop, ",
+  "because those thresholds are the usage track's business; ",
+  "independent filtering: not applied (the threshold is NA and nothing was ",
+  "filtered); ",
+  tx_sf_note, "; ", tx_disp_note, "; ", contrast_note, "; ", dpl_batch_note)
+
+write.table(det_out,
             file = file.path(opt$`output-dir`, "det.tsv"),
             sep = "\t", quote = FALSE, row.names = FALSE)
-cat("[telescope_diff]  wrote det.tsv (",
-    nrow(pau_out), "transcripts)\n")
+cat("[telescope_diff]  wrote det.tsv (", nrow(det_out), "transcripts,",
+    sum(det_out$padj_na_reason == "none"), "tested)\n")
 }
 
 # =====================================================================
@@ -766,8 +1044,19 @@ sample_order <- design$sample_id
 y_mat <- dpl_matrices(units, sample_order, tx_ids_all, "mean_log2_pal", NULL)$y
 
 cat("  fitting", length(tx_ids_all), "transcripts…\n")
-fit_raw <- dpl_fit_model(y_mat, dpl_design_matrix, NULL, FALSE)
-fit     <- dpl_fit_model(y_mat, dpl_design_matrix, NULL, TRUE)
+# ONE FIT FOR BOTH ARMS. eBayes leaves the coefficients, the unscaled
+# standard deviations, the residual standard deviation and the residual
+# degrees of freedom untouched, so the raw statistics come out of the same
+# fit as the moderated ones. Fitting the transcriptome twice doubled the
+# dominant cost of this track for no extra information.
+both     <- dpl_fit_both(y_mat, dpl_design_matrix, NULL)
+fit_raw  <- both$raw
+fit      <- both$moderated
+# The moderation is fitted with the variance trend, and the note says whether
+# that actually happened: a cohort whose features share one average leaves
+# limma's spline nothing to fit, and the moderation then goes on without the
+# trend. The receipt has to say which fit produced the numbers.
+dpl_ebayes_note <- if (nzchar(both$ebayes_note)) paste0(both$ebayes_note, "; ") else ""
 
 se_raw  <- fit_raw$se
 t_raw   <- fit_raw$t
@@ -805,7 +1094,17 @@ n_adm_ctrl[is.na(n_adm_ctrl)] <- 0
 # leave the denominator at the wider population and change nothing.
 min_samples <- opt$`min-samples`
 too_few_cells <- n_adm_case < min_samples | n_adm_ctrl < min_samples
-fit_failed <- !is.finite(t_raw)
+# A TRANSCRIPT WHOSE RESIDUAL VARIANCE HAS COLLAPSED IS NOT A RESULT.
+# limma computes the residual standard deviation from the QR decomposition,
+# so a mathematically zero residual variance comes out at ~1e-15 rather than
+# at 0. The t statistic is then finite and enormous (1e+16) and the p-value
+# is a floating-point artefact (1e-141): a row of that kind would be the most
+# significant row in the table, and it says nothing at all. The floor is
+# 1e-8 on the VARIANCE, which is 1e-4 on the standard deviation -- and the
+# smallest variance in the real cohorts is 1.7e-7, so nothing that carries
+# signal is masked by it.
+sigma2_raw <- fit_raw$sigma2_raw
+fit_failed <- !is.finite(t_raw) | !is.finite(se_raw) | (sigma2_raw < 1e-8)
 masked <- fit_failed | too_few_cells
 t_raw[masked] <- NA_real_
 p_raw[masked] <- NA_real_
@@ -819,12 +1118,40 @@ cat("  testable transcripts:", sum(!masked), "(both groups with >=",
 # WHY A ROW HAS NO ADJUSTED P-VALUE. The length track has no independent
 # filter: it drops no row for having a low mean, so the threshold is NA and
 # the count of filtered rows is 0. A row without a statistic says why.
+no_cells <- n_adm_case == 0 & n_adm_ctrl == 0
 pal_na_reason <- ifelse(
   !is.na(p_raw), "none",
-  ifelse(n_adm_case == 0 & n_adm_ctrl == 0,
-         "no admissible cells at all",
-         "too few admissible cells in one group"))
+  ifelse(no_cells, "no admissible cells at all",
+         ifelse(fit_failed, "degenerate_zero_variance",
+                "too few admissible cells in one group")))
 
+# THE PRIORS ARE SUMMARISED, NOT LISTED. With trend = TRUE limma fits the
+# prior variance as a function of the average expression, so s2.prior and
+# df.prior hold ONE VALUE PER TRANSCRIPT rather than one value for the fit.
+# Printing them one by one would put sixteen numbers in a log line, and
+# pasting them into every row's model_parameters would put a paragraph in
+# every cell.
+#
+# WHAT THE BASE FIT IS. The name and the sentence have to agree: with a batch
+# term in the design the fit is not a two-sample t, its coefficient is not the
+# difference of the two group means, and calling it one is a receipt that
+# contradicts the model_name column beside it.
+dpl_base_fit_clause <- if (dpl_spec$batch_used) {
+  "base fit: batch_adjusted_raw_t (the design carries a batch term, so the fit is a linear model with a batch term and its `case` coefficient is the BATCH-ADJUSTED difference, not the raw difference of the two group means); "
+} else {
+  "base fit: equal_raw_t (unweighted two-sample t on the transcript x sample means; with no batch term in the design, the `case` coefficient is the difference of the two group means); "
+}
+# THE AUDIT IS NOT RE-RUN HERE. The calibration is a separate script over a
+# separate set of cohorts, and its verdict is a property of THAT run. Writing
+# a verdict into this receipt as a literal would put a claim in every row of
+# every table that no run of this engine could confirm -- and a claim that
+# cannot be confirmed is a claim that can be wrong. So the receipt says where
+# the verdict lives instead of asserting one.
+dpl_audit_clause <- paste0(
+  "audit: workflow/scripts/audit_dpl_models.R -- the calibration of this model ",
+  "is a SEPARATE run, not recomputed here; its verdict is in that script's own ",
+  "dpl_audit_summary.tsv, one row per candidate model; "
+)
 pal_out <- data.frame(
   gene_id                    = unname(gene_of),
   transcript_id              = tx_ids_all,
@@ -851,13 +1178,18 @@ pal_out <- data.frame(
   independent_filter_threshold = NA_real_,
   n_independent_filtered     = 0L,
   padj_na_reason             = pal_na_reason,
-  model_name                 = "equal_raw_t",
+  # The name follows the design that was fitted. With a usable batch the
+  # baseline is not a two-sample t any more -- the design carries a batch
+  # term -- so calling it "equal_raw_t" would name a model that was not
+  # fitted.
+  model_name                 = if (dpl_spec$batch_used) "batch_adjusted_raw_t" else "equal_raw_t",
   model_parameters           = paste0(
-    "base fit: equal_raw_t (unweighted two-sample t on the transcript x sample ",
-    "means); moderated arm: equal_weight_eb (limma eBayes: s2.prior=",
-    format(fit$s2_prior, digits = 10), ", df.prior=",
-    format(fit$df_prior, digits = 10), "); audit: ",
-    "workflow/scripts/audit_dpl_models.R (verdict CALIBRATED); ",
+    dpl_base_fit_clause,
+    "moderated arm: equal_weight_eb (limma eBayes with trend = TRUE ",
+    "and robust = TRUE; the prior variance is fitted against the average ",
+    "expression, so s2.prior and df.prior are per transcript: s2.prior ",
+    dpl_prior_summary(fit$s2_prior), ", df.prior ", dpl_prior_summary(fit$df_prior),
+    "); ", dpl_ebayes_note, dpl_audit_clause,
     "independent filtering: not applied (the length track drops no row, so the ",
     "independent filter threshold is NA and nothing was filtered); ",
     contrast_note, "; ", dpl_batch_note),
@@ -867,7 +1199,13 @@ pal_out <- data.frame(
 # has too few admissible cells keeps its effect estimate: the difference of
 # the two group means is computed, it is the TEST that is not supported. The
 # admissible sample counts and the NA reason say which.
+#
+# BOTH EFFECT COLUMNS ARE MASKED TOGETHER. The moderated arm's estimate is the
+# SAME coefficient as the raw arm's (limma moderates the variance, not the
+# coefficient), so leaving one of them filled on a row whose fit failed would
+# make the two effect columns disagree about whether the row has a result.
 pal_out$delta_pal_case_minus_control[fit_failed] <- NA_real_
+pal_out$delta_pal_moderated[fit_failed] <- NA_real_
 pal_out$model_name[is.na(pal_out$t_raw)] <- "not_testable"
 
 write.table(pal_out,
@@ -875,8 +1213,9 @@ write.table(pal_out,
             sep = "\t", quote = FALSE, row.names = FALSE)
 cat("[telescope_diff]  wrote dpl.tsv (",
     nrow(pal_out), "transcripts,", sum(!is.na(pal_out$p_raw)), "tested)\n")
-cat("[telescope_diff]  limma eBayes priors: s2.prior =", fit$s2_prior,
-    " df.prior =", fit$df_prior, "\n")
+cat("[telescope_diff]  limma eBayes priors (per transcript, summarised): ",
+    "s2.prior =", dpl_prior_summary(fit$s2_prior),
+    " df.prior =", dpl_prior_summary(fit$df_prior), "\n")
 
 # The moderation must not have emptied the moderated columns.
 if (sum(is.finite(fit$sigma2_post)) > 0) {
@@ -969,18 +1308,57 @@ if (length(apa_samples) < 2) {
        "output and a design row; found ", length(apa_samples), ".")
 }
 
-# THE (SITE x SAMPLE) COUNT MATRIX. A site that LAPA did not call in a sample
-# has no reads there, so its count for that sample is zero.
+# THE (SITE x SAMPLE) USAGE MATRIX. THE TEST IS ABOUT A PROPORTION, NOT A
+# COUNT. LAPA's own `usage` column is the site's share of its gene's
+# poly(A) reads in that sample: usage == count / gene_count, which was
+# verified on 65,639 of 65,639 rows over 21 bed files. A raw count is not a
+# usage: a gene whose output doubles doubles every one of its sites' counts,
+# so a test on counts measures the gene's abundance (the DEG track) and calls
+# it a poly(A) site choice. So the matrix holds the USAGE.
+#
+# A CELL IS VALID ONLY WHEN THE GENE'S TOTAL IS BIG ENOUGH TO DIVIDE. LAPA's
+# `gene_count` is that total for the sample, and a share taken over a handful
+# of reads is noise. A cell whose gene total is below the minimum count is
+# NA, not zero.
 apa_site_ids <- sort(unique(unlist(lapply(lapa_rows, function(d) d$site_id))))
-apa_mat <- matrix(0, nrow = length(apa_site_ids), ncol = length(apa_samples),
+apa_mat <- matrix(NA_real_, nrow = length(apa_site_ids), ncol = length(apa_samples),
                    dimnames = list(apa_site_ids, apa_samples))
+apa_counts <- matrix(NA_real_, nrow = length(apa_site_ids), ncol = length(apa_samples),
+                      dimnames = list(apa_site_ids, apa_samples))
+# WHICH CELLS LAPA ACTUALLY CALLED. A site LAPA did not call in a sample is
+# a different thing from a site it called with a value that cannot be used,
+# and the two are told apart by this mask rather than by the cell being NA.
+apa_present <- matrix(FALSE, nrow = length(apa_site_ids), ncol = length(apa_samples),
+                       dimnames = list(apa_site_ids, apa_samples))
+# THE GENE TOTAL PER (GENE, SAMPLE). LAPA writes the same gene_count on every
+# row of a gene in a sample, so the first non-missing one is the total.
+apa_gene_total <- list()
 for (s in apa_samples) {
   d <- lapa_rows[[s]]
-  d <- d[d$site_id %in% apa_site_ids, ]
-  j <- match(d$site_id, apa_site_ids)
-  apa_mat[cbind(j, match(s, apa_samples))] <- d$count
+  g <- d$gene_id
+  gc <- suppressWarnings(as.numeric(d$gene_count))
+  keep <- !is.na(g) & nzchar(g)
+  if (any(keep)) {
+    tot <- tapply(gc[keep], g[keep], function(x) x[which(!is.na(x))[1]])
+    apa_gene_total[[s]] <- tot
+  } else {
+    apa_gene_total[[s]] <- numeric(0)
+  }
+  # The rows are RE-ORDERED to the matrix's site order, and the values must
+  # be re-ordered with them. Taking the usage from the original rows and
+  # writing it into the reordered positions puts every site's usage on
+  # another site -- a rotation that no assertion on the totals would see.
+  # A SITE THIS SAMPLE DOES NOT HAVE HAS NO ROW AT ALL, so its index is NA:
+  # those rows are left out of the assignment, because an NA in a subscripted
+  # assignment is an error, not a "no value".
+  d2 <- d[match(apa_site_ids, d$site_id), ]
+  j <- match(d2$site_id, apa_site_ids)
+  cc <- match(s, apa_samples)
+  present <- !is.na(j)
+  apa_mat[cbind(j[present], cc)] <- suppressWarnings(as.numeric(d2$usage))[present]
+  apa_counts[cbind(j[present], cc)] <- suppressWarnings(as.numeric(d2$count))[present]
+  apa_present[cbind(j[present], cc)] <- TRUE
 }
-apa_mat[is.na(apa_mat)] <- 0
 
 # The gene of a site: LAPA's own gene_id column. The first non-missing one
 # wins, over the samples in a fixed order.
@@ -992,10 +1370,47 @@ for (s in apa_samples) {
   take <- is.na(apa_gene) & !is.na(g) & nzchar(g)
   apa_gene[take] <- g[take]
 }
+# THE COORDINATE OF A SITE. LAPA's `polyA_site` is the peak's position.
+apa_coord <- rep(NA_real_, length(apa_site_ids))
+for (s in apa_samples) {
+  d <- lapa_rows[[s]]
+  d <- d[match(apa_site_ids, d$site_id), ]
+  pos <- suppressWarnings(as.numeric(d$polyA_site))
+  take <- is.na(apa_coord) & !is.na(pos)
+  apa_coord[take] <- pos[take]
+}
 
-# THE TEST. limma on the (site x sample) count matrix, with the same design
+# A SITE LAPA DID NOT CALL IN A SAMPLE HAS NO READS THERE, so its share is
+# zero -- but only when the gene's total for that sample is known and big
+# enough to divide. Otherwise the cell is NA.
+for (cc in seq_along(apa_samples)) {
+  s <- apa_samples[cc]
+  totals <- apa_gene_total[[s]]
+  genes <- apa_gene
+  known <- !is.na(genes) & genes %in% names(totals)
+  tot <- rep(NA_real_, length(genes))
+  tot[known] <- totals[genes[known]]
+  absent <- !apa_present[, cc]
+  usable <- absent & !is.na(tot) & tot >= opt$`min-counts`
+  apa_mat[usable, cc] <- 0
+}
+# A CELL WHOSE GENE TOTAL IS TOO SMALL IS NOT USABLE, whatever LAPA wrote.
+for (cc in seq_along(apa_samples)) {
+  s <- apa_samples[cc]
+  totals <- apa_gene_total[[s]]
+  genes <- apa_gene
+  known <- !is.na(genes) & genes %in% names(totals)
+  tot <- rep(NA_real_, length(genes))
+  tot[known] <- totals[genes[known]]
+  too_small <- apa_present[, cc] & (is.na(tot) | tot < opt$`min-counts`)
+  apa_mat[too_small, cc] <- NA_real_
+}
+
+# THE TEST. limma on the (site x sample) USAGE matrix, with the same design
 # the length track uses: the reference level is the control, so the effect is
-# case minus control.
+# case minus control. The scale is the proportion itself, so the fitted
+# effect IS the difference of the two groups' mean usages -- the quantity the
+# table reports as delta_pau.
 apa_design_mat <- dpl_design_matrix[match(apa_samples, design$sample_id), , drop = FALSE]
 rownames(apa_design_mat) <- apa_samples
 if (any(is.na(apa_design_mat[, "case"]))) {
@@ -1006,37 +1421,172 @@ if (nrow(apa_design_mat) - ncol(apa_design_mat) < 1) {
        nrow(apa_design_mat), " samples and ", ncol(apa_design_mat),
        " design columns leave none.")
 }
-apa_fit <- limma::lmFit(apa_mat, apa_design_mat)
-apa_fit <- limma::eBayes(apa_fit)
-# The adjusted p-values are limma's own (BH, over all the sites).
-apa_tab <- limma::topTable(apa_fit, coef = "case", number = Inf,
-                           adjust.method = "BH")
-apa_padj <- apa_tab$adj.P.Val[match(apa_site_ids, rownames(apa_tab))]
-
+# A SITE WITH TOO FEW USABLE CELLS IN ONE GROUP HAS NO WITHIN-GROUP VARIANCE,
+# so it is not testable. Those rows are reported with the reason, and they
+# are kept out of the adjustment's denominator: the adjusted p-value has to
+# be the adjusted p-value of the population that was tested.
 apa_case_samples    <- apa_samples[as.character(design$condition[
   match(apa_samples, design$sample_id)]) == case_condition]
 apa_control_samples <- apa_samples[as.character(design$condition[
   match(apa_samples, design$sample_id)]) == control_condition]
+apa_n_case    <- rowSums(!is.na(apa_mat[, apa_case_samples, drop = FALSE]))
+apa_n_control <- rowSums(!is.na(apa_mat[, apa_control_samples, drop = FALSE]))
+apa_too_few <- apa_n_case < opt$`min-samples` | apa_n_control < opt$`min-samples`
+apa_y <- apa_mat
+apa_y[apa_too_few, ] <- NA_real_
+# THE FIT, UNLESS THERE IS NOTHING TO FIT. dpl_fit_both is the engine's one
+# limma fit: it fits the rows that carry an observation (a site with no usable
+# cell at all gives limma's empirical Bayes trend a NaN average and aborts the
+# WHOLE fit) and returns the raw and the moderated statistics of that one fit.
+# This table reports the moderated arm, so se, t_stat, pvalue and padj are one
+# coherent set.
+#
+# On a real cohort MOST sites have no usable cell at all -- the gene's poly(A)
+# reads are below the minimum count in every sample -- so a cohort where EVERY
+# site fails is a real possibility (a lower-coverage cohort, or a higher
+# --min-counts). dpl_fit_both stops with "no row of the response matrix
+# carries an observation" in that case, and a stop there takes down the WHOLE
+# run: the four other tables, which are fine, would never be written. So the
+# poly(A) track writes its table with every row carrying its reason instead.
+apa_fit_made <- sum(!apa_too_few) > 0
+if (apa_fit_made) {
+  apa_both <- dpl_fit_both(apa_y, apa_design_mat, NULL)
+} else {
+  n_sites <- length(apa_site_ids)
+  apa_both <- list(
+    raw = list(t = rep(NA_real_, n_sites),
+               se = rep(NA_real_, n_sites),
+               sigma2_raw = rep(NA_real_, n_sites)),
+    moderated = list(estimate = rep(NA_real_, n_sites),
+                     se = rep(NA_real_, n_sites),
+                     t = rep(NA_real_, n_sites),
+                     p = rep(NA_real_, n_sites)),
+    observed = rep(FALSE, n_sites),
+    trend_used = FALSE,
+    ebayes_note = paste0("no poly(A) site had enough usable cells in BOTH ",
+                         "groups (at least ", opt$`min-samples`, " in each), so ",
+                         "no model was fitted and no p-value exists; ")
+  )
+  cat("  WARN: no poly(A) site is testable at --min-samples ",
+      opt$`min-samples`, "; apa.tsv is written with every row carrying its ",
+      "reason, and the other tables are unaffected.\n")
+}
+apa_fit <- apa_both$moderated
+apa_ebayes_note <- if (nzchar(apa_both$ebayes_note)) paste0(apa_both$ebayes_note, "; ") else ""
+# A SITE WHOSE RESIDUAL VARIANCE HAS COLLAPSED IS NOT A RESULT. The same
+# guard the length track applies, and for the same reason: limma computes the
+# residual variance from the QR decomposition, so a mathematically zero
+# residual variance comes out at ~1e-15 rather than at 0, and the statistic
+# that comes out of it is a ratio of two floating-point noise values rather
+# than a measurement. A site whose usage is exactly 1 in every usable sample
+# -- the site of a gene whose only replicated poly(A) cluster is that one --
+# has exactly this shape: zero residual variance, an estimate of zero, and a
+# t statistic of -0.44 that says nothing. The floor is 1e-8 on the VARIANCE,
+# which is 1e-4 on the standard deviation of a proportion.
+#
+# ONLY THE ROWS THAT WERE FITTED CAN BE DEGENERATE. A row that was left out of
+# the fit (too few usable cells in one group) has no t statistic at all, and
+# calling that a collapsed variance would report the wrong reason.
+apa_degenerate <- apa_both$observed &
+  (!is.finite(apa_both$raw$t) | !is.finite(apa_both$raw$se) |
+     (apa_both$raw$sigma2_raw < 1e-8))
+apa_fit$t[apa_degenerate] <- NA_real_
+apa_fit$p[apa_degenerate] <- NA_real_
+# The adjusted p-values are BH over the p-values the fit produced. The
+# adjustment's denominator is the number of p-values it is given, and an NA
+# is left out of it, so the q-value is the q-value of the TESTED population.
+apa_p_raw <- apa_fit$p
+apa_q_raw <- stats::p.adjust(apa_p_raw, method = "BH")
+# THE GROUP MEANS ARE TAKEN OVER THE SAME CELLS THE FIT USED, so that
+# delta_pau is exactly pau_case - pau_control WHEN THE DESIGN CARRIES NO
+# BATCH TERM: the coefficient of a two-group design is the difference of the
+# two group means. With a batch term the coefficient is the batch-ADJUSTED
+# difference, and the receipt says so.
+pau_case    <- rowMeans(apa_y[, apa_case_samples, drop = FALSE], na.rm = TRUE)
+pau_control <- rowMeans(apa_y[, apa_control_samples, drop = FALSE], na.rm = TRUE)
+pau_case[!is.finite(pau_case)] <- NA_real_
+pau_control[!is.finite(pau_control)] <- NA_real_
 
+# THE MODEL NAME FOLLOWS THE FIT. `dpl_ebayes()` falls back to
+# `eBayes(robust = TRUE)` when the variance trend cannot be fitted, and a
+# hard-coded "limma_trend_robust" would then say that a trend was fitted when
+# it was not. The same rule the length track follows for its batch: the name
+# is the one the fit earns.
+apa_model_name <- if (!apa_fit_made) {
+  "not_testable"
+} else if (apa_both$trend_used) {
+  "limma_trend_robust"
+} else {
+  "limma_eb_robust"
+}
+apa_fit_clause <- if (!apa_fit_made) {
+  "NO MODEL WAS FITTED for this run (no site had enough usable cells in both "
+} else if (apa_both$trend_used) {
+  "limma::lmFit + eBayes(trend = TRUE, robust = TRUE) on the (site x sample) "
+} else {
+  "limma::lmFit + eBayes(robust = TRUE) -- NO variance trend -- on the (site x sample) "
+}
+apa_trend_clause <- if (!apa_fit_made) {
+  "groups), so every row carries its reason and no statistic exists; "
+} else if (apa_both$trend_used) {
+  "limma applies no log transform, so the trend covariate is the site's mean usage; "
+} else {
+  "no variance trend was fitted for this run (the note above says why), so there is no trend covariate; "
+}
+# WHAT delta_pau IS. With a two-group design the coefficient of the `case`
+# column IS the difference of the two group means. With a batch term in the
+# design it is the batch-ADJUSTED difference, and the two raw means are not
+# it -- so the receipt has to say which of the two the column holds.
+apa_delta_clause <- if (dpl_spec$batch_used) {
+  "the design carries a batch term, so delta_pau is the BATCH-ADJUSTED difference and is NOT equal to pau_case - pau_control (those two are the raw group means); "
+} else {
+  "with no batch term in the design, delta_pau is exactly pau_case - pau_control; "
+}
 apa_out <- data.frame(
   gene_id           = apa_gene,
   site_id           = apa_site_ids,
+  coord_bp          = apa_coord,
   case_condition    = rep(case_condition, length(apa_site_ids)),
   control_condition = rep(control_condition, length(apa_site_ids)),
-  usage_case        = rowMeans(apa_mat[, apa_case_samples, drop = FALSE], na.rm = TRUE),
-  usage_control     = rowMeans(apa_mat[, apa_control_samples, drop = FALSE], na.rm = TRUE),
-  delta_usage       = apa_fit$coefficients[, "case"],
-  pvalue            = apa_fit$p.value[, "case"],
-  padj              = apa_padj,
+  pau_case          = pau_case,
+  pau_control       = pau_control,
+  delta_pau         = apa_fit$estimate,
+  se                = apa_fit$se,
+  t_stat            = apa_fit$t,
+  pvalue            = apa_p_raw,
+  padj              = apa_q_raw,
   n_case            = rep(length(apa_case_samples), length(apa_site_ids)),
   n_control         = rep(length(apa_control_samples), length(apa_site_ids)),
-  model_name        = "limma_eb",
+  independent_filter_threshold = NA_real_,
+  n_independent_filtered = 0L,
+  model_name        = apa_model_name,
   stringsAsFactors = FALSE
 )
+apa_no_usable <- apa_n_case == 0 & apa_n_control == 0
+apa_out$padj_na_reason <- ifelse(
+  apa_no_usable, "no usable cell (the gene's poly(A) reads are below the minimum count in every sample)",
+  ifelse(apa_too_few, "too few usable samples in one group",
+         ifelse(apa_degenerate, "degenerate_zero_variance", "none")))
 apa_out$model_parameters <- paste0(
-  "limma::lmFit + eBayes on the (site x sample) count matrix; the counts are ",
-  "LAPA's own per-sample counts, taken from the replicated-cluster files ",
-  "(sample/), i.e. only the sites LAPA kept after its replication filter; ",
+  apa_fit_clause,
+  "USAGE matrix: LAPA's own 'usage' column, i.e. the site's share of its ",
+  "gene's poly(A) reads in that sample (usage == count / gene_count), taken ",
+  "from the replicated-cluster files (sample/), i.e. only the sites LAPA kept ",
+  "after its replication filter; a cell is usable only when the gene's total ",
+  "in that sample is at least the minimum count (", opt$`min-counts`, "), and ",
+  "a site is tested only when at least ", opt$`min-samples`, " cells are ",
+  "usable in EACH group; a site whose residual variance has collapsed (below ",
+  "1e-8) carries no statistic and is reported with padj_na_reason = ",
+  "'degenerate_zero_variance', out of the adjustment's denominator as well; ",
+  apa_ebayes_note,
+  "THE SCALE IS THE PROPORTION ITSELF, so delta_pau is ",
+  "a difference of the two groups' mean usages on the [0,1] scale, not a log ",
+  "ratio, and pau_case and pau_control are those two means over the same ",
+  "usable cells; ", apa_delta_clause,
+  apa_trend_clause,
+  "se, t_stat, pvalue and padj are the ",
+  "moderated arm of that one fit; independent filtering: not applied (the ",
+  "threshold is NA and nothing was filtered); ",
   contrast_note, "; ", dpl_batch_note)
 
 write.table(apa_out,

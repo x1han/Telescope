@@ -156,6 +156,106 @@ dpl_design <- function(samples, condition, case_condition, control_condition,
 }
 
 # ---------------------------------------------------------------------------
+# Rows that carry no observation
+# ---------------------------------------------------------------------------
+#
+# A row with no observation at all has no mean, and limma's empirical Bayes
+# with trend = TRUE uses the mean as its trend covariate: limma's lmFit sets
+# Amean <- rowMeans(y, na.rm = TRUE), so an empty row's Amean is NaN. eBayes
+# then refuses the WHOLE fit -- "covariate contains NA or infinite values"
+# with robust = TRUE, "NA covariate values not allowed" without it. One empty
+# transcript would take down the transcriptome, and the shipped real-cohort
+# tables have thousands of them: a transcript whose every cell failed the
+# quality gate. So the empty rows are left out of the fit and put back
+# afterwards, as NA.
+dpl_observed_rows <- function(y, weights = NULL) {
+  obs <- rowSums(!is.na(y)) > 0
+  if (!is.null(weights)) {
+    w <- weights
+    w[is.na(w)] <- 0
+    obs <- obs & (rowSums(w > 0) > 0)
+  }
+  obs
+}
+
+#' Put a per-row quantity back onto the full set of rows.
+#'
+#' limma's df.residual is PER ROW, not one number for the fit: a row whose
+#' cells are partly missing has fewer observations and therefore fewer
+#' residual degrees of freedom. So it is expanded like every other per-row
+#' quantity.
+#'
+#' @param v the value for the rows that were fitted.
+#' @param keep the indices of the rows that were fitted.
+#' @param n the number of rows of the response matrix.
+#' @return a numeric vector of length n, NA for the rows that were not fitted.
+dpl_expand <- function(v, keep, n) {
+  out <- rep(NA_real_, n)
+  v <- as.numeric(v)
+  if (length(v) == 1L) v <- rep(v, length(keep))
+  out[keep] <- v
+  out
+}
+
+#' Summarise a per-row prior instead of listing it.
+#'
+#' With trend = TRUE limma fits the prior variance against the average
+#' expression, so s2.prior and df.prior hold ONE VALUE PER TRANSCRIPT rather
+#' than one value for the fit. Printing them one by one would put thousands
+#' of numbers in a log line and a paragraph in every cell of a table.
+#'
+#' @param v a numeric vector.
+#' @return a one-line summary.
+dpl_prior_summary <- function(v) {
+  v <- as.numeric(v)
+  finite <- v[is.finite(v)]
+  if (length(finite) == 0) {
+    if (length(v) > 0 && all(is.infinite(v))) {
+      # limma estimates NO prior degrees of freedom when the prior variance
+      # is fitted against a trend: the trend carries the whole prior.
+      return("infinite (limma estimates no prior df when the trend is fitted)")
+    }
+    return("not estimable")
+  }
+  sprintf("median %.6g, range %.6g..%.6g", stats::median(finite),
+          min(finite), max(finite))
+}
+
+#' limma's empirical Bayes, with the variance trend when the trend can be
+#' fitted.
+#'
+#' `trend = TRUE` fits the prior variance against the average expression of
+#' the features, using a natural spline. The spline needs the covariate to
+#' have several distinct values, and when it does not -- a handful of
+#' features with the same average, which is what a small cohort's poly(A)
+#' table looks like -- limma stops with "Problem with covariate". The fit
+#' then goes on WITHOUT the trend, and the note says so: a run that silently
+#' used a different fit would be a run whose receipt is wrong.
+#'
+#' @param fit a limma fit.
+#' @return list(fit = the moderated fit, trend = whether the trend was used,
+#'   note = the note to put in the receipt, "" when nothing happened).
+dpl_ebayes <- function(fit) {
+  ok <- tryCatch(
+    list(fit = limma::eBayes(fit, trend = TRUE, robust = TRUE),
+         trend = TRUE, note = ""),
+    error = function(e) {
+      fallback <- tryCatch(limma::eBayes(fit, robust = TRUE),
+                           error = function(e2) stop(e2))
+      list(
+        fit = fallback,
+        trend = FALSE,
+        note = paste0(
+          "the variance trend could not be fitted (limma: ",
+          conditionMessage(e),
+          "), so the empirical Bayes moderation was fitted WITHOUT the trend ",
+          "(robust = TRUE only)")
+      )
+    })
+  ok
+}
+
+# ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
 
@@ -179,25 +279,48 @@ DPL_MODEL_NAMES <- c(
 #' @param ebayes apply limma's empirical Bayes moderation.
 #' @return a list with coefficient, se, df, t, p and (for ebayes) the prior.
 dpl_fit_model <- function(y, design, weights = NULL, ebayes = FALSE) {
-  fit <- limma::lmFit(y, design, weights = weights)
+  n <- nrow(y)
+  observed <- dpl_observed_rows(y, weights)
+  keep <- which(observed)
+  if (length(keep) == 0) {
+    stop("ERROR: no row of the response matrix carries an observation.")
+  }
+  # THE WEIGHTS ARE SUBSETTED WITH THE RESPONSE. lmFit checks that the weight
+  # matrix has one row per row of the response it is given, so handing it the
+  # FULL weights with a SUBSET response is a dimension mismatch that aborts
+  # with "x is not a matrix of the right dimensions". It is latent today
+  # because every row that reaches this function carries an observation, and
+  # it would fire the first time a row does not.
+  w <- weights
+  if (!is.null(w)) w <- w[keep, , drop = FALSE]
+  fit <- limma::lmFit(y[keep, , drop = FALSE], design, weights = w)
+  eb_note <- ""
+  eb_trend <- FALSE
   if (ebayes) {
-    fit <- limma::eBayes(fit)
+    # trend = TRUE fits the prior variance as a function of the average
+    # expression, and robust = TRUE shrinks the influence of the transcripts
+    # whose variance is extreme (Phipson et al. 2016). Without them a handful
+    # of outliers sets the prior for every transcript.
+    eb <- dpl_ebayes(fit)
+    fit <- eb$fit
+    eb_note <- eb$note
+    eb_trend <- eb$trend
     # s2.post is the posterior VARIANCE, so the moderated standard error is
     # stdev.unscaled * sqrt(s2.post). That is exactly the divisor limma's
     # own moderated t uses.
     se <- fit$stdev.unscaled[, "case"] * sqrt(fit$s2.post)
     df_raw <- fit$df.residual
     out <- list(
-      estimate   = fit$coefficients[, "case"],
-      se         = se,
-      df_raw     = df_raw,
-      t          = fit$t[, "case"],
-      p          = fit$p.value[, "case"],
-      df_post    = fit$df.total,
-      sigma2_raw = fit$sigma^2,
-      sigma2_post = fit$s2.post,
-      df_prior   = fit$df.prior,
-      s2_prior   = fit$s2.prior
+      estimate   = dpl_expand(fit$coefficients[, "case"], keep, n),
+      se         = dpl_expand(se, keep, n),
+      df_raw     = dpl_expand(df_raw, keep, n),
+      t          = dpl_expand(fit$t[, "case"], keep, n),
+      p          = dpl_expand(fit$p.value[, "case"], keep, n),
+      df_post    = dpl_expand(fit$df.total, keep, n),
+      sigma2_raw = dpl_expand(fit$sigma^2, keep, n),
+      sigma2_post = dpl_expand(fit$s2.post, keep, n),
+      df_prior   = dpl_expand(fit$df.prior, keep, n),
+      s2_prior   = dpl_expand(fit$s2.prior, keep, n)
     )
   } else {
     # fit$sigma is the residual STANDARD DEVIATION, so the standard error is
@@ -205,20 +328,90 @@ dpl_fit_model <- function(y, design, weights = NULL, ebayes = FALSE) {
     # standard deviation as a variance and inflates the standard error.
     # With equal weights this reproduces the ordinary two-sample t exactly.
     se <- fit$stdev.unscaled[, "case"] * fit$sigma
+    out_t <- fit$coefficients[, "case"] / se
     out <- list(
-      estimate   = fit$coefficients[, "case"],
-      se         = se,
-      df_raw     = fit$df.residual,
-      t          = out_t <- fit$coefficients[, "case"] / se,
-      p          = 2 * stats::pt(-abs(out_t), df = fit$df.residual),
-      df_post    = fit$df.residual + 0,
-      sigma2_raw = fit$sigma^2,
-      sigma2_post = NA_real_,
-      df_prior   = NA_real_,
-      s2_prior   = NA_real_
+      estimate   = dpl_expand(fit$coefficients[, "case"], keep, n),
+      se         = dpl_expand(se, keep, n),
+      df_raw     = dpl_expand(fit$df.residual, keep, n),
+      t          = dpl_expand(out_t, keep, n),
+      p          = dpl_expand(2 * stats::pt(-abs(out_t), df = fit$df.residual), keep, n),
+      df_post    = dpl_expand(fit$df.residual, keep, n),
+      sigma2_raw = dpl_expand(fit$sigma^2, keep, n),
+      sigma2_post = rep(NA_real_, n),
+      df_prior   = rep(NA_real_, n),
+      s2_prior   = rep(NA_real_, n)
     )
   }
+  out$observed <- observed
+  out$trend_used <- eb_trend
+  out$ebayes_note <- eb_note
   out
+}
+
+#' Fit one model and take BOTH the raw and the moderated statistics from it.
+#'
+#' `eBayes` leaves the coefficients, the unscaled standard deviations, the
+#' residual standard deviation and the residual degrees of freedom untouched:
+#' it adds the posterior variance and the moderated t and p on top. So one
+#' `lmFit` serves both arms, and the whole-transcriptome fit is not paid for
+#' twice.
+#'
+#' @param y matrix, transcripts x samples, NA where the cell is missing.
+#' @param design design matrix with an intercept and a `case` column.
+#' @param weights matrix of the same shape, 0 where there is no observation.
+#' @return a list with a `raw` and a `moderated` element, each as
+#'   `dpl_fit_model` returns them.
+dpl_fit_both <- function(y, design, weights = NULL) {
+  n <- nrow(y)
+  observed <- dpl_observed_rows(y, weights)
+  keep <- which(observed)
+  if (length(keep) == 0) {
+    stop("ERROR: no row of the response matrix carries an observation.")
+  }
+  # The weights are subsetted with the response: lmFit requires one weight row
+  # per row of the response it is given.
+  w <- weights
+  if (!is.null(w)) w <- w[keep, , drop = FALSE]
+  fit <- limma::lmFit(y[keep, , drop = FALSE], design, weights = w)
+  ebx <- dpl_ebayes(fit)
+  eb <- ebx$fit
+  # fit$sigma is the residual STANDARD DEVIATION, so the standard error is
+  # stdev.unscaled * sigma; sqrt(sigma) would treat a standard deviation as
+  # a variance and inflate the standard error.
+  se_raw <- eb$stdev.unscaled[, "case"] * eb$sigma
+  t_raw <- eb$coefficients[, "case"] / se_raw
+  # s2.post is the posterior VARIANCE, so the moderated standard error is
+  # stdev.unscaled * sqrt(s2.post).
+  se_mod <- eb$stdev.unscaled[, "case"] * sqrt(eb$s2.post)
+  list(
+    raw = list(
+      estimate   = dpl_expand(eb$coefficients[, "case"], keep, n),
+      se         = dpl_expand(se_raw, keep, n),
+      df_raw     = dpl_expand(eb$df.residual, keep, n),
+      t          = dpl_expand(t_raw, keep, n),
+      p          = dpl_expand(2 * stats::pt(-abs(t_raw), df = eb$df.residual), keep, n),
+      df_post    = dpl_expand(eb$df.residual, keep, n),
+      sigma2_raw = dpl_expand(eb$sigma^2, keep, n),
+      sigma2_post = rep(NA_real_, n),
+      df_prior   = rep(NA_real_, n),
+      s2_prior   = rep(NA_real_, n)
+    ),
+    moderated = list(
+      estimate   = dpl_expand(eb$coefficients[, "case"], keep, n),
+      se         = dpl_expand(se_mod, keep, n),
+      df_raw     = dpl_expand(eb$df.residual, keep, n),
+      t          = dpl_expand(eb$t[, "case"], keep, n),
+      p          = dpl_expand(eb$p.value[, "case"], keep, n),
+      df_post    = dpl_expand(eb$df.total, keep, n),
+      sigma2_raw = dpl_expand(eb$sigma^2, keep, n),
+      sigma2_post = dpl_expand(eb$s2.post, keep, n),
+      df_prior   = dpl_expand(eb$df.prior, keep, n),
+      s2_prior   = dpl_expand(eb$s2.prior, keep, n)
+    ),
+    observed = observed,
+    trend_used = ebx$trend,
+    ebayes_note = ebx$note
+  )
 }
 
 #' Build the wide response and weight matrices for a set of transcripts.
