@@ -1542,6 +1542,17 @@ apa_delta_clause <- if (dpl_spec$batch_used) {
 } else {
   "with no batch term in the design, delta_pau is exactly pau_case - pau_control; "
 }
+# THE CONTRACT, COLUMN BY COLUMN, IN ORDER. The poly(A) table's columns are a
+# published list, not a set: a reader (or a downstream script) that looks up
+# "the column after n_independent_filtered" must get the same answer every
+# time. `padj_na_reason` and `model_name` were built in the other order, so
+# the table came out with the two of them swapped against the contract.
+APA_COLUMNS <- c(
+  "gene_id", "site_id", "coord_bp", "case_condition", "control_condition",
+  "pau_case", "pau_control", "delta_pau", "se", "t_stat", "pvalue", "padj",
+  "n_case", "n_control", "independent_filter_threshold",
+  "n_independent_filtered", "padj_na_reason", "model_name", "model_parameters"
+)
 apa_out <- data.frame(
   gene_id           = apa_gene,
   site_id           = apa_site_ids,
@@ -1589,7 +1600,7 @@ apa_out$model_parameters <- paste0(
   "threshold is NA and nothing was filtered); ",
   contrast_note, "; ", dpl_batch_note)
 
-write.table(apa_out,
+write.table(apa_out[, APA_COLUMNS],
             file = file.path(opt$`output-dir`, "apa.tsv"),
             sep = "\t", quote = FALSE, row.names = FALSE)
 cat("[telescope_diff]  wrote apa.tsv (", nrow(apa_out), "sites,",
