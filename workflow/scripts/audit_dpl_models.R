@@ -15,10 +15,20 @@
 #                               means
 #   equal_weight_eb             the same fit with limma's empirical Bayes
 #                               variance moderation
-#   weight_sum_lm               what the shipped engine does today: weight
-#                               each sample by its posterior mass, i.e. by a
-#                               READ COUNT. Kept as the reference to change
-#                               from, and reported next to the candidates.
+#   weight_sum_lm               weight each sample by its posterior mass, i.e.
+#                               by a READ COUNT. NOT what the shipped engine
+#                               does: the shipped path collapses each cell to
+#                               its posterior-mass-weighted mean_log2_pal and
+#                               then fits UNWEIGHTED -- telescope_diff.R:1056
+#                               calls dpl_fit_both(y_mat, design, NULL), which
+#                               is equal_raw_t. Measured against the shipped
+#                               p_raw: equal_raw_t agrees to 2.11e-12 and
+#                               weight_sum_lm differs by up to 2.69 (relative),
+#                               so they are different estimators. Reproduce with
+#                               /datf/hanxi/software/Telescope/workspace/
+#                               validation/dpl_model_review_round206_5/scripts/
+#                               which_model_is_shipped.py. The shipped model is
+#                               the REF_MODEL / DISC_MODEL below.
 #   precision_weighted_lm       weight each sample by 1/measurement_variance
 #   empirical_bayes_weighted_lm the same fit with limma's empirical Bayes
 #                               variance moderation
@@ -614,9 +624,14 @@ if (length(perm_res) > 0) {
         "discoveries median", stats::median(disc_other$n_discoveries),
         "range", min(disc_other$n_discoveries), "..", max(disc_other$n_discoveries),
         "| median W of the top-", K_obs, "median",
-        stats::median(disc_other$median_W_top_K, na.rm = TRUE),
+        if (K_obs > 0) stats::median(disc_other$median_W_top_K, na.rm = TRUE) else NA_real_,
         "against the observed labelling's",
         disc_tab$median_W_top_K[disc_tab$is_observed], "\n")
+    if (K_obs == 0) {
+      cat("[audit]     the observed labelling makes no discovery at q <=",
+          opt$alpha, ", so it has no discovery set and the median W of the",
+          " top-K set is undefined for every labelling\n")
+    }
   }
 }
 
