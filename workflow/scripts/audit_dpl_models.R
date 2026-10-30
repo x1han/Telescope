@@ -24,11 +24,14 @@
 #                               is equal_raw_t. Measured against the shipped
 #                               p_raw: equal_raw_t agrees to 2.11e-12 and
 #                               weight_sum_lm differs by up to 2.69 (relative),
-#                               so they are different estimators. Reproduce with
-#                               /datf/hanxi/software/Telescope/workspace/
+#                               so they are different estimators. The
+#                               measurement that settles this lives in the
+#                               project workspace layer, under
 #                               validation/dpl_model_review_round206_5/scripts/
-#                               which_model_is_shipped.py. The shipped model is
-#                               the REF_MODEL / DISC_MODEL below.
+#                               (which_model_is_shipped.py); that harness is
+#                               internal material and is not part of this
+#                               public tree. The shipped model is the
+#                               REF_MODEL / DISC_MODEL below.
 #   precision_weighted_lm       weight each sample by 1/measurement_variance
 #   empirical_bayes_weighted_lm the same fit with limma's empirical Bayes
 #                               variance moderation
