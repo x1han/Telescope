@@ -8,9 +8,12 @@
 #
 #   - It is kept here, beside the code that drives it, so that the two cannot
 #     drift apart silently.
-#   - `workflow/test_data/` holds the synthetic profiles, the design matrix,
-#     and the expected output. That fixture is the acceptance test for the
-#     engine and, through it, for the CLI.
+#   - The synthetic profiles, the design matrix and the expected output live
+#     in the project workspace layer, at
+#     `../workspace/validation/differential_acceptance/`. That fixture is a
+#     validation harness rather than release content, so it is not part of
+#     this repository; it is the acceptance test for the engine and, through
+#     it, for the CLI.
 #   - The R dependencies (DEXSeq, DESeq2, limma) are Bioconductor packages;
 #     the Rust side deliberately shares no code path with them, which is what
 #     makes the comparison meaningful.
@@ -77,7 +80,7 @@
 #     --design   design.tsv \
 #     --case-condition COPD --control-condition HC \
 #     --output-dir results/ \
-#     --min-weight 10 \
+#     --min-weight 5 \
 #     --min-counts 20 \
 #     --det --dpl
 #
@@ -117,7 +120,7 @@ option_list <- list(
               help = "Design TSV (sample_id, condition)"),
   make_option("--output-dir", type = "character", default = ".",
               help = "Output directory [default %default]"),
-  make_option("--min-weight", type = "double", default = 10,
+  make_option("--min-weight", type = "double", default = 5,
               help = "Min sum(posterior_weight) per (transcript x sample) [default %default]"),
   make_option("--min-counts", type = "double", default = 20,
               help = "Min total counts per transcript for the usage track (DEXSeq dispersion stability; default = 20) [default %default]"),
@@ -989,13 +992,14 @@ cat("  aggregating to (transcript × sample) BEFORE fitting to avoid pseudorepli
 #   swy2 = sum(w * y^2)
 #   sw2  = sum(w^2)
 # the mean is swy/W, the Kish effective sample size is W^2/sw2, the
-# within-cell variance is (swy2 - swy^2/W) / (Kish_Neff - 1) and the variance
-# of the cell mean is that variance divided by Kish_Neff.
+# reliability-weighted within-cell variance is (swy2 - swy^2/W) / (W - sw2/W)
+# and the variance of the cell mean is that variance divided by Kish_Neff.
 #
-# The Kish denominator is Kish_Neff - 1 and not W - 1 on purpose: with the
-# soft posterior a cell holds one row per (read, candidate transcript) pair,
-# so the row count is not the sample size but Kish_Neff is. For equal
-# weights the two conventions coincide.
+# The denominator is W - sw2/W and not Kish_Neff - 1: for i.i.d. observations
+# with FIXED weights the unbiased weighted variance divides by
+# W - sum(w^2)/W, which equals Kish_Neff - 1 only when the weights are all
+# equal. See dpl_models.R for the derivation and for what that does and does
+# not claim about the EM's own posterior weights.
 
 need_unit_cols <- c("sample_id", "gene_id", "transcript_id", "weight_sum",
                     "weighted_log2pal_sum", "weight_sq_sum",
@@ -1115,6 +1119,56 @@ q_mod <- stats::p.adjust(p_mod, method = "BH")
 cat("  testable transcripts:", sum(!masked), "(both groups with >=",
     min_samples, "admissible cells; the audit's population)\n")
 
+# THE EFFECT ON THE PHYSICAL SCALE. The statistic above is a difference of
+# means of log2(polyA_length), so it is the LOG2 of a ratio: reporting it
+# alone leaves the reader to guess how many nucleotides that is, and 2^d is a
+# ratio, not a length. The columns added here are the geometric means of the
+# two groups in nt, their ratio, their difference, and intervals for all of
+# them.
+#
+# THEY COME FROM THE SAME ADMISSIBLE CELLS AS THE FIT, and the interval on
+# the nt scale is the delta method applied to the SAME raw difference of the
+# two group means -- so the baseline's own estimation error is propagated
+# instead of the interval endpoints being multiplied by a fixed constant.
+#
+# WHEN THE DESIGN CARRIES A BATCH TERM the fitted coefficient is the
+# BATCH-ADJUSTED difference, while these columns are the raw difference of
+# the two group means. The two are then different quantities, and the receipt
+# says which one each column is.
+nt_eff <- dpl_effect_nt(y_mat, design$condition == case_condition,
+                        design$condition == control_condition)
+# THE RAW DIFFERENCE AND THE FITTED COEFFICIENT ARE THE SAME NUMBER when the
+# design has no batch term. That is an invariant, not an assumption, so it is
+# asserted: a drift between the two paths would otherwise show up only as a
+# silently different column. The check runs BEFORE the masking, so it covers
+# every row the fit produced.
+if (!dpl_spec$batch_used) {
+  .chk <- is.finite(nt_eff$delta_log2_pal) & is.finite(fit_raw$estimate)
+  if (any(.chk)) {
+    .d <- abs(nt_eff$delta_log2_pal[.chk] - fit_raw$estimate[.chk])
+    .tol <- 1e-8 * pmax(1, abs(fit_raw$estimate[.chk]))
+    if (max(.d) > max(.tol)) {
+      stop("ERROR: the raw difference of the group means and the fitted ",
+           "coefficient disagree by ", format(max(.d), digits = 6),
+           " -- the effect columns and the test are not the same number.")
+    }
+  }
+}
+# THE MASKING RULE FOR THESE COLUMNS IS `fit_failed`, NOT `masked`. A
+# transcript with too few admissible cells in one group keeps its effect
+# estimate in the contract column -- the difference of the group means is
+# computed, it is the TEST that is not supported -- so the columns that
+# describe the same difference keep it too, and the `padj_na_reason` column
+# says why the test is not supported. A row whose FIT failed gets NA in all
+# of them: a degenerate zero variance is not a result.
+for (.cn in c("geometric_mean_ratio", "geometric_mean_control_nt",
+              "geometric_mean_case_nt", "delta_geometric_mean_nt",
+              "ci_lo_log2_pal", "ci_hi_log2_pal", "ci_lo_ratio", "ci_hi_ratio",
+              "ci_lo_delta_geometric_mean_nt",
+              "ci_hi_delta_geometric_mean_nt")) {
+  nt_eff[[.cn]][fit_failed] <- NA_real_
+}
+
 # WHY A ROW HAS NO ADJUSTED P-VALUE. The length track has no independent
 # filter: it drops no row for having a low mean, so the threshold is NA and
 # the count of filtered rows is 0. A row without a statistic says why.
@@ -1152,12 +1206,46 @@ dpl_audit_clause <- paste0(
   "is a SEPARATE run, not recomputed here; its verdict is in that script's own ",
   "dpl_audit_summary.tsv, one row per candidate model; "
 )
+# THE CONFOUNDING FLAG. dpl_design() decides it: TRUE when the design carries
+# a batch that cannot be separated from the condition at all. The sentence is
+# fixed, because a reader has to be able to search for it.
+dpl_confounded <- isTRUE(dpl_spec$confounded)
+dpl_confound_clause <- if (dpl_confounded) {
+  paste0("CONFOUNDED DESIGN: batch and condition are completely confounded; ",
+         "treatment-specific effects are not identifiable; the contrast in ",
+         "this table is a batch-and-condition difference; ")
+} else {
+  ""
+}
+# THE PHYSICAL-SCALE COLUMNS, NAMED. The receipt says which quantity each
+# column is, because with a batch term the fitted coefficient and the raw
+# difference of the group means are different numbers.
+dpl_effect_clause <- if (dpl_spec$batch_used) {
+  paste0("effect columns: the fitted coefficient is the BATCH-ADJUSTED ",
+         "difference of the group means, while geometric_mean_*_nt and ",
+         "delta_geometric_mean_nt are the RAW difference of the two group ",
+         "means; the geometric means are the group means of log2 tail length ",
+         "exponentiated, and delta_geometric_mean_nt is their DIFFERENCE, not ",
+         "a ratio and not an arithmetic mean difference; the intervals are ",
+         "t intervals on the raw difference and the delta method applied to ",
+         "the same difference; ")
+} else {
+  paste0("effect columns: geometric_mean_*_nt are the group means of log2 ",
+         "tail length exponentiated, and delta_geometric_mean_nt is their ",
+         "DIFFERENCE, not a ratio and not an arithmetic mean difference; the ",
+         "intervals are t intervals on the difference of the group means and ",
+         "the delta method applied to the same difference; ")
+}
 pal_out <- data.frame(
   gene_id                    = unname(gene_of),
   transcript_id              = tx_ids_all,
   case_condition             = rep(case_condition, length(tx_ids_all)),
   control_condition          = rep(control_condition, length(tx_ids_all)),
   delta_pal_case_minus_control = fit_raw$estimate,
+  # THE SAME NUMBER UNDER A NAME THAT CARRIES ITS UNIT. The contract column
+  # above is the log2 difference of the group means; the column below says so
+  # in the name. They are assigned from one value, so they cannot drift.
+  delta_log2_pal             = fit_raw$estimate,
   se_raw                     = se_raw,
   df_raw                     = df_raw,
   t_raw                      = t_raw,
@@ -1171,6 +1259,21 @@ pal_out <- data.frame(
   t_moderated                = t_mod,
   p_moderated                = p_mod,
   q_moderated                = q_mod,
+  # THE PHYSICAL SCALE. `geometric_mean_*_nt` are the geometric mean tail
+  # lengths of the two groups in nucleotides -- the means of log2 lengths,
+  # exponentiated. `delta_geometric_mean_nt` is their DIFFERENCE, which is not
+  # the same number as the geometric mean ratio and not the same as the
+  # arithmetic mean difference of the raw lengths.
+  geometric_mean_ratio       = nt_eff$geometric_mean_ratio,
+  geometric_mean_control_nt  = nt_eff$geometric_mean_control_nt,
+  geometric_mean_case_nt     = nt_eff$geometric_mean_case_nt,
+  delta_geometric_mean_nt    = nt_eff$delta_geometric_mean_nt,
+  ci_lo_log2_pal             = nt_eff$ci_lo_log2_pal,
+  ci_hi_log2_pal             = nt_eff$ci_hi_log2_pal,
+  ci_lo_ratio                = nt_eff$ci_lo_ratio,
+  ci_hi_ratio                = nt_eff$ci_hi_ratio,
+  ci_lo_delta_geometric_mean_nt = nt_eff$ci_lo_delta_geometric_mean_nt,
+  ci_hi_delta_geometric_mean_nt = nt_eff$ci_hi_delta_geometric_mean_nt,
   n_case                     = rep(sum(design$condition == case_condition), length(tx_ids_all)),
   n_control                  = rep(sum(design$condition == control_condition), length(tx_ids_all)),
   n_admissible_case          = n_adm_case,
@@ -1178,6 +1281,11 @@ pal_out <- data.frame(
   independent_filter_threshold = NA_real_,
   n_independent_filtered     = 0L,
   padj_na_reason             = pal_na_reason,
+  # THE DESIGN IS CONFOUNDED. The batch note already says it in words; this
+  # column says it where a downstream script can read it without parsing
+  # prose. A TRUE here means the contrast in this table cannot be attributed
+  # to the treatment: the batch and the condition cannot be separated.
+  confounded_design          = dpl_confounded,
   # The name follows the design that was fitted. With a usable batch the
   # baseline is not a two-sample t any more -- the design carries a batch
   # term -- so calling it "equal_raw_t" would name a model that was not
@@ -1190,9 +1298,13 @@ pal_out <- data.frame(
     "expression, so s2.prior and df.prior are per transcript: s2.prior ",
     dpl_prior_summary(fit$s2_prior), ", df.prior ", dpl_prior_summary(fit$df_prior),
     "); ", dpl_ebayes_note, dpl_audit_clause,
+    "cell admission gate: min_weight = ", format(opt$`min-weight`),
+    ", min_neff = 2, min_samples = ", min_samples,
+    ", sigma2_floor = 1e-8; ",
+    dpl_effect_clause,
     "independent filtering: not applied (the length track drops no row, so the ",
     "independent filter threshold is NA and nothing was filtered); ",
-    contrast_note, "; ", dpl_batch_note),
+    contrast_note, "; ", dpl_batch_note, dpl_confound_clause),
   stringsAsFactors = FALSE
 )
 # A transcript whose FIT failed carries NA. A transcript that was fitted but

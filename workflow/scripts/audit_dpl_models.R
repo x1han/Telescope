@@ -59,6 +59,22 @@
 # false rejection, and the bootstrap is what makes the truth known. The two
 # arms answer different questions and neither substitutes for the other.
 #
+# THE PERMUTATION ARM HAS A POSITIVE CONTROL, AND THE CONTROL IS
+# REPLICATED. The permutation statistic is read against a simulated null
+# cohort that carries the REAL cohort's structure, and the control is run
+# on several independent null cohorts, so that the baseline the real
+# cohort's value is read against and the band it is read against are both
+# MEASURED rather than chosen. Neither of the two is ever taken from the
+# model under test: a band that contains the model's own measurement is a
+# band the model cannot leave, and a criterion that cannot fail is not a
+# criterion.
+#
+# THE DISCOVERY-COUNT INSTRUMENT. The script also enumerates, for every
+# labelling it enumerates anyway, how many discoveries that labelling
+# makes. It is a measurement and not a criterion, and it answers a
+# question the permutation statistic does not: are the hits just the deep
+# transcripts, or did the label find something?
+#
 # NOTHING HERE SELECTS A MODEL BY ITS HIT COUNT. The verdict is a
 # calibration verdict: does the procedure control the false discovery rate
 # at the nominal level, and does the estimate reproduce the injected effect.
@@ -111,7 +127,7 @@ option_list <- list(
               help = "Where the audit tables are written [default %default]"),
   make_option("--batch-column", type = "character", default = "batch",
               help = "Name of the batch column in the design [default %default]"),
-  make_option("--min-weight", type = "double", default = 10,
+  make_option("--min-weight", type = "double", default = 5,
               help = "Min posterior mass for a cell [default %default]"),
   make_option("--min-neff", type = "double", default = 2,
               help = "Min Kish effective sample size for a cell [default %default]"),
@@ -122,6 +138,12 @@ option_list <- list(
                            "shipped population.")),
   make_option("--max-permutations", type = "integer", default = 2000,
               help = "Cap on the enumerated label permutations [default %default]"),
+  make_option("--control-replicates", type = "integer", default = 5,
+              help = paste("Independent null cohorts for the permutation positive",
+                           "control. The control's measured value is the",
+                           "permutation statistic's baseline and its spread",
+                           "across these cohorts is the acceptance band",
+                           "[default %default]")),
   make_option("--bootstrap", type = "integer", default = 400,
               help = paste("Bootstrap replicates for the NULL arm. The verdict",
                            "resolves alpha, and resolving it needs this many",
@@ -211,6 +233,44 @@ Wsum <- matrix(0, nrow = length(transcripts), ncol = length(samples),
 uu <- units[units$transcript_id %in% transcripts & units$sample_id %in% samples, ]
 Wsum[cbind(match(uu$transcript_id, transcripts), match(uu$sample_id, samples))] <- uu$W
 Y <- mat_pv$y
+
+# --------------------------------------------------------------------------
+# The real cohort's structure
+# --------------------------------------------------------------------------
+# The quantities below are the real cohort's structure, and they are
+# computed ONCE and read by two arms: the permutation positive control
+# builds its null cohorts from them, and the NULL arm at the end of this
+# script builds its null cohorts from the same ones. A structure computed
+# twice is a structure that can be computed two ways.
+present <- !is.na(Y)
+# Every row is the same case/control mask over the samples.
+case_mask <- matrix(rep(case_ind, each = length(transcripts)),
+                     nrow = length(transcripts), ncol = length(samples))
+
+# The pooled within-group sum of squares of a transcript's cells.
+group_ss <- function(mask) {
+  m <- mask & present
+  n <- rowSums(m)
+  s1 <- rowSums(m * Y, na.rm = TRUE)
+  s2 <- rowSums(m * Y^2, na.rm = TRUE)
+  ss <- s2 - ifelse(n > 0, s1^2 / n, 0)
+  ss[!is.finite(ss)] <- 0
+  ss[ss < 0] <- 0
+  list(n = n, ss = ss)
+}
+g_case <- group_ss(case_mask)
+g_ctrl <- group_ss(!case_mask)
+# The transcript's own scale: the scatter of its cell means around the
+# two group means. This is the real cohort's BETWEEN-TRANSCRIPT
+# dispersion, and it is what a simulated null cohort has to carry.
+pooled_var <- (g_case$ss + g_ctrl$ss) /
+  pmax(1, g_case$n + g_ctrl$n - 2)
+grand_mean <- rowSums(Y, na.rm = TRUE) / pmax(1, rowSums(present))
+usable <- is.finite(pooled_var) & pooled_var > 0
+cat("[audit] transcripts with a pooled within-group variance:",
+    sum(usable), "of", length(transcripts), "\n")
+cat("[audit] the real cohort's observed cell-missing rate:",
+    mean(!present), "\n")
 
 # --------------------------------------------------------------------------
 # The fits
@@ -379,20 +439,27 @@ cat("[audit] permutations:", n_perm, "of", n_perm_total,
 # The statistic of the observed labelling is one of the permutations: the
 # identity. It is included, and the p-value uses the (1 + count) / (1 + N)
 # convention, so the smallest attainable p-value is 1 / (1 + N).
-perm_stats <- function(model) {
+#
+# The SAME engine serves the real cohort and the positive control below:
+# the control's null cohort is another response matrix, and the control's
+# statistic is only comparable with the real cohort's if both are computed
+# by the same code on the same enumeration.
+perm_stats <- function(model, y = Y, weights = NULL, design = NULL,
+                       cmb = perm_index$case) {
   sp <- model_specs[[model]]
-  w <- wmat_for(sp$weight)
-  d <- design_for(model)
-  t_obs <- stat_of(model, Y, d, w)
-  chunks <- parallel::mclapply(seq_len(n_perm), function(j) {
-    idx <- perm_index$case[, j]
+  w <- if (is.null(weights)) wmat_for(sp$weight) else weights
+  d <- if (is.null(design)) design_for(model) else design
+  fit_obs <- dpl_fit_model(y, d, w, isTRUE(sp$ebayes))
+  t_obs <- fit_obs$t
+  chunks <- parallel::mclapply(seq_len(ncol(cmb)), function(j) {
+    idx <- cmb[, j]
     d2 <- d
     d2[, "case"] <- 0
     d2[idx, "case"] <- 1
-    stat_of(model, Y, d2, w)
+    stat_of(model, y, d2, w)
   }, mc.cores = opt$cores)
-  counts <- numeric(length(transcripts))
-  usable <- numeric(length(transcripts))
+  counts <- numeric(nrow(y))
+  usable <- numeric(nrow(y))
   for (tp in chunks) {
     # A permutation can put every observation of a transcript on one side of
     # the contrast, which makes the design rank-deficient and the statistic
@@ -404,7 +471,8 @@ perm_stats <- function(model) {
     usable <- usable + as.numeric(ok)
   }
   p_perm <- (1 + counts) / (1 + usable)
-  list(p = p_perm, t_obs = t_obs, usable = usable)
+  list(p = p_perm, t_obs = t_obs, usable = usable,
+       p_analytic = fit_obs$p)
 }
 
 perm_res <- list()
@@ -444,6 +512,115 @@ if (length(perm_rows) > 0) {
 }
 
 # --------------------------------------------------------------------------
+# The discovery-count instrument
+# --------------------------------------------------------------------------
+# A second instrument, and it is NOT a criterion: it is a measurement, and
+# it does not use the model's own numbers as its yardstick. For EVERY
+# labelling the script enumerates it computes the analytic p-values, the
+# BH q-values over that labelling's OWN universe, and the number of
+# discoveries at q < alpha.
+#
+# The complement labelling -- case and control swapped -- is one of the
+# enumerated labellings and it is REPORTED AS ITS OWN ROW. It is not a
+# separate experiment: for a two-sided two-sample t, swapping the two
+# groups gives the same |t|, the same p, the same BH q and the same
+# number of discoveries. The row is written out anyway, because a reader
+# who counts the rows has to be able to see it, and the summary says how
+# many labellings were enumerated and how many of them the observed and
+# the complement are. The complement is NOT folded into an "other" bucket.
+#
+# The instrument answers "are the hits just the deep transcripts?". For
+# every labelling it also reports the median posterior mass W of that
+# labelling's top-K set, with K the number of discoveries the OBSERVED
+# labelling makes, so the comparison is like-for-like: if the observed
+# labelling's hits are no deeper than the other labellings' hits, then
+# the hits are a selection effect and not the label.
+#
+# The instrument is computed on the base fit, equal_raw_t, and its rows
+# name the model they belong to.
+DISC_MODEL <- "equal_raw_t"
+disc_tab <- NULL
+if (length(perm_res) > 0) {
+  # The transcript's posterior mass: the sum of its cells' posterior mass
+  # over the cohort's samples. It is a property of the transcript and not
+  # of the labelling, so the same number is compared across the
+  # labellings.
+  W_tx <- rowSums(Wsum)
+  # The complement labelling: the observed case set's complement, which is
+  # the control set, is itself one of the enumerated labellings.
+  obs_ctrl <- which(!case_ind)
+  compl <- which(vapply(seq_len(ncol(perm_index$case)),
+                         function(j) setequal(perm_index$case[, j], obs_ctrl),
+                         logical(1)))[1]
+  disc_model <- DISC_MODEL
+  sp_disc <- model_specs[[disc_model]]
+  w_disc <- wmat_for(sp_disc$weight)
+  d_disc <- design_for(disc_model)
+  cmb_disc <- perm_index$case
+  disc_fit <- function(j) {
+    d2 <- d_disc
+    d2[, "case"] <- 0
+    d2[cmb_disc[, j], "case"] <- 1
+    dpl_fit_model(Y, d2, w_disc, isTRUE(sp_disc$ebayes))
+  }
+  # The median W of the top-K set of a labelling, with K taken from the
+  # OBSERVED labelling so that every labelling is compared over the same
+  # number of transcripts.
+  topk_median_W <- function(tv, ok, K) {
+    if (is.na(K) || K <= 0) return(NA_real_)
+    idx <- which(ok)
+    if (length(idx) == 0) return(NA_real_)
+    idx <- idx[order(abs(tv[idx]), decreasing = TRUE)]
+    idx <- idx[seq_len(min(K, length(idx)))]
+    stats::median(W_tx[idx])
+  }
+  # The observed labelling first: its number of discoveries is the K.
+  f_obs <- disc_fit(ident)
+  q_obs <- stats::p.adjust(f_obs$p, method = "BH")
+  ok_obs <- !is.na(f_obs$p)
+  K_obs <- sum(q_obs <= opt$alpha, na.rm = TRUE)
+  disc_rows <- parallel::mclapply(seq_len(ncol(cmb_disc)), function(j) {
+    f <- disc_fit(j)
+    q <- stats::p.adjust(f$p, method = "BH")
+    ok <- !is.na(f$p)
+    data.frame(
+      model_name = disc_model,
+      labelling_index = j,
+      is_observed = j == ident,
+      is_complement_of_observed = j == compl,
+      n_discoveries = sum(q <= opt$alpha, na.rm = TRUE),
+      n_tested = sum(ok),
+      top_K = K_obs,
+      median_W_top_K = topk_median_W(f$t, ok, K_obs),
+      stringsAsFactors = FALSE
+    )
+  }, mc.cores = opt$cores)
+  disc_tab <- do.call(rbind, disc_rows)
+  write.table(disc_tab,
+              file = file.path(opt$`output-dir`, "dpl_permutation_discovery_counts.tsv"),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+  disc_other <- disc_tab[!disc_tab$is_observed & !disc_tab$is_complement_of_observed, ]
+  cat("[audit] discovery-count instrument:", ncol(perm_index$case),
+      "distinct labellings enumerated,", sum(disc_tab$is_observed | disc_tab$is_complement_of_observed),
+      "of them the observed and the complement labelling (the complement is",
+      "the same experiment with the groups swapped, not a second one)\n")
+  cat("[audit]   observed labelling:", sum(disc_tab$n_discoveries[disc_tab$is_observed]),
+      "discoveries at q <=", opt$alpha, "of", disc_tab$n_tested[disc_tab$is_observed],
+      "transcripts tested; complement labelling:",
+      disc_tab$n_discoveries[disc_tab$is_complement_of_observed],
+      "discoveries\n")
+  if (nrow(disc_other) > 0) {
+    cat("[audit]   the other", nrow(disc_other), "labellings:",
+        "discoveries median", stats::median(disc_other$n_discoveries),
+        "range", min(disc_other$n_discoveries), "..", max(disc_other$n_discoveries),
+        "| median W of the top-", K_obs, "median",
+        stats::median(disc_other$median_W_top_K, na.rm = TRUE),
+        "against the observed labelling's",
+        disc_tab$median_W_top_K[disc_tab$is_observed], "\n")
+  }
+}
+
+# --------------------------------------------------------------------------
 # A positive control for the permutation arm
 # --------------------------------------------------------------------------
 # The permutation arm is checked against a case whose answer is known: a
@@ -454,57 +631,146 @@ if (length(perm_rows) > 0) {
 # p falls below the permutation p is the same statistic as on the real
 # cohort, so this control says what that fraction looks like when nothing
 # is wrong, and the real cohort's value can be read against it.
-perm_self_test <- function(n_case, n_ctrl, n_tx = 2000, seed = opt$seed) {
+#
+# THE CONTROL IS REPLICATED, so the statistic has an EMPIRICAL
+# DISTRIBUTION. One null cohort gives one number, and a band built from
+# one number is a number the author chose. The control is therefore run
+# on several INDEPENDENT null cohorts: their mean is the BASELINE the
+# real cohort's value is read against, and their spread is the ACCEPTANCE
+# BAND. Neither of the two is ever taken from the model under test.
+#
+# THE NULL COHORT HAS THE REAL COHORT'S STRUCTURE. A cohort that is
+# complete, homoscedastic and iid normal is not a null for a cohort that
+# is none of those, and a control measured on it answers a question about
+# the complete cohort. The simulated null copies:
+#
+#   the SCALE, per transcript: the real cohort's pooled within-group
+#   standard deviation, one real transcript drawn per simulated
+#   transcript, so the control carries the real cohort's BETWEEN-TRANSCRIPT
+#   dispersion instead of one common scale.
+#   the MISSINGNESS: the real cohort's observed cell-missing rate, so the
+#   per-row degrees of freedom vary the way they do on the real data.
+#   the WEIGHTS: the real cohort's own weight rows, one real transcript
+#   per simulated transcript, so the weighted models meet the weight
+#   dispersion they meet on the real cohort and a transcript's scatter
+#   comes with that transcript's own assumed precision.
+#
+# WHAT IT IS NOT. The simulated cells are normal and independent within a
+# transcript, so the control carries no condition effect at all -- that is
+# what a null cohort is for -- and no biological scatter beyond the
+# per-transcript scale. The missingness is drawn at random rather than
+# copied cell by cell, so WHICH sample is missing is not the real cohort's
+# pattern. And the control's cohort is not the real cohort: its
+# transcripts are drawn from the real cohort's pool, and its number of
+# transcripts is not the real cohort's.
+
+# The number of transcripts in the control. The control's statistic is a
+# FRACTION over transcripts, so its Monte-Carlo error goes like
+# sqrt(f * (1 - f) / n): at 1000 transcripts and a fraction near 0.8 that
+# is 0.013, against the permutation p's granularity floor of 1/(1+N),
+# which is 0.048 on the three-versus-three cohort and 0.004 on the
+# five-versus-five one. The control is run at 1000 transcripts: enough for
+# the fraction's sampling error to be small against the bands it is used
+# to build, and small enough to keep the control's cost -- a permutation
+# enumeration per model per replicate -- bounded.
+CONTROL_TX <- 1000
+
+# One null cohort for the positive control: the real cohort's structure,
+# with no condition effect in it.
+control_null_cohort <- function(n_case, n_ctrl, n_tx, seed) {
   set.seed(seed)
-  y <- matrix(rnorm(n_tx * (n_case + n_ctrl)), nrow = n_tx)
-  des <- data.frame(
-    sample_id = as.character(seq_len(n_case + n_ctrl)),
-    condition = c(rep("case", n_case), rep("control", n_ctrl)),
-    stringsAsFactors = FALSE
-  )
-  d <- dpl_design(des$sample_id, des$condition, "case", "control", NULL)
-  # Weight matrices with the same shape as the simulated data, and with the
-  # real cohort's weight dispersion, so the weighted models are exercised
-  # here under the heterogeneity they will actually meet.
-  draw_from <- function(m, positive_only = TRUE) {
-    v <- m[is.finite(m) & (m > 0 | !positive_only)]
-    if (length(v) == 0) v <- rep(1, n_tx * (n_case + n_ctrl))
-    matrix(sample(v, n_tx * (n_case + n_ctrl), replace = TRUE), nrow = n_tx)
-  }
-  w_pv <- draw_from(mat_pv$w)
-  w_sum <- draw_from(Wsum)
-  cmb <- combn(seq_len(n_case + n_ctrl), n_case)
-  n_perm <- ncol(cmb)
-  out <- list()
-  for (nm in names(model_specs)) {
-    sp <- model_specs[[nm]]
-    ww <- switch(sp$weight, none = NULL, sum = w_sum, pv = w_pv)
-    fit <- dpl_fit_model(y, d$design, ww, sp$ebayes)
-    cnt <- numeric(n_tx)
-    for (j in seq_len(n_perm)) {
-      d2 <- d$design
-      d2[, "case"] <- 0
-      d2[cmb[, j], "case"] <- 1
-      tp <- dpl_fit_model(y, d2, ww, sp$ebayes)$t
-      ok <- !is.na(tp) & !is.na(fit$t)
-      cnt <- cnt + ifelse(ok & (abs(tp) >= abs(fit$t) - 1e-12), 1, 0)
+  n_s <- n_case + n_ctrl
+  # The real transcripts the simulated ones copy: the ones with a pooled
+  # within-group variance, one drawn per simulated transcript.
+  pool <- which(usable)
+  j <- sample(pool, n_tx, replace = TRUE)
+  # The scale: the real cohort's pooled within-group standard deviation,
+  # so the simulated transcript carries the real cohort's
+  # between-transcript dispersion instead of one common scale.
+  sd_sim <- sqrt(pooled_var[j])
+  # The cells: normal, around the real transcript's own mean, with that
+  # transcript's scale.
+  y <- matrix(rnorm(n_tx * n_s), nrow = n_tx) * sd_sim + grand_mean[j]
+  # The missingness: the real cohort's observed cell-missing rate, drawn
+  # per transcript and per group, and never taking a group below two
+  # observed cells, because a group of one has no within-group variance
+  # and the pooled two-sample t is not defined on it.
+  miss_rate <- mean(!present)
+  mask <- matrix(FALSE, nrow = n_tx, ncol = n_s)
+  for (g in list(which(case_ind), which(!case_ind))) {
+    k <- pmin(rbinom(n_tx, length(g), miss_rate), max(0L, length(g) - 2L))
+    for (i in seq_len(n_tx)) {
+      if (k[i] > 0) mask[i, sample(g, k[i])] <- TRUE
     }
-    p_perm <- (1 + cnt) / (1 + n_perm)
-    out[[nm]] <- data.frame(
-      model_name = nm,
-      mean_analytic_p = mean(fit$p, na.rm = TRUE),
-      sd_analytic_p = stats::sd(fit$p, na.rm = TRUE),
-      mean_permutation_p = mean(p_perm, na.rm = TRUE),
-      frac_analytic_p_below_permutation_p = mean(fit$p < p_perm, na.rm = TRUE),
-      min_permutation_p = min(p_perm),
-      n_transcripts = n_tx,
-      n_permutations = n_perm,
-      stringsAsFactors = FALSE
-    )
+  }
+  y[mask] <- NA_real_
+  # The weights: the real transcript's own weight row. Where the real
+  # transcript has no observation its weight is zero, and a zero weight on
+  # an OBSERVED cell would drop that cell from the fit, so the value is
+  # resampled from that transcript's own observed weights.
+  copy_row <- function(M, i, obs) {
+    v <- M[i, ]
+    bad <- !is.finite(v) | v <= 0
+    if (any(bad & obs)) {
+      donor <- M[i, !bad]
+      if (length(donor) == 0) donor <- 1
+      v[bad & obs] <- sample(donor, sum(bad & obs), replace = TRUE)
+    }
+    v[!obs] <- 0
+    v
+  }
+  obs <- !mask
+  # vapply stacks one CALL RESULT PER COLUMN, so the rows are transposed
+  # back into place: one simulated transcript per row.
+  w_pv <- t(vapply(seq_len(n_tx),
+                   function(i) copy_row(mat_pv$w, j[i], obs[i, ]),
+                   numeric(n_s)))
+  w_sum <- t(vapply(seq_len(n_tx),
+                    function(i) copy_row(Wsum, j[i], obs[i, ]),
+                    numeric(n_s)))
+  list(y = y, w_pv = w_pv, w_sum = w_sum,
+       missing_rate = mean(mask), drawn_from = j)
+}
+
+# The positive control, replicated: one independent null cohort per
+# replicate, one row per (replicate, model).
+perm_self_test <- function(n_case, n_ctrl, n_tx = CONTROL_TX,
+                           replicates = opt$`control-replicates`,
+                           seed = opt$seed) {
+  out <- list()
+  for (rep in seq_len(replicates)) {
+    # An independent null cohort per replicate. The seeds are derived
+    # from the run's seed and are all different, so the cohorts are
+    # independent draws and not the same cohort twice.
+    coh <- control_null_cohort(n_case, n_ctrl, n_tx, seed + 700000L + rep)
+    for (nm in names(model_specs)) {
+      sp <- model_specs[[nm]]
+      ww <- switch(sp$weight, none = NULL, sum = coh$w_sum, pv = coh$w_pv)
+      # The control's design is the real cohort's plain design, without a
+      # batch term: the simulated cohort carries no batch structure, so a
+      # batch term would be fitted on nothing.
+      pr <- perm_stats(nm, y = coh$y, weights = ww, design = dl$design,
+                       cmb = perm_index$case)
+      an <- pr$p_analytic
+      ok <- !is.na(pr$p) & !is.na(an)
+      out[[length(out) + 1L]] <- data.frame(
+        model_name = nm,
+        replicate = rep,
+        mean_analytic_p = mean(an, na.rm = TRUE),
+        sd_analytic_p = stats::sd(an, na.rm = TRUE),
+        mean_permutation_p = mean(pr$p, na.rm = TRUE),
+        frac_analytic_p_below_permutation_p = mean(an[ok] < pr$p[ok], na.rm = TRUE),
+        min_permutation_p = min(pr$p),
+        n_transcripts = sum(ok),
+        n_permutations = n_perm,
+        stringsAsFactors = FALSE
+      )
+    }
   }
   do.call(rbind, out)
 }
-cat("[audit] permutation positive control on a simulated null cohort\n")
+cat("[audit] permutation positive control on", opt$`control-replicates`,
+    "simulated null cohorts with the real cohort's structure\n")
 perm_control <- perm_self_test(n_case, n_ctrl)
 write.table(perm_control,
             file = file.path(opt$`output-dir`, "dpl_permutation_control.tsv"),
@@ -532,30 +798,9 @@ print(perm_control)
 #                      for real data, and the report says which.
 #
 # All of this is computed with matrix algebra: a per-transcript loop over
-# twenty thousand transcripts cost minutes and bought nothing.
-present <- !is.na(Y)
-# Every row is the same case/control mask over the samples.
-case_mask <- matrix(rep(case_ind, each = length(transcripts)),
-                     nrow = length(transcripts), ncol = length(samples))
-
-group_ss <- function(mask) {
-  m <- mask & present
-  n <- rowSums(m)
-  s1 <- rowSums(m * Y, na.rm = TRUE)
-  s2 <- rowSums(m * Y^2, na.rm = TRUE)
-  ss <- s2 - ifelse(n > 0, s1^2 / n, 0)
-  ss[!is.finite(ss)] <- 0
-  ss[ss < 0] <- 0
-  list(n = n, ss = ss)
-}
-g_case <- group_ss(case_mask)
-g_ctrl <- group_ss(!case_mask)
-pooled_var <- (g_case$ss + g_ctrl$ss) /
-  pmax(1, g_case$n + g_ctrl$n - 2)
-grand_mean <- rowSums(Y, na.rm = TRUE) / pmax(1, rowSums(present))
-usable <- is.finite(pooled_var) & pooled_var > 0
-cat("[audit] transcripts with a pooled within-group variance:",
-    sum(usable), "of", length(transcripts), "\n")
+# twenty thousand transcripts cost minutes and bought nothing. The
+# quantities it reads -- present, case_mask, pooled_var, grand_mean and
+# usable -- are the real cohort's structure, computed once above.
 
 # The per-cell standard deviation of each null. A per-transcript value has
 # to be constant along a ROW, so the matrix is filled by column: filling it
@@ -723,15 +968,24 @@ write.table(inj_tab, file = file.path(opt$`output-dir`, "dpl_injection_power.tsv
 # --------------------------------------------------------------------------
 # The verdict
 # --------------------------------------------------------------------------
-# Two criteria, and both tolerances are MEASURED, not chosen.
+# Two criteria, and both tolerances are MEASURED, not chosen. Neither of
+# them takes its yardstick from the model under test: a criterion whose
+# band contains the model's own measurement is a criterion the model
+# cannot fail, and a verdict that cannot fail is not a verdict.
 #
 # 1. The permutation arm. The analytic p-value claims to be the probability
 #    that the statistic is as extreme as it is under the null; the exact
-#    permutation p-value IS that probability, enumerated. When the two agree,
-#    the analytic p falls below the permutation p about half the time. The
-#    reference model is `equal_raw_t`, whose calibration is a mathematical
-#    fact (it is the ordinary two-sample t, checked above), so its measured
-#    departure from one half is the yardstick for the others.
+#    permutation p-value IS that probability, enumerated. The fraction of
+#    transcripts where the analytic p falls below the permutation p is the
+#    statistic, and it is NOT compared against one half: the analytic p is
+#    CONTINUOUS and the permutation p is DISCRETE (a multiple of 1/(1+N)),
+#    so under a true null the fraction is not one half. The baseline is
+#    the POSITIVE CONTROL's measured value FOR THE SAME MODEL -- the null
+#    cohort of the same structure, on which the same statistic is
+#    computed -- and the acceptance band is the control's own spread
+#    across its replicates, with the permutation p's granularity
+#    1/(1+N) as a floor on that band, because a departure smaller than
+#    the granularity of the permutation p cannot be resolved.
 #
 # 2. The null arm. Every transcript of a null cohort is null, so every
 #    rejection in it is a false discovery, and BH's guarantee is that the
@@ -742,6 +996,14 @@ write.table(inj_tab, file = file.path(opt$`output-dir`, "dpl_injection_power.tsv
 #    significantly larger than alpha would produce. That is why the number
 #    of null cohorts has to be large enough to resolve alpha, and why the
 #    count of cohorts is reported next to the verdict.
+#
+# 3. The uniformity of the p-value, read on the positive control. On the
+#    null cohort the mean p-value has to be 0.5, and the band is the
+#    Monte-Carlo error of that mean over the control's transcripts, WIDENED
+#    by the control's own spread of the mean across its replicates. The
+#    band does NOT contain the control's own departure from one half: that
+#    term made the criterion true by construction for the model that owns
+#    it.
 #
 # The verdict is about calibration. The number of discoveries a model makes
 # on the real cohort is reported, and it is never part of the verdict.
@@ -757,21 +1019,78 @@ perm_tab <- if (length(perm_rows) > 0) {
 perm_ref_dev <- if (nrow(perm_tab) == 0) NA_real_ else abs(
   perm_tab$frac_analytic_p_below_permutation_p[perm_tab$model_name == REF_MODEL] - 0.5)
 perm_granularity <- 1 / (1 + n_perm)
-cat("[audit] permutation yardstick: the reference model's departure from",
-    "one half is", perm_ref_dev, "\n")
+cat("[audit] the permutation p's granularity floor on the acceptance band:",
+    perm_granularity, "\n")
+cat("[audit] the reference model's departure from one half is", perm_ref_dev,
+    "(reported; it is NOT the yardstick any more)\n")
 
-# The positive control's band. On the simulated null cohort the mean
-# p-value has to be 0.5, and the reference model says how close the
-# machinery gets there; the Monte-Carlo error of the mean over the control's
-# transcripts is the other half of the band.
-ref_ctrl <- perm_control[perm_control$model_name == REF_MODEL, ]
-ctrl_band <- if (nrow(ref_ctrl) == 0) {
-  NA_real_
-} else {
-  max(abs(ref_ctrl$mean_analytic_p - 0.5),
-      2 * ref_ctrl$sd_analytic_p / sqrt(ref_ctrl$n_transcripts))
+# The positive control's per-model summary: the measured baseline and the
+# measured spread, and nothing else. The baseline is the control's mean
+# over its replicates and the spread is the control's own standard
+# deviation over the same replicates, so the band is the control's
+# EMPIRICAL spread rather than a number the author chose.
+control_summary <- function(model) {
+  r <- perm_control[perm_control$model_name == model, ]
+  if (nrow(r) == 0) {
+    return(list(n = 0L, frac_mean = NA_real_, frac_sd = NA_real_,
+                p_mean = NA_real_, p_sd = NA_real_,
+                sampling_band = NA_real_, replicate_band = NA_real_,
+                band = NA_real_))
+  }
+  frac_mean <- mean(r$frac_analytic_p_below_permutation_p, na.rm = TRUE)
+  frac_sd <- stats::sd(r$frac_analytic_p_below_permutation_p, na.rm = TRUE)
+  p_mean <- mean(r$mean_analytic_p, na.rm = TRUE)
+  p_sd <- stats::sd(r$mean_analytic_p, na.rm = TRUE)
+  n_tx_ctrl <- mean(r$n_transcripts, na.rm = TRUE)
+  sd_p <- mean(r$sd_analytic_p, na.rm = TRUE)
+  sampling <- 2 * sd_p / sqrt(n_tx_ctrl)
+  replicate_spread <- 2 * p_sd
+  list(n = nrow(r), frac_mean = frac_mean, frac_sd = frac_sd,
+       p_mean = p_mean, p_sd = p_sd,
+       sampling_band = sampling, replicate_band = replicate_spread,
+       band = sampling + replicate_spread)
 }
-cat("[audit] uniformity band on the control cohort:", ctrl_band, "\n")
+
+# What the permutation arm on THIS cohort is allowed to mean. The arm
+# exchanges the case/control LABELS of the samples, so it is a
+# randomization test of the GROUPING, and it is a treatment-effect
+# randomization test only when the treatment was assigned at random. On a
+# cohort whose batch is completely confounded with the condition the
+# contrast is a batch-and-condition difference, and no permutation result
+# on that cohort is a treatment-effect randomization test at all.
+perm_interpretation <- if (isTRUE(dl_batch$confounded)) {
+  paste0("the batch is completely confounded with the condition, so this",
+         " contrast is a batch-and-condition difference and NO permutation",
+         " result on this cohort is a treatment-effect randomization test;",
+         " the arm measures a grouping difference only")
+} else {
+  paste0("the arm exchanges the case/control LABELS of the samples, so it",
+         " is a randomization test of the GROUPING; it is a treatment-effect",
+         " randomization test only when the treatment was assigned at",
+         " random, and on this cohort no permutation result is one")
+}
+cat("[audit] permutation arm on this cohort:", perm_interpretation, "\n")
+
+# The discovery-count instrument, read once for the summary.
+disc_observed <- if (is.null(disc_tab)) NA_integer_ else
+  sum(disc_tab$n_discoveries[disc_tab$is_observed])
+disc_complement <- if (is.null(disc_tab)) NA_integer_ else
+  sum(disc_tab$n_discoveries[disc_tab$is_complement_of_observed])
+disc_other <- if (is.null(disc_tab)) NULL else
+  disc_tab[!disc_tab$is_observed & !disc_tab$is_complement_of_observed, ]
+disc_null_median <- if (is.null(disc_other) || nrow(disc_other) == 0) NA_real_ else
+  stats::median(disc_other$n_discoveries)
+disc_null_min <- if (is.null(disc_other) || nrow(disc_other) == 0) NA_real_ else
+  min(disc_other$n_discoveries)
+disc_null_max <- if (is.null(disc_other) || nrow(disc_other) == 0) NA_real_ else
+  max(disc_other$n_discoveries)
+disc_W_observed <- if (is.null(disc_tab)) NA_real_ else
+  disc_tab$median_W_top_K[disc_tab$is_observed]
+disc_W_null_median <- if (is.null(disc_other) || nrow(disc_other) == 0) NA_real_ else
+  stats::median(disc_other$median_W_top_K, na.rm = TRUE)
+n_distinct_labellings <- if (is.null(disc_tab)) 0L else nrow(disc_tab)
+n_obs_complement <- if (is.null(disc_tab)) 0L else
+  sum(disc_tab$is_observed | disc_tab$is_complement_of_observed)
 
 null_stats <- function(model, variant) {
   r <- null_tab[null_tab$model_name == model & null_tab$null_variant == variant, ]
@@ -794,13 +1113,29 @@ for (nm in names(model_specs)) {
   st <- null_stats(nm, "realistic_scatter")
   st_assumed <- null_stats(nm, "model_assumed")
   null_pass <- !is.na(st$excess_p) && st$excess_p > 0.05
-  crow <- perm_control[perm_control$model_name == nm, ]
-  ctrl_dev <- if (nrow(crow) == 0) NA_real_ else abs(crow$mean_analytic_p - 0.5)
-  ctrl_pass <- !is.na(ctrl_dev) && ctrl_dev <= ctrl_band
+  cs <- control_summary(nm)
+  # THE UNIFORMITY CRITERION. On the null cohort the analytic p-value has
+  # to be uniform, so its mean has to be one half. The band is the
+  # Monte-Carlo error of that mean over the control's transcripts, plus
+  # the control's own spread of the mean across its replicates. It does
+  # NOT contain the control's own departure from one half: that term made
+  # the criterion true by construction for the model that owns it.
+  ctrl_dev <- if (is.na(cs$p_mean)) NA_real_ else abs(cs$p_mean - 0.5)
+  ctrl_band <- cs$band
+  ctrl_pass <- !is.na(ctrl_dev) && !is.na(ctrl_band) && ctrl_dev <= ctrl_band
+  # THE PERMUTATION CRITERION. The real cohort's statistic is read against
+  # the CONTROL's measured baseline for the SAME model, and the band is
+  # the control's own spread across its replicates, floored by the
+  # granularity of the permutation p (1/(1+N)): a departure smaller than
+  # that granularity cannot be resolved.
   prow <- perm_tab[perm_tab$model_name == nm, ]
-  perm_dev <- if (nrow(prow) == 0) NA_real_ else
-    abs(prow$frac_analytic_p_below_permutation_p - 0.5)
-  perm_pass <- !is.na(perm_dev) && perm_dev <= max(perm_ref_dev, perm_granularity)
+  perm_value <- if (nrow(prow) == 0) NA_real_ else
+    prow$frac_analytic_p_below_permutation_p
+  perm_dev <- if (is.na(perm_value) || is.na(cs$frac_mean)) NA_real_ else
+    abs(perm_value - cs$frac_mean)
+  perm_spread <- if (is.finite(cs$frac_sd)) 2 * cs$frac_sd else 0
+  perm_band <- max(perm_spread, perm_granularity)
+  perm_pass <- !is.na(perm_dev) && perm_dev <= perm_band
   it <- inj_tab[inj_tab$model_name == nm &
                   inj_tab$null_variant == "realistic_scatter", ]
   # The false discovery rate of the injected cohorts, pooled over the
@@ -833,20 +1168,18 @@ for (nm in names(model_specs)) {
   summ[[nm]] <- data.frame(
     model_name = nm,
     verdict = verdict,
-    control_mean_analytic_p = if (nrow(crow) == 0) NA_real_ else crow$mean_analytic_p,
+    control_mean_analytic_p = cs$p_mean,
     control_uniformity_deviation = ctrl_dev,
     control_uniformity_band = ctrl_band,
-    control_frac_analytic_below_perm = if (nrow(crow) == 0) NA_real_ else
-      crow$frac_analytic_p_below_permutation_p,
+    control_frac_analytic_below_perm = cs$frac_mean,
     null_cohorts = st$n,
     null_cohorts_with_a_rejection = st$n_any,
     null_p_any_rejection = st$p_any,
     null_excess_binomial_p = st$excess_p,
     null_p_any_rejection_model_assumed = st_assumed$p_any,
     null_excess_binomial_p_model_assumed = st_assumed$excess_p,
-    perm_frac_analytic_below_perm = if (nrow(prow) == 0) NA_real_ else
-      prow$frac_analytic_p_below_permutation_p,
-    perm_deviation_from_one_half = perm_dev,
+    perm_frac_analytic_below_perm = perm_value,
+    perm_deviation_from_one_half = if (is.na(perm_value)) NA_real_ else abs(perm_value - 0.5),
     perm_reference_deviation = perm_ref_dev,
     alpha = opt$alpha,
     injection_pooled_fdr = pooled_fdr,
@@ -857,6 +1190,31 @@ for (nm in names(model_specs)) {
     n_real_discoveries_q_le_alpha = sum(rp$q_raw <= opt$alpha, na.rm = TRUE),
     n_real_tested = sum(!is.na(rp$p_raw)),
     batch_note = dl_batch$batch_note,
+    # --- the evidence the two criteria above are built on ---
+    control_replicates = cs$n,
+    control_uniformity_band_sampling = cs$sampling_band,
+    control_uniformity_band_replicate_spread = cs$replicate_band,
+    control_mean_analytic_p_sd_across_replicates = cs$p_sd,
+    perm_control_baseline = cs$frac_mean,
+    perm_control_baseline_sd_across_replicates = cs$frac_sd,
+    perm_control_band_spread = perm_spread,
+    perm_granularity_floor = perm_granularity,
+    perm_control_band = perm_band,
+    perm_deviation_from_control_baseline = perm_dev,
+    perm_criterion_pass = perm_pass,
+    uniformity_criterion_pass = ctrl_pass,
+    # --- the discovery-count instrument ---
+    ref_discovery_model = DISC_MODEL,
+    ref_discovery_count_observed = disc_observed,
+    ref_discovery_count_complement = disc_complement,
+    ref_discovery_count_null_median = disc_null_median,
+    ref_discovery_count_null_min = disc_null_min,
+    ref_discovery_count_null_max = disc_null_max,
+    ref_median_W_observed = disc_W_observed,
+    ref_median_W_null_median = disc_W_null_median,
+    n_distinct_labellings = n_distinct_labellings,
+    n_labellings_observed_or_complement = n_obs_complement,
+    permutation_interpretation = perm_interpretation,
     stringsAsFactors = FALSE
   )
 }
@@ -867,5 +1225,6 @@ write.table(summ_tab, file = file.path(opt$`output-dir`, "dpl_audit_summary.tsv"
 cat("\n[audit] summary\n")
 print(summ_tab)
 cat("\n[audit] wrote dpl_units.tsv, dpl_model_fit.tsv, dpl_permutation_null.tsv,",
+    "dpl_permutation_discovery_counts.tsv, dpl_permutation_control.tsv,",
     "dpl_null_calibration.tsv, dpl_injection_power.tsv, dpl_audit_summary.tsv to",
     opt$`output-dir`, "\n")

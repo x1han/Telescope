@@ -72,7 +72,7 @@ use rayon::prelude::*;
 
 /// Default minimum posterior-weight mass for a (transcript × sample) cell.
 /// Same default as the R engine's `--min-weight`.
-pub const MIN_WEIGHT_DEFAULT: f64 = 10.0;
+pub const MIN_WEIGHT_DEFAULT: f64 = 5.0;
 
 /// Default minimum total count for a transcript in the ΔPAU track.
 /// Same default as the R engine's `--min-counts`.

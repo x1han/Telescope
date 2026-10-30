@@ -56,7 +56,7 @@ suppressPackageStartupMessages({
 #' @return data.frame with sample_id, transcript_id, gene_id, condition,
 #'   mean_log2_pal, within_variance, W, Kish_Neff, measurement_variance,
 #'   passed_quality_gate.
-dpl_units <- function(agg, design, min_weight = 10, min_neff = 2) {
+dpl_units <- function(agg, design, min_weight = 5, min_neff = 2) {
   stopifnot(all(c("sample_id", "gene_id", "transcript_id", "weight_sum",
                   "weighted_log2pal_sum", "weight_sq_sum",
                   "weighted_log2pal_sq_sum") %in% names(agg)))
@@ -83,8 +83,29 @@ dpl_units <- function(agg, design, min_weight = 10, min_neff = 2) {
   ss_w <- d$swy2 - d$swy^2 / d$W
   ss_w[!is.finite(ss_w)] <- 0
   ss_w[ss_w < 0] <- 0
-  d$within_variance <- ifelse(is.na(d$Kish_Neff) | d$Kish_Neff <= 1,
-                              NA_real_, ss_w / (d$Kish_Neff - 1))
+  # RELIABILITY-WEIGHTED UNBIASED VARIANCE.
+  #
+  # For i.i.d. observations y_i with variance sigma^2 and FIXED weights w_i,
+  #   E[ sum_i w_i (y_i - ybar_w)^2 ] = sigma^2 * (W - sum_i w_i^2 / W),
+  # so the unbiased estimate divides by that quantity and not by the
+  # dimensionless Kish_Neff - 1. The two agree only for equal weights: then
+  # sum w_i^2 / W = 1 and Kish_Neff = W, and W - 1 = Kish_Neff - 1. With
+  # fractional posterior weights (w in (0, 1]) they differ, and the ratio of
+  # the two estimates is Kish_Neff / W.
+  #
+  # The denominator is FIRST ORDER in the weights (W -> cW and
+  # sum w_i^2 / W -> c * sum w_i^2 / W), as is the numerator, so the estimate
+  # is invariant under a global rescaling of the weights. Dividing by
+  # Kish_Neff - 1 breaks that invariance: the estimate then grows with c.
+  #
+  # CAVEAT, NOT A FOOTNOTE: the weights here are ESTIMATED by the EM, not
+  # fixed independently of the data, so this is the unbiased estimator under
+  # FIXED reliability weights. It is not claimed to be exactly unbiased
+  # under the EM's own posterior, and `measurement_variance` is not claimed
+  # to be a fully calibrated measurement error.
+  den_w <- d$W - d$sw2 / d$W
+  d$within_variance <- ifelse(is.na(d$Kish_Neff) | !is.finite(den_w) | den_w <= 0,
+                              NA_real_, ss_w / den_w)
   d$measurement_variance <- d$within_variance / d$Kish_Neff
 
   d$passed_quality_gate <- !is.na(d$measurement_variance) &
@@ -114,7 +135,7 @@ dpl_units <- function(agg, design, min_weight = 10, min_neff = 2) {
 #' @param condition character vector, same length as samples.
 #' @param case_condition,control_condition the two labels.
 #' @param batch optional character vector of batch labels.
-#' @return list(design, contrast, batch_used, batch_note)
+#' @return list(design, contrast, batch_used, confounded, batch_note)
 dpl_design <- function(samples, condition, case_condition, control_condition,
                        batch = NULL) {
   known <- unique(condition)
@@ -132,6 +153,7 @@ dpl_design <- function(samples, condition, case_condition, control_condition,
   design <- stats::model.matrix(~ cond)
   colnames(design) <- c("intercept", "case")
   batch_used <- FALSE
+  confounded <- FALSE
   batch_note <- "no batch column in the design"
   if (!is.null(batch)) {
     b <- factor(batch)
@@ -143,6 +165,18 @@ dpl_design <- function(samples, condition, case_condition, control_condition,
         batch_used <- TRUE
         batch_note <- paste("batch adjusted:", paste(levels(b), collapse = ","))
       } else {
+        # COMPLETE CONFOUNDING. The batch and the condition cannot be
+        # separated, so the contrast this design reports is a
+        # batch-and-condition difference and not a treatment effect. This is
+        # checked EXPLICITLY -- every batch holds samples of exactly one
+        # condition -- rather than inferred from the rank deficiency, because
+        # a rank deficiency can also come from a factor level that holds no
+        # samples at all.
+        cc <- as.character(condition)
+        bb <- as.character(batch)
+        ok <- !is.na(bb) & !is.na(cc)
+        tb <- table(bb[ok], cc[ok])
+        confounded <- all(apply(tb, 1L, function(r) sum(r > 0) == 1L))
         batch_note <- paste0(
           "batch present (", paste(levels(b), collapse = ","),
           ") but confounded with condition; NOT adjusted")
@@ -152,7 +186,8 @@ dpl_design <- function(samples, condition, case_condition, control_condition,
     }
   }
   list(design = design, contrast = c(control_condition, case_condition),
-       batch_used = batch_used, batch_note = batch_note)
+       batch_used = batch_used, confounded = confounded,
+       batch_note = batch_note)
 }
 
 # ---------------------------------------------------------------------------
@@ -440,4 +475,84 @@ dpl_matrices <- function(units, samples, transcripts, value = "mean_log2_pal",
     w[cbind(ti[ok], si[ok])] <- 1 / u[[weight]][ok]
   }
   list(y = y, w = w)
+}
+
+# ---------------------------------------------------------------------------
+# Effect size on the physical scale: nt, and not only log2 nt
+# ---------------------------------------------------------------------------
+#
+# The shipped statistic is a difference of means of log2(polyA_length), so it
+# is the LOG2 of a ratio of geometric means. Reporting it alone leaves the
+# reader to guess the physical size, and 2^d is not a length: it is a ratio.
+# The difference of the two geometric means is a different number again, and
+# it is the one a reader can compare with a tail length.
+#
+# Everything below is computed from the SAME admissible cells the fit uses:
+#
+#   m_c, m_k   the mean log2 tail length of the case / control cells
+#   D          = m_c - m_k              the log2 difference
+#   GM_c       = 2^m_c                  the geometric mean tail length, nt
+#   GM_k       = 2^m_k
+#   R          = 2^D                    the geometric mean ratio
+#   dGM        = GM_c - GM_k            the difference of the geometric means
+#
+# The intervals are ordinary t intervals on the raw difference of the two
+# group means, and the interval on dGM is the delta method applied to that
+# SAME raw difference -- so the baseline's own estimation error is propagated
+# instead of the interval endpoints being multiplied by a fixed constant.
+#
+# WHAT THIS IS NOT: none of these quantities separates the within-sample
+# molecular spread from the between-replicate spread. The interval below is
+# the sampling interval of the two group means, nothing more.
+
+#' Effect size and intervals on the physical (nt) scale.
+#'
+#' @param y matrix, transcripts x samples, NA where the cell is missing.
+#' @param is_case,is_control logical vectors over the columns of `y`.
+#' @param conf the confidence level.
+#' @return a data.frame with one row per transcript.
+dpl_effect_nt <- function(y, is_case, is_control, conf = 0.95) {
+  stopifnot(is.matrix(y), length(is_case) == ncol(y),
+            length(is_control) == ncol(y))
+  Yc <- y[, is_case, drop = FALSE]
+  Yk <- y[, is_control, drop = FALSE]
+  nc <- rowSums(is.finite(Yc))
+  nk <- rowSums(is.finite(Yk))
+  mc <- rowMeans(Yc, na.rm = TRUE)
+  mk <- rowMeans(Yk, na.rm = TRUE)
+  # The pooled within-group variance, and the degrees of freedom that go with
+  # it. A group with one cell has no within-group variance, so its pooled
+  # variance is 0 and the degrees of freedom are what says the test is not
+  # supported.
+  sc2 <- rowSums((Yc - mc)^2, na.rm = TRUE) / pmax(nc - 1, 1)
+  sk2 <- rowSums((Yk - mk)^2, na.rm = TRUE) / pmax(nk - 1, 1)
+  df <- nc + nk - 2
+  s2 <- ((nc - 1) * sc2 + (nk - 1) * sk2) / pmax(df, 1)
+  d <- mc - mk
+  se <- sqrt(s2 * (1 / nc + 1 / nk))
+  ok <- df > 0 & is.finite(d) & is.finite(se)
+  tcrit <- rep(NA_real_, length(d))
+  tcrit[ok] <- stats::qt(1 - (1 - conf) / 2, df[ok])
+  lo <- d - tcrit * se
+  hi <- d + tcrit * se
+  gm_c <- 2^mc
+  gm_k <- 2^mk
+  dgm <- gm_c - gm_k
+  # Delta method on dGM = 2^mc - 2^mk: the derivative with respect to mc is
+  # log(2) * 2^mc, and with respect to mk it is -log(2) * 2^mk.
+  se_dgm <- sqrt((log(2))^2 * (gm_c^2 * s2 / nc + gm_k^2 * s2 / nk))
+  data.frame(
+    delta_log2_pal                  = d,
+    geometric_mean_ratio            = 2^d,
+    geometric_mean_control_nt       = gm_k,
+    geometric_mean_case_nt          = gm_c,
+    delta_geometric_mean_nt         = dgm,
+    ci_lo_log2_pal                  = lo,
+    ci_hi_log2_pal                  = hi,
+    ci_lo_ratio                     = 2^lo,
+    ci_hi_ratio                     = 2^hi,
+    ci_lo_delta_geometric_mean_nt   = dgm - tcrit * se_dgm,
+    ci_hi_delta_geometric_mean_nt   = dgm + tcrit * se_dgm,
+    stringsAsFactors = FALSE
+  )
 }
