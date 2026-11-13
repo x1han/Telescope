@@ -136,12 +136,11 @@ S6    results/S6.profile.parquet    treated    b1    s6.genome.bam
 | `software_versions.tsv` | Exact versions of all executed software and Bioconductor packages |
 | `model_parameters.tsv` | Configured statistical thresholds and fitted prior parameters |
 
-### Admission Gates and the `DT-EB` Model
+### Admission Gates
 
 1. **Per-group feature admission (`DEG`, `DET`, `DIU`)**: Each condition must contain at least `--min-samples` (default 3) biological replicates. A feature is tested only when it reaches at least `--min-counts` (default 20) total reads and exhibits non-zero support in at least `--min-samples` replicates of **each** condition; the usage track additionally requires the feature's **gene** to carry at least `--min-counts` reads in at least `--min-samples` replicates of each condition. Excluded features remain in the output table with their exclusion reason recorded in `padj_na_reason`.
 2. **Per-site admission (`APA`)**: a poly(A) site is tested only when its own total poly(A) reads reach **10** — a literal, not `--min-counts` — it has at least `--min-samples` (default 3) usable cells in **each** condition, and the gene's poly(A) total in a usable cell reaches the single-sample floor `max(5, floor(--min-counts / 4))` (5 by default). A site LAPA did not call in a sample counts as a zero share when the gene's total for that sample is known and large enough; otherwise that cell is unusable. Excluded sites remain in the output table with their exclusion reason recorded in `padj_na_reason`.
 3. **Cell-level tail-length admission & `DT-EB` (`DPL`)**: A `(transcript × sample)` cell enters the poly(A) tail-length linear model only when its posterior weight sum reaches `--min-cell-weight` (default 10), its Kish effective sample size reaches `--min-neff` (default 10), and its within-sample variance is finite and positive. `DT-EB` fits an equal-weight linear model across qualifying replicates and moderates residual variances using `limma::eBayes(trend = cov_depth, robust = TRUE)`, where the trend covariate is the mean log2 read support of each isoform. If the variance trend cannot be fitted, the engine explicitly records the fallback (`DT-EB-no-trend`) in the receipt.
-4. **High-speed Rust aggregation**: `telescope diff` streams multi-million-row per-read `.profile.parquet` files in Rust and reduces them to per-`(transcript × sample)` sufficient statistics before invoking R, preventing per-read pseudoreplication while reducing memory usage from tens of gigabytes to hundreds of megabytes.
 
 ---
 
