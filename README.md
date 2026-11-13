@@ -33,7 +33,7 @@ Run `telescope <command> --help` to inspect all parameters.
 
 ## Installation
 
-Three steps. The conda environment carries both the Bioconductor stack (for `telescope diff`) and a Rust toolchain (for the binary), so a single `mamba activate` is all you need.
+Three steps. The conda environment carries both the Bioconductor stack (for `telescope diff`) and a Rust toolchain (for the binary), so a single `conda activate` is all you need.
 
 ### 1. Clone
 
@@ -45,8 +45,8 @@ cd Telescope
 ### 2. Create the environment
 
 ```bash
-mamba env create -f environment.yml
-mamba activate telescope
+conda env create -f environment.yml
+conda activate telescope
 ```
 
 The environment pins every Bioconductor package exactly, because the published differential tables were produced by those builds. `environment.yml` is the single source for those pins.
@@ -55,13 +55,13 @@ The environment pins every Bioconductor package exactly, because the published d
 
 ```bash
 cargo install --path crates/telescope-cli --root "$CONDA_PREFIX"
-mkdir -p "$CONDA_PREFIX/share/telescope/workflow/scripts"
-cp workflow/scripts/*.R "$CONDA_PREFIX/share/telescope/workflow/scripts/"
+mkdir -p "$CONDA_PREFIX/telescope/workflow/scripts"
+cp workflow/scripts/*.R "$CONDA_PREFIX/telescope/workflow/scripts/"
 ```
 
-Installing with the prefix set to `$CONDA_PREFIX` places `telescope` in `$CONDA_PREFIX/bin`, which is on `PATH` inside the activated environment. The `cp` places the R engine where `telescope diff` looks for it: `$CONDA_PREFIX/share/telescope/workflow/scripts/telescope_diff.R`.
+Installing with the prefix set to `$CONDA_PREFIX` places `telescope` in `$CONDA_PREFIX/bin`, which is on `PATH` inside the activated environment. The `cp` places the R engine where `telescope diff` looks for it: `$CONDA_PREFIX/telescope/workflow/scripts/telescope_diff.R`.
 
-`telescope diff` resolves the R interpreter via `$TELESCOPE_RSCRIPT` (or `Rscript` on `PATH`) and locates the R engine via `$TELESCOPE_DIFF_R`, `$CONDA_PREFIX/share/telescope/workflow/scripts/telescope_diff.R`, or relative to the binary path (overridable via `--rscript` and `--r-script`).
+`telescope diff` resolves the R interpreter via `$TELESCOPE_RSCRIPT` (or `Rscript` on `PATH`) and locates the R engine via `$TELESCOPE_DIFF_R`, `$CONDA_PREFIX/telescope/workflow/scripts/telescope_diff.R`, or relative to the binary path (overridable via `--rscript` and `--r-script`).
 
 ---
 
