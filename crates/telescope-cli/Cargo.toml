@@ -1,0 +1,30 @@
+[package]
+name = "telescope"
+description = "Telescope CLI: terminal-resolved native poly(A) inference for ONT DRS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "telescope"
+path = "src/main.rs"
+
+[dependencies]
+telescope-core = { version = "1.1.0", path = "../telescope-core" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+arrow = { version = "60", default-features = false, features = ["csv"] }
+arrow-array = { version = "60", default-features = false }
+arrow-schema = { version = "60", default-features = false }
+parquet = { version = "60", default-features = false, features = ["arrow", "snap"] }
+rayon = "1.10"
+
+[dev-dependencies]
+                                                                              
+                                                                      
+                                                                              
+                                                                        
+                                                                           
+telescope-core = { path = "../telescope-core", features = ["test-support"] }

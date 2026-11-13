@@ -1,0 +1,3 @@
+chr1	tX	transcript	1	2000	.	+	.	gene_id "G1"; transcript_id "tx0"; gene_name "GA";
+chr1	tX	transcript	1	2000	.	+	.	gene_id "G1"; transcript_id "tx1"; gene_name "GA";
+chr1	tX	transcript	1	2000	.	+	.	gene_id "G2"; transcript_id "tx2"; gene_name "GB";
